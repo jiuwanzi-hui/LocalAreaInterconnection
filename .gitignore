@@ -1,0 +1,7 @@
+node_modules/
+.idea/
+dist/
+coverage/
+native/target/
+.DS_Store
+*.log
