@@ -1,4 +1,4 @@
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
 use lai_core::{
     add_room_member, close_room, create_diagnostic_export_bundle, create_game_network_plan,
     create_invite, create_join_plan, create_room, create_room_session,
@@ -20,7 +20,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 #[command(name = "lai-cli")]
 struct Cli {
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 #[derive(Subcommand)]
@@ -197,7 +197,12 @@ enum Command {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
-    match cli.command {
+    let Some(command) = cli.command else {
+        Cli::command().print_help()?;
+        println!();
+        return Ok(());
+    };
+    match command {
         Command::Init { room_name, host } => {
             let room = create_room(room_name, host, &[])?;
             let invite = create_invite(&room)?;

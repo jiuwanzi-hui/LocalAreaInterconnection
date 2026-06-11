@@ -18,6 +18,24 @@ fn run_cli(args: &[&str]) -> Value {
 }
 
 #[test]
+fn no_args_prints_help_successfully() {
+    let output = Command::new(env!("CARGO_BIN_EXE_lai-cli"))
+        .output()
+        .expect("run lai-cli");
+
+    assert!(
+        output.status.success(),
+        "lai-cli --help fallback failed\nstatus: {}\nstdout: {}\nstderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("Usage:"));
+    assert!(stdout.contains("diagnostic-export"));
+}
+
+#[test]
 fn init_outputs_room_and_invite() {
     let value = run_cli(&["init", "--room-name", "Friday LAN", "--host", "Alice"]);
     let room = &value[0];

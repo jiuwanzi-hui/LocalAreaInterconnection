@@ -71,6 +71,20 @@ Desktop test shell:
 .\dist\LocalAreaInterconnection.exe
 ```
 
+Build the latest Windows test shell:
+
+```powershell
+.\scripts\build-windows-test-shell.ps1
+```
+
+Build and launch it:
+
+```powershell
+.\scripts\run-windows-test-shell.ps1
+```
+
+In JetBrains IDEs, select `Build latest Windows exe` to only regenerate `dist\LocalAreaInterconnection.exe`, or select `Build and run Windows exe` to regenerate and launch it.
+
 The desktop test shell includes the current app icon, mist-blue background styling, soft glow, and static particle accents.
 It initializes language from the Windows UI culture, supports English/Chinese switching in the title bar, and remembers the user's choice.
 The desktop shell now starts from `LocalAreaInterconnection.exe`; the command backend is `LocalAreaInterconnection.Cli.exe`.

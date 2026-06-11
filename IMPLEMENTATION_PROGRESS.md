@@ -67,6 +67,46 @@
 
 ## 本轮进展
 
+### 2026-06-11 本次会话：修复 IDE 运行误报与生成最新版 exe 入口
+
+已完成：
+
+- 根据截图确认：IDE 里点击 `Run lai-cli` 报 `exit code: 2`，原因是 Rust CLI 未传子命令运行时 clap 按错误退出；不是代码编译失败。
+- 修改 `native/crates/lai-cli/src/main.rs`：
+  - `command` 改为可选。
+  - 无参数运行时打印 help 并正常退出 0。
+- 更新 `native/crates/lai-cli/tests/cli_smoke.rs`：
+  - 新增无参数运行测试，确保以后 `Run lai-cli` 不再因为只打印帮助而显示红色错误。
+- 新增 `scripts/build-windows-test-shell.ps1`：
+  - 一键重新编译 `dist/LocalAreaInterconnection.exe`。
+  - 同时重新编译 `dist/LocalAreaInterconnection.Cli.exe`。
+- 新增 `scripts/run-windows-test-shell.ps1`：
+  - 先构建最新版 Windows 测试壳。
+  - 再启动 `dist/LocalAreaInterconnection.exe`。
+- 新增 JetBrains 运行配置：
+  - `.run/Build latest Windows exe.run.xml`
+  - `.run/Build and run Windows exe.run.xml`
+- 更新 `README.md`，说明如何生成和启动最新版 exe。
+
+测试结果：
+
+- 在 `native/` 下执行 `cargo fmt`：通过。
+- 在 `native/` 下执行 `cargo test`：通过。
+  - Rust CLI 集成测试：5 个通过。
+  - Rust core 单元测试：26 个通过。
+- 执行 `cargo run -q -p lai-cli`：正常打印 help，退出码 0。
+- 执行 `.\scripts\build-windows-test-shell.ps1`：成功生成：
+  - `dist\LocalAreaInterconnection.exe`
+  - `dist\LocalAreaInterconnection.Cli.exe`
+- 执行 `.\scripts\run-windows-test-shell.ps1`：成功构建并启动 `dist\LocalAreaInterconnection.exe`，进程保持运行。
+
+使用提示：
+
+- 只想生成最新版 exe：在 IDE 右上角运行配置下拉里选 `Build latest Windows exe`，再点绿色运行按钮。
+- 想生成并直接打开：选 `Build and run Windows exe`，再点绿色运行按钮。
+- 手动双击运行：打开 `dist\LocalAreaInterconnection.exe`。
+- 不建议点 `lai-cli` 当桌面程序用；它只是命令行后端，点它只会显示命令帮助。
+
 ### 2026-06-11 本次会话：Rust 诊断导出、房间生命周期、运行时观测边界
 
 已完成：
