@@ -77,10 +77,22 @@ Build the latest Windows test shell:
 .\scripts\build-windows-test-shell.ps1
 ```
 
+Or double-click:
+
+```text
+build-latest-exe.bat
+```
+
 Build and launch it:
 
 ```powershell
 .\scripts\run-windows-test-shell.ps1
+```
+
+Or double-click:
+
+```text
+build-and-run-exe.bat
 ```
 
 In JetBrains IDEs, select `Build latest Windows exe` to only regenerate `dist\LocalAreaInterconnection.exe`, or select `Build and run Windows exe` to regenerate and launch it.
