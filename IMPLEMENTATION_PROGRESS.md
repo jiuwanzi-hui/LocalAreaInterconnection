@@ -29,7 +29,7 @@
 | 真实隧道服务 | 未完成 | 已有 tunnel service snapshot 到诊断观测的转换边界；P2P、加密、心跳、重连、路径统计服务仍未实现。 |
 | 真实广播/游戏包捕获与转发 | 未完成 | 已有 packet capture summary 到诊断观测的转换边界；真实虚拟网卡抓包和转发仍未实现。 |
 | 真实房间成员生命周期 | 部分完成 | Rust core 已有本地房间成员生命周期模型；尚未接入真实协调服务、在线心跳或桌面详情。 |
-| Git 仓库初始化 | 已完成 | 已执行 `git init`，并补充 `.gitignore` 忽略 IDE 与构建产物；尚未创建提交。 |
+| Git 仓库初始化 | 已完成 | 已执行 `git init`，补充 `.gitignore`，并创建首次基线提交。 |
 
 ## 当前状态
 
@@ -63,7 +63,7 @@
 - 桌面测试壳已支持创建/解析/加入房间、复制邀请码、复制虚拟 IP、网卡/防火墙/网络诊断、UDP/TCP/广播测试写入包观测文件、导出诊断包和右侧房间详情摘要。
 - Rust 工具链当前可用：`cargo 1.96.0`、`rustc 1.96.0`。
 - `native/` 已完成 `cargo fmt` 和 `cargo test`，当前 20 个 `lai-core` 测试通过，`lai-cli` 测试目标可编译。
-- 当前目录已初始化为 Git 仓库，尚未创建首次提交。
+- 当前目录已初始化为 Git 仓库，并已创建首次基线提交。
 
 ## 本轮进展
 
@@ -109,7 +109,8 @@
 - 更新 `.gitignore`：
   - 增加 `.idea/`。
   - 增加 `native/target/`。
-- 执行 `git init`，当前目录已初始化为 Git 仓库；尚未创建提交。
+- 执行 `git init`，当前目录已初始化为 Git 仓库。
+- 创建首次基线提交：`dbf167e Initial LocalAreaInterconnection baseline`。
 
 测试结果：
 
@@ -121,7 +122,7 @@
 - CLI 冒烟：
   - `diagnostic-export` 可写入临时 JSON bundle，stdout 返回 `status=ok`，bundle `schema_version=1`。
   - `room-summary --peer Bob --peer Carol` 输出 `member_count=3`、`online_count=3`、`status=Open`。
-- `git status --short` 当前显示仓库已初始化，源码/文档/资源均为未跟踪文件；没有创建提交。
+- 首次基线提交已创建，后续仅剩本进度文件更新需要追加提交。
 
 未完成：
 
@@ -130,7 +131,7 @@
 - `runtime_observation` 当前是服务接入边界，不是实际 tunnel/capture 服务。
 - `room_lifecycle` 当前是本地状态模型，不是协调服务、心跳服务或真实在线成员同步。
 - 桌面测试壳仍调用 C# CLI 后端，尚未切换到 Rust CLI/native service。
-- Git 仓库已初始化但尚未创建首次提交。
+- Git 仓库已初始化并创建首次基线提交。
 
 阻塞问题：
 
@@ -1025,6 +1026,6 @@
 - [x] 将 `diagnostic-export` 从 Windows C# 测试壳迁移到 Rust 原生核心边界。
 - [x] 在 Rust core 新增本地房间成员生命周期模型，用于后续接入真实成员列表、连接路径和延迟。
 - [x] 在 Rust core 新增 runtime observation 转换边界，用于未来接入真实隧道服务状态和真实广播/游戏包捕获摘要。
-- [ ] 创建首次 Git 提交。
+- [x] 创建首次 Git 提交。
 - [ ] 将 `network_observation` 接入真实隧道服务实现和真实广播/游戏包捕获实现。
 - [ ] 将桌面测试壳房间详情接入 Rust 房间生命周期模型或未来真实成员服务。
