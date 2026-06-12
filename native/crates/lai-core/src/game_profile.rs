@@ -2,9 +2,13 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub enum DiscoveryMode {
+    #[serde(rename = "udp_broadcast")]
     UdpBroadcast,
+    #[serde(rename = "direct_ip")]
     DirectIp,
+    #[serde(rename = "manual_ports")]
     ManualPorts,
+    #[serde(rename = "unknown")]
     Unknown,
 }
 
@@ -14,6 +18,7 @@ pub enum CompatibilityLevel {
     B,
     C,
     D,
+    #[serde(rename = "unknown")]
     Unknown,
 }
 

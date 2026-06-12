@@ -184,6 +184,59 @@ fn room_runtime_plan_uses_nat_bootstrap_selected_peer_endpoint() {
 }
 
 #[test]
+fn game_profile_plan_reads_catalog_and_outputs_network_plan() {
+    let path = std::env::temp_dir().join(format!(
+        "lai-cli-game-profile-catalog-{}.json",
+        std::process::id()
+    ));
+    let path_string = path.display().to_string();
+    fs::write(
+        &path,
+        serde_json::json!({
+            "profiles": [
+                {
+                    "game_name": "Example Game",
+                    "steam_app_id": "123456",
+                    "discovery": "udp_broadcast",
+                    "ports": [27016, 27015, 27015],
+                    "join_method": "lan_list_or_direct_ip",
+                    "compatibility": "A",
+                    "notes": "Allow private network firewall access."
+                }
+            ]
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let value = run_cli(&[
+        "game-profile-plan",
+        "--catalog",
+        &path_string,
+        "--game-name",
+        "example game",
+        "--subnet",
+        "10.77.12.0/24",
+        "--host-ip",
+        "10.77.12.1",
+        "--local-ip",
+        "10.77.12.2",
+    ]);
+    fs::remove_file(&path).ok();
+
+    assert_eq!(value["status"], "ok");
+    assert_eq!(value["matched_by"], "game_name");
+    assert_eq!(value["profile"]["game_name"], "Example Game");
+    assert_eq!(value["profile"]["discovery"], "udp_broadcast");
+    assert_eq!(value["profile"]["compatibility"], "A");
+    assert_eq!(value["plan"]["game_name"], "Example Game");
+    assert_eq!(value["plan"]["broadcast"]["enabled"], true);
+    assert_eq!(value["plan"]["firewall_rules"].as_array().unwrap().len(), 4);
+    assert_eq!(value["plan"]["host_ip"], "10.77.12.1");
+    assert_eq!(value["plan"]["local_ip"], "10.77.12.2");
+}
+
+#[test]
 fn room_runtime_run_can_bootstrap_nat_remote_peer_before_starting() {
     let probe = UdpSocket::bind("127.0.0.1:0").expect("free udp port");
     let listener_addr = probe.local_addr().unwrap();

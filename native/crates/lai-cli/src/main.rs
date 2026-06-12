@@ -6,16 +6,16 @@ use lai_core::{
     create_p2p_handshake_hello, create_room, create_room_runtime_plan, create_room_session,
     create_windows_firewall_plan, create_windows_virtual_adapter_ensure_report,
     create_windows_virtual_adapter_plan, decode_invite, evaluate_firewall_diagnostics,
-    evaluate_network_observations, network_snapshot_from_runtime, observation_from_expected_rule,
-    open_tunnel_payload, parse_netsh_adapter_observation, parse_netsh_firewall_rules,
-    parse_windows_ping_observation, seal_tunnel_payload, udp_forward_summary, AdapterObservation,
-    CommandExecutionRecord, CommandExecutionStatus, CompatibilityLevel,
-    DiagnosticExportEnvironment, DiagnosticExportInputs, DiagnosticExportSources,
-    DiagnosticSnapshot, DiagnosticTextSource, DiscoveryMode, FirewallRule, FirewallRuleObservation,
-    GameProfile, Ipv4Subnet, NetworkCommand, NetworkObservationSnapshot, P2pHandshakeAck,
-    P2pHandshakeHello, PacketCaptureSummary, PacketObservation, RoomRuntimePeer, RoomRuntimePlan,
-    TunnelEnvelope, TunnelObservation, TunnelServiceSnapshot, UdpForwardObservation,
-    VirtualUdpPacket,
+    evaluate_network_observations, find_game_profile, network_snapshot_from_runtime,
+    observation_from_expected_rule, open_tunnel_payload, parse_game_profile_catalog_json,
+    parse_netsh_adapter_observation, parse_netsh_firewall_rules, parse_windows_ping_observation,
+    seal_tunnel_payload, udp_forward_summary, AdapterObservation, CommandExecutionRecord,
+    CommandExecutionStatus, CompatibilityLevel, DiagnosticExportEnvironment,
+    DiagnosticExportInputs, DiagnosticExportSources, DiagnosticSnapshot, DiagnosticTextSource,
+    DiscoveryMode, FirewallRule, FirewallRuleObservation, GameProfile, Ipv4Subnet, NetworkCommand,
+    NetworkObservationSnapshot, P2pHandshakeAck, P2pHandshakeHello, PacketCaptureSummary,
+    PacketObservation, RoomRuntimePeer, RoomRuntimePlan, TunnelEnvelope, TunnelObservation,
+    TunnelServiceSnapshot, UdpForwardObservation, VirtualUdpPacket,
 };
 use rand::RngCore;
 use std::fs;
@@ -182,6 +182,22 @@ enum Command {
         host_ip: Option<String>,
         #[arg(long)]
         local_ip: Option<String>,
+    },
+    GameProfilePlan {
+        #[arg(long)]
+        catalog: String,
+        #[arg(long)]
+        game_name: Option<String>,
+        #[arg(long)]
+        steam_app_id: Option<String>,
+        #[arg(long)]
+        subnet: String,
+        #[arg(long)]
+        host_ip: Option<String>,
+        #[arg(long)]
+        local_ip: Option<String>,
+        #[arg(long, default_value_t = 30)]
+        max_broadcast_packets_per_second: u16,
     },
     FirewallPlan {
         #[arg(long, default_value = "Generic LAN Game")]
@@ -1086,6 +1102,54 @@ fn run_main() -> Result<(), Box<dyn std::error::Error>> {
                 30,
             );
             println!("{}", serde_json::to_string_pretty(&plan)?);
+        }
+        Command::GameProfilePlan {
+            catalog,
+            game_name,
+            steam_app_id,
+            subnet,
+            host_ip,
+            local_ip,
+            max_broadcast_packets_per_second,
+        } => {
+            if game_name.as_deref().unwrap_or_default().trim().is_empty()
+                && steam_app_id
+                    .as_deref()
+                    .unwrap_or_default()
+                    .trim()
+                    .is_empty()
+            {
+                return Err(invalid_input(
+                    "game-profile-plan requires --game-name or --steam-app-id".to_owned(),
+                ));
+            }
+            let catalog_text = fs::read_to_string(catalog)?;
+            let catalog = parse_game_profile_catalog_json(&catalog_text)?;
+            let matched =
+                find_game_profile(&catalog, game_name.as_deref(), steam_app_id.as_deref())
+                    .ok_or_else(|| {
+                        invalid_input(format!(
+                            "game profile not found for game_name={:?}, steam_app_id={:?}",
+                            game_name, steam_app_id
+                        ))
+                    })?;
+            let subnet = subnet.parse::<Ipv4Subnet>()?;
+            let plan = create_game_network_plan(
+                &matched.profile,
+                subnet,
+                parse_optional_ipv4(host_ip.as_deref())?,
+                parse_optional_ipv4(local_ip.as_deref())?,
+                max_broadcast_packets_per_second,
+            );
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "status": "ok",
+                    "matched_by": matched.matched_by,
+                    "profile": matched.profile,
+                    "plan": plan,
+                }))?
+            );
         }
         Command::FirewallPlan {
             game_name,

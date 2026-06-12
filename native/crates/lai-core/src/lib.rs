@@ -9,6 +9,7 @@ pub mod firewall_diagnostics;
 pub mod firewall_plan;
 pub mod game_network_plan;
 pub mod game_profile;
+pub mod game_profile_catalog;
 pub mod invite;
 pub mod ip;
 pub mod join_plan;
@@ -78,6 +79,9 @@ pub use game_network_plan::{
 };
 pub use game_profile::{
     normalize_ports, recommended_join_instruction, CompatibilityLevel, DiscoveryMode, GameProfile,
+};
+pub use game_profile_catalog::{
+    find_game_profile, parse_game_profile_catalog_json, GameProfileCatalog, GameProfileMatch,
 };
 pub use invite::{create_invite, decode_invite, verify_invite, InvitePayload};
 pub use ip::{broadcast_address, host_address, peer_address, subnet_for_room, Ipv4Subnet};
