@@ -1,5 +1,6 @@
 pub mod broadcast_policy;
 pub mod command_execution;
+pub mod coordination_room_view;
 pub mod coordination_store;
 pub mod diagnostic_export;
 pub mod diagnostics;
@@ -41,6 +42,9 @@ pub use broadcast_policy::{
 pub use command_execution::{
     create_command_execution_preview, CommandExecutionPreview, CommandExecutionRecord,
     CommandExecutionStatus,
+};
+pub use coordination_room_view::{
+    coordination_room_view, CoordinationRoomMemberView, CoordinationRoomView,
 };
 pub use coordination_store::{
     create_coordination_store, fetch_coordination_offers, heartbeat_coordination_peer,

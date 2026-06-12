@@ -1520,6 +1520,92 @@ fn coordination_store_publishes_fetches_and_heartbeats_offers() {
 }
 
 #[test]
+fn coordination_room_view_outputs_online_members() {
+    let path = std::env::temp_dir().join(format!(
+        "lai-cli-coordination-room-view-{}.json",
+        std::process::id()
+    ));
+    let path_string = path.display().to_string();
+    fs::remove_file(&path).ok();
+
+    run_cli(&["coordination-store-init", "--out", &path_string]);
+    let local = run_cli(&[
+        "nat-candidates",
+        "--room-id",
+        "room_test",
+        "--peer-id",
+        "peer_a",
+        "--bind",
+        "127.0.0.1:0",
+        "--nonce",
+        "nonce-a",
+    ]);
+    let remote = run_cli(&[
+        "nat-candidates",
+        "--room-id",
+        "room_test",
+        "--peer-id",
+        "peer_b",
+        "--bind",
+        "127.0.0.1:0",
+        "--nonce",
+        "nonce-b",
+    ]);
+    let local_offer = serde_json::to_string(&local["offer"]).unwrap();
+    let remote_offer = serde_json::to_string(&remote["offer"]).unwrap();
+    run_cli(&[
+        "coordination-offer-publish",
+        "--store",
+        &path_string,
+        "--offer",
+        &local_offer,
+        "--ttl-ms",
+        "30000",
+    ]);
+    run_cli(&[
+        "coordination-offer-publish",
+        "--store",
+        &path_string,
+        "--offer",
+        &remote_offer,
+        "--ttl-ms",
+        "30000",
+    ]);
+
+    let view = run_cli(&[
+        "coordination-room-view",
+        "--store",
+        &path_string,
+        "--room-id",
+        "room_test",
+        "--peer-id",
+        "peer_a",
+        "--subnet",
+        "10.77.12.0/24",
+    ]);
+    fs::remove_file(&path).ok();
+
+    assert_eq!(view["status"], "ready");
+    assert_eq!(view["room_id"], "room_test");
+    assert_eq!(view["local_peer_id"], "peer_a");
+    assert_eq!(view["member_count"], 2);
+    assert_eq!(view["online_count"], 2);
+    assert_eq!(view["expired_count"], 0);
+    assert_eq!(view["members"][0]["peer_id"], "peer_a");
+    assert_eq!(view["members"][0]["status"], "online");
+    assert!(view["members"][0]["virtual_ip"]
+        .as_str()
+        .unwrap()
+        .starts_with("10.77.12."));
+    assert_eq!(view["members"][1]["peer_id"], "peer_b");
+    assert!(view["members"][1]["candidate_count"].as_u64().unwrap() >= 1);
+    assert!(view["next_action"]
+        .as_str()
+        .unwrap()
+        .contains("runtime bootstrap"));
+}
+
+#[test]
 fn nat_hole_punch_loopback_exchanges_udp_packets() {
     let value = run_cli(&[
         "nat-hole-punch-loopback-test",

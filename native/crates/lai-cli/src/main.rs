@@ -555,6 +555,16 @@ enum Command {
         #[arg(long, default_value_t = 30000)]
         ttl_ms: u128,
     },
+    CoordinationRoomView {
+        #[arg(long)]
+        store: String,
+        #[arg(long)]
+        room_id: String,
+        #[arg(long)]
+        peer_id: String,
+        #[arg(long)]
+        subnet: String,
+    },
     CoordinationPrune {
         #[arg(long)]
         store: String,
@@ -1686,6 +1696,22 @@ fn run_main() -> Result<(), Box<dyn std::error::Error>> {
             );
             write_json_file(&store, &coordination_store)?;
             println!("{}", serde_json::to_string_pretty(&update)?);
+        }
+        Command::CoordinationRoomView {
+            store,
+            room_id,
+            peer_id,
+            subnet,
+        } => {
+            let coordination_store = load_coordination_store_or_default(&store)?;
+            let view = lai_core::coordination_room_view(
+                &coordination_store,
+                room_id,
+                peer_id,
+                subnet.parse::<Ipv4Subnet>()?,
+                current_epoch_ms(),
+            );
+            println!("{}", serde_json::to_string_pretty(&view)?);
         }
         Command::CoordinationPrune { store } => {
             let mut coordination_store = load_coordination_store_or_default(&store)?;
