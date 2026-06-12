@@ -555,6 +555,20 @@ enum Command {
         #[arg(long, default_value_t = 30000)]
         ttl_ms: u128,
     },
+    CoordinationLeave {
+        #[arg(long)]
+        store: String,
+        #[arg(long)]
+        room_id: String,
+        #[arg(long)]
+        peer_id: String,
+    },
+    CoordinationClose {
+        #[arg(long)]
+        store: String,
+        #[arg(long)]
+        room_id: String,
+    },
     CoordinationRoomView {
         #[arg(long)]
         store: String,
@@ -604,6 +618,20 @@ enum Command {
         peer_id: String,
         #[arg(long, default_value_t = 30000)]
         ttl_ms: u128,
+    },
+    CoordinationHttpLeave {
+        #[arg(long)]
+        server: String,
+        #[arg(long)]
+        room_id: String,
+        #[arg(long)]
+        peer_id: String,
+    },
+    CoordinationHttpClose {
+        #[arg(long)]
+        server: String,
+        #[arg(long)]
+        room_id: String,
     },
     CoordinationHttpPrune {
         #[arg(long)]
@@ -1697,6 +1725,27 @@ fn run_main() -> Result<(), Box<dyn std::error::Error>> {
             write_json_file(&store, &coordination_store)?;
             println!("{}", serde_json::to_string_pretty(&update)?);
         }
+        Command::CoordinationLeave {
+            store,
+            room_id,
+            peer_id,
+        } => {
+            let mut coordination_store = load_coordination_store_or_default(&store)?;
+            let report = lai_core::leave_coordination_room(
+                &mut coordination_store,
+                room_id,
+                peer_id,
+                current_epoch_ms(),
+            );
+            write_json_file(&store, &coordination_store)?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
+        }
+        Command::CoordinationClose { store, room_id } => {
+            let mut coordination_store = load_coordination_store_or_default(&store)?;
+            let report = lai_core::close_coordination_room(&mut coordination_store, room_id);
+            write_json_file(&store, &coordination_store)?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
+        }
         Command::CoordinationRoomView {
             store,
             room_id,
@@ -1756,6 +1805,18 @@ fn run_main() -> Result<(), Box<dyn std::error::Error>> {
             ttl_ms,
         } => {
             let result = coordination_http_heartbeat(&server, &room_id, &peer_id, ttl_ms)?;
+            println!("{}", serde_json::to_string_pretty(&result)?);
+        }
+        Command::CoordinationHttpLeave {
+            server,
+            room_id,
+            peer_id,
+        } => {
+            let result = coordination_http_leave(&server, &room_id, &peer_id)?;
+            println!("{}", serde_json::to_string_pretty(&result)?);
+        }
+        Command::CoordinationHttpClose { server, room_id } => {
+            let result = coordination_http_close(&server, &room_id)?;
             println!("{}", serde_json::to_string_pretty(&result)?);
         }
         Command::CoordinationHttpPrune { server } => {
@@ -2661,6 +2722,21 @@ fn handle_coordination_http_request(
             write_json_file(store_path, store)?;
             Ok((200, serde_json::to_value(update)?))
         }
+        ("POST", ["v1", "rooms", room_id, "peers", peer_id, "leave"]) => {
+            let report = lai_core::leave_coordination_room(
+                store,
+                room_id.to_owned(),
+                peer_id.to_owned(),
+                current_epoch_ms(),
+            );
+            write_json_file(store_path, store)?;
+            Ok((200, serde_json::to_value(report)?))
+        }
+        ("POST", ["v1", "rooms", room_id, "close"]) => {
+            let report = lai_core::close_coordination_room(store, room_id.to_owned());
+            write_json_file(store_path, store)?;
+            Ok((200, serde_json::to_value(report)?))
+        }
         ("POST", ["v1", "prune"]) => {
             let report = lai_core::prune_expired_coordination_peers(store, current_epoch_ms());
             write_json_file(store_path, store)?;
@@ -2806,6 +2882,36 @@ fn coordination_http_heartbeat(
             percent_encode(peer_id)
         ),
         &serde_json::json!({ "ttlMs": ttl_ms }),
+    )
+}
+
+fn coordination_http_leave(
+    server: &str,
+    room_id: &str,
+    peer_id: &str,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    http_post_json(
+        &format!(
+            "{}/v1/rooms/{}/peers/{}/leave",
+            trim_trailing_slash(server),
+            percent_encode(room_id),
+            percent_encode(peer_id)
+        ),
+        &serde_json::json!({}),
+    )
+}
+
+fn coordination_http_close(
+    server: &str,
+    room_id: &str,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    http_post_json(
+        &format!(
+            "{}/v1/rooms/{}/close",
+            trim_trailing_slash(server),
+            percent_encode(room_id)
+        ),
+        &serde_json::json!({}),
     )
 }
 

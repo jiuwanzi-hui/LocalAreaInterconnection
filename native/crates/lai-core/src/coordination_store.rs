@@ -48,6 +48,24 @@ pub struct CoordinationPruneReport {
     pub removed_room_count: usize,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct CoordinationLeaveReport {
+    pub status: String,
+    pub room_id: String,
+    pub peer_id: String,
+    pub peer_removed: bool,
+    pub room_removed: bool,
+    pub remaining_peer_count: usize,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct CoordinationCloseReport {
+    pub status: String,
+    pub room_id: String,
+    pub room_removed: bool,
+    pub removed_peer_count: usize,
+}
+
 pub fn create_coordination_store() -> CoordinationStore {
     CoordinationStore {
         schema_version: 1,
@@ -176,6 +194,70 @@ pub fn prune_expired_coordination_peers(
     }
 }
 
+pub fn leave_coordination_room(
+    store: &mut CoordinationStore,
+    room_id: impl Into<String>,
+    peer_id: impl Into<String>,
+    now_ms: u128,
+) -> CoordinationLeaveReport {
+    let room_id = room_id.into();
+    let peer_id = peer_id.into();
+    let Some(room_index) = store.rooms.iter().position(|room| room.room_id == room_id) else {
+        return CoordinationLeaveReport {
+            status: "not-found".to_owned(),
+            room_id,
+            peer_id,
+            peer_removed: false,
+            room_removed: false,
+            remaining_peer_count: 0,
+        };
+    };
+
+    let room = &mut store.rooms[room_index];
+    let before = room.peers.len();
+    room.peers.retain(|peer| peer.peer_id != peer_id);
+    let peer_removed = room.peers.len() != before;
+    room.updated_at_ms = now_ms;
+    let remaining_peer_count = room.peers.len();
+    let room_removed = room.peers.is_empty();
+    if room_removed {
+        store.rooms.remove(room_index);
+    }
+
+    CoordinationLeaveReport {
+        status: if peer_removed { "ok" } else { "not-found" }.to_owned(),
+        room_id,
+        peer_id,
+        peer_removed,
+        room_removed,
+        remaining_peer_count,
+    }
+}
+
+pub fn close_coordination_room(
+    store: &mut CoordinationStore,
+    room_id: impl Into<String>,
+) -> CoordinationCloseReport {
+    let room_id = room_id.into();
+    let Some(room_index) = store.rooms.iter().position(|room| room.room_id == room_id) else {
+        return CoordinationCloseReport {
+            status: "not-found".to_owned(),
+            room_id,
+            room_removed: false,
+            removed_peer_count: 0,
+        };
+    };
+    let removed_peer_count = store.rooms[room_index].peers.len();
+    store.rooms.remove(room_index);
+
+    CoordinationCloseReport {
+        status: "ok".to_owned(),
+        room_id,
+        room_removed: true,
+        removed_peer_count,
+    }
+}
+
 fn get_or_insert_room<'a>(
     store: &'a mut CoordinationStore,
     room_id: &str,
@@ -250,5 +332,46 @@ mod tests {
         assert_eq!(fetched.offers[0].peer_id, "peer_b");
         assert_eq!(expired.status, "empty");
         assert_eq!(expired.expired_peer_count, 2);
+    }
+
+    #[test]
+    fn coordination_store_leaves_and_closes_rooms() {
+        let mut store = create_coordination_store();
+        let offer_a = create_nat_traversal_offer(
+            "room",
+            "peer_a",
+            "a",
+            10,
+            "127.0.0.1:10000".parse().unwrap(),
+            None,
+            vec![],
+        );
+        let offer_b = create_nat_traversal_offer(
+            "room",
+            "peer_b",
+            "b",
+            20,
+            "127.0.0.1:10001".parse().unwrap(),
+            None,
+            vec![],
+        );
+        publish_coordination_offer(&mut store, offer_a, 100, 1000);
+        publish_coordination_offer(&mut store, offer_b, 110, 1000);
+
+        let leave = leave_coordination_room(&mut store, "room", "peer_a", 120);
+        let fetched = fetch_coordination_offers(&mut store, "room", "peer_b", 130);
+        let close = close_coordination_room(&mut store, "room");
+        let close_again = close_coordination_room(&mut store, "room");
+
+        assert_eq!(leave.status, "ok");
+        assert!(leave.peer_removed);
+        assert!(!leave.room_removed);
+        assert_eq!(leave.remaining_peer_count, 1);
+        assert_eq!(fetched.status, "empty");
+        assert_eq!(close.status, "ok");
+        assert!(close.room_removed);
+        assert_eq!(close.removed_peer_count, 1);
+        assert_eq!(close_again.status, "not-found");
+        assert_eq!(store.rooms.len(), 0);
     }
 }

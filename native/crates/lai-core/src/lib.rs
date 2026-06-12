@@ -47,10 +47,11 @@ pub use coordination_room_view::{
     coordination_room_view, CoordinationRoomMemberView, CoordinationRoomView,
 };
 pub use coordination_store::{
-    create_coordination_store, fetch_coordination_offers, heartbeat_coordination_peer,
-    prune_expired_coordination_peers, publish_coordination_offer, CoordinationFetchResult,
-    CoordinationPeer, CoordinationPruneReport, CoordinationRoom, CoordinationStore,
-    CoordinationStoreUpdate,
+    close_coordination_room, create_coordination_store, fetch_coordination_offers,
+    heartbeat_coordination_peer, leave_coordination_room, prune_expired_coordination_peers,
+    publish_coordination_offer, CoordinationCloseReport, CoordinationFetchResult,
+    CoordinationLeaveReport, CoordinationPeer, CoordinationPruneReport, CoordinationRoom,
+    CoordinationStore, CoordinationStoreUpdate,
 };
 pub use diagnostic_export::{
     create_diagnostic_export_bundle, DiagnosticAdapterScanSection, DiagnosticExportBundle,

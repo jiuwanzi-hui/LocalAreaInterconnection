@@ -479,6 +479,122 @@ fn coordination_http_server_publishes_fetches_and_heartbeats_offers() {
 }
 
 #[test]
+fn coordination_http_server_leaves_and_closes_rooms() {
+    let probe = TcpListener::bind("127.0.0.1:0").expect("free local port");
+    let server_addr = probe.local_addr().unwrap();
+    drop(probe);
+    let store_path = std::env::temp_dir().join(format!(
+        "lai-cli-coordination-http-leave-close-store-{}.json",
+        std::process::id()
+    ));
+    let store_path_string = store_path.display().to_string();
+    fs::remove_file(&store_path).ok();
+
+    let server = Command::new(env!("CARGO_BIN_EXE_lai-cli"))
+        .args([
+            "coordination-http-serve",
+            "--bind",
+            &server_addr.to_string(),
+            "--store",
+            &store_path_string,
+            "--max-requests",
+            "4",
+            "--request-timeout-ms",
+            "5000",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn coordination http server");
+    std::thread::sleep(Duration::from_millis(100));
+    let server_url = format!("http://{server_addr}");
+
+    let offer_a = serde_json::json!({
+        "schema_version": 1,
+        "room_id": "room_test",
+        "peer_id": "peer_a",
+        "nonce": "nonce-a",
+        "created_at_ms": 1,
+        "candidates": [{
+            "candidate_type": "host",
+            "transport": "udp",
+            "endpoint": "127.0.0.1:39090",
+            "priority": 100,
+            "source": "test"
+        }]
+    });
+    let offer_b = serde_json::json!({
+        "schema_version": 1,
+        "room_id": "room_test",
+        "peer_id": "peer_b",
+        "nonce": "nonce-b",
+        "created_at_ms": 1,
+        "candidates": [{
+            "candidate_type": "host",
+            "transport": "udp",
+            "endpoint": "127.0.0.1:39091",
+            "priority": 100,
+            "source": "test"
+        }]
+    });
+    let offer_a = serde_json::to_string(&offer_a).unwrap();
+    let offer_b = serde_json::to_string(&offer_b).unwrap();
+    run_cli(&[
+        "coordination-http-offer-publish",
+        "--server",
+        &server_url,
+        "--offer",
+        &offer_a,
+        "--ttl-ms",
+        "30000",
+    ]);
+    run_cli(&[
+        "coordination-http-offer-publish",
+        "--server",
+        &server_url,
+        "--offer",
+        &offer_b,
+        "--ttl-ms",
+        "30000",
+    ]);
+    let leave = run_cli(&[
+        "coordination-http-leave",
+        "--server",
+        &server_url,
+        "--room-id",
+        "room_test",
+        "--peer-id",
+        "peer_a",
+    ]);
+    let close = run_cli(&[
+        "coordination-http-close",
+        "--server",
+        &server_url,
+        "--room-id",
+        "room_test",
+    ]);
+    let server_output = server.wait_with_output().expect("server exits");
+    fs::remove_file(&store_path).ok();
+
+    assert_eq!(leave["status"], "ok");
+    assert_eq!(leave["peer_removed"], true);
+    assert_eq!(leave["remaining_peer_count"], 1);
+    assert_eq!(close["status"], "ok");
+    assert_eq!(close["room_removed"], true);
+    assert_eq!(close["removed_peer_count"], 1);
+    assert!(
+        server_output.status.success(),
+        "server failed\nstatus: {}\nstdout: {}\nstderr: {}",
+        server_output.status,
+        String::from_utf8_lossy(&server_output.stdout),
+        String::from_utf8_lossy(&server_output.stderr)
+    );
+    let server_json: Value =
+        serde_json::from_slice(&server_output.stdout).expect("server final json");
+    assert_eq!(server_json["handledRequests"], 4);
+}
+
+#[test]
 fn room_runtime_run_fetches_http_coordination_offer_before_bootstrap() {
     let http_probe = TcpListener::bind("127.0.0.1:0").expect("free local port");
     let server_addr = http_probe.local_addr().unwrap();
@@ -1517,6 +1633,111 @@ fn coordination_store_publishes_fetches_and_heartbeats_offers() {
     assert_eq!(fetch_for_a["offers"][0]["peer_id"], "peer_b");
     assert_eq!(heartbeat["status"], "ok");
     assert_eq!(heartbeat["peer_id"], "peer_a");
+}
+
+#[test]
+fn coordination_store_leaves_and_closes_rooms() {
+    let path = std::env::temp_dir().join(format!(
+        "lai-cli-coordination-leave-close-{}.json",
+        std::process::id()
+    ));
+    let path_string = path.display().to_string();
+    fs::remove_file(&path).ok();
+
+    run_cli(&["coordination-store-init", "--out", &path_string]);
+    let local = run_cli(&[
+        "nat-candidates",
+        "--room-id",
+        "room_test",
+        "--peer-id",
+        "peer_a",
+        "--bind",
+        "127.0.0.1:0",
+        "--nonce",
+        "nonce-a",
+    ]);
+    let remote = run_cli(&[
+        "nat-candidates",
+        "--room-id",
+        "room_test",
+        "--peer-id",
+        "peer_b",
+        "--bind",
+        "127.0.0.1:0",
+        "--nonce",
+        "nonce-b",
+    ]);
+    let local_offer = serde_json::to_string(&local["offer"]).unwrap();
+    let remote_offer = serde_json::to_string(&remote["offer"]).unwrap();
+    run_cli(&[
+        "coordination-offer-publish",
+        "--store",
+        &path_string,
+        "--offer",
+        &local_offer,
+        "--ttl-ms",
+        "30000",
+    ]);
+    run_cli(&[
+        "coordination-offer-publish",
+        "--store",
+        &path_string,
+        "--offer",
+        &remote_offer,
+        "--ttl-ms",
+        "30000",
+    ]);
+
+    let leave = run_cli(&[
+        "coordination-leave",
+        "--store",
+        &path_string,
+        "--room-id",
+        "room_test",
+        "--peer-id",
+        "peer_a",
+    ]);
+    let view_after_leave = run_cli(&[
+        "coordination-room-view",
+        "--store",
+        &path_string,
+        "--room-id",
+        "room_test",
+        "--peer-id",
+        "peer_b",
+        "--subnet",
+        "10.77.12.0/24",
+    ]);
+    let close = run_cli(&[
+        "coordination-close",
+        "--store",
+        &path_string,
+        "--room-id",
+        "room_test",
+    ]);
+    let view_after_close = run_cli(&[
+        "coordination-room-view",
+        "--store",
+        &path_string,
+        "--room-id",
+        "room_test",
+        "--peer-id",
+        "peer_b",
+        "--subnet",
+        "10.77.12.0/24",
+    ]);
+    fs::remove_file(&path).ok();
+
+    assert_eq!(leave["status"], "ok");
+    assert_eq!(leave["peer_removed"], true);
+    assert_eq!(leave["room_removed"], false);
+    assert_eq!(leave["remaining_peer_count"], 1);
+    assert_eq!(view_after_leave["member_count"], 1);
+    assert_eq!(view_after_leave["members"][0]["peer_id"], "peer_b");
+    assert_eq!(close["status"], "ok");
+    assert_eq!(close["room_removed"], true);
+    assert_eq!(close["removed_peer_count"], 1);
+    assert_eq!(view_after_close["member_count"], 0);
 }
 
 #[test]

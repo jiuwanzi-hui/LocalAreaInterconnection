@@ -823,6 +823,7 @@ public class LocalAreaInterconnectionDesktop : Form
             output.Text = T("runtimeNotRunning");
             return;
         }
+        string leaveOutput = LeaveCoordinationRoomIfConfigured();
         if (runtimeStopFile.Length > 0)
         {
             File.WriteAllText(runtimeStopFile, "stop");
@@ -831,6 +832,10 @@ public class LocalAreaInterconnectionDesktop : Form
         output.Text = T("runtimeStopped")
             + Environment.NewLine + RuntimeStatusText()
             + Environment.NewLine + runtimeOutput.ToString();
+        if (leaveOutput.Length > 0)
+        {
+            output.Text += Environment.NewLine + Environment.NewLine + leaveOutput;
+        }
         if (latestRuntimeSnapshot.Length > 0 && File.Exists(latestRuntimeSnapshot))
         {
             output.Text += Environment.NewLine + T("runtimeSnapshotReady") + latestRuntimeSnapshot;
@@ -1219,6 +1224,22 @@ public class LocalAreaInterconnectionDesktop : Form
             + " --offer " + Quote(latestNativeOfferFile)
             + " --ttl-ms 30000";
         return showOutput ? RunNativeCli(arguments) : RunNativeCliCapture(arguments);
+    }
+
+    string LeaveCoordinationRoomIfConfigured()
+    {
+        string server = coordinationServer.Text.Trim();
+        if (server.Length == 0)
+        {
+            return "";
+        }
+        string peer = SafePeerId(hostName.Text);
+        string result = RunNativeCliCapture("coordination-http-leave"
+            + " --server " + Quote(server)
+            + " --room-id desktop_runtime"
+            + " --peer-id " + Quote(peer));
+        RefreshCoordinationRoomView(false);
+        return T("coordinationLeft") + Environment.NewLine + result;
     }
 
     string CreateNativeOffer(string peer, bool showOutput)
@@ -1893,6 +1914,7 @@ public class LocalAreaInterconnectionDesktop : Form
             if (key == "coordinationRoomStatus") return "房间";
             if (key == "coordinationOnline") return "在线";
             if (key == "coordinationExpired") return "过期";
+            if (key == "coordinationLeft") return "已从协调房间离开:";
             if (key == "textFilesFilter") return "文本文件 (*.txt)|*.txt|所有文件 (*.*)|*.*";
             if (key == "jsonFilesFilter") return "JSON 文件 (*.json)|*.json|所有文件 (*.*)|*.*";
             if (key == "missingCli") return "缺少 CLI 程序: ";
@@ -2007,6 +2029,7 @@ public class LocalAreaInterconnectionDesktop : Form
             if (key == "coordinationRoomStatus") return "room";
             if (key == "coordinationOnline") return "online";
             if (key == "coordinationExpired") return "expired";
+            if (key == "coordinationLeft") return "Left coordination room:";
             if (key == "textFilesFilter") return "Text files (*.txt)|*.txt|All files (*.*)|*.*";
             if (key == "jsonFilesFilter") return "JSON files (*.json)|*.json|All files (*.*)|*.*";
             if (key == "missingCli") return "Missing CLI executable: ";
