@@ -184,6 +184,7 @@ public class LocalAreaInterconnectionDesktop : Form
         AddButton(actionsPanel, "joinRoom", delegate { JoinRoom(); });
         AddButton(actionsPanel, "adapterPlan", delegate { RunCli("adapter-plan --subnet " + subnet.Text + " --ip " + ip.Text); });
         AddButton(actionsPanel, "adapterScan", delegate { RunCli("adapter-scan --adapter-name LocalAreaInterconnection --subnet " + subnet.Text + " --ip " + ip.Text); });
+        AddButton(actionsPanel, "nativeAdapterEnsure", delegate { RunNativeAdapterEnsure(); });
         AddButton(actionsPanel, "gamePlan", delegate { RunCli("game-plan --game-name " + Quote(gameName.Text) + " --subnet " + subnet.Text + " --ports " + ports.Text); });
         AddButton(actionsPanel, "firewallPlan", delegate { RunCli("firewall-plan --game-name " + Quote(gameName.Text) + " --subnet " + subnet.Text + " --ports " + ports.Text); });
         AddButton(actionsPanel, "firewallDiagnose", delegate { RunCli(FirewallDiagnoseArgs()); });
@@ -193,6 +194,8 @@ public class LocalAreaInterconnectionDesktop : Form
         AddButton(actionsPanel, "exportDiagnostics", delegate { ExportDiagnostics(); });
         AddButton(actionsPanel, "udpTest", delegate { RunUdpTest(); });
         AddButton(actionsPanel, "broadcastTest", delegate { RunBroadcastTest(); });
+        AddButton(actionsPanel, "nativeRuntimeSelfTest", delegate { RunNativeRuntimeSelfTest(); });
+        AddButton(actionsPanel, "nativeNatSelfTest", delegate { RunNativeNatSelfTest(); });
         AddButton(actionsPanel, "tcpTest", delegate { RunTcpTest(); });
         AddButton(actionsPanel, "browseNetsh", delegate { BrowseNetshOutput(); });
         AddButton(actionsPanel, "browsePackets", delegate { BrowsePacketObservations(); });
@@ -363,7 +366,7 @@ public class LocalAreaInterconnectionDesktop : Form
     {
         Button button = new Button();
         button.Text = T(key);
-        button.Width = 116;
+        button.Width = Math.Min(184, Math.Max(116, TextRenderer.MeasureText(button.Text, Font).Width + 24));
         button.Height = 28;
         button.Margin = new Padding(0, 0, 8, 8);
         button.FlatStyle = FlatStyle.Flat;
@@ -641,7 +644,7 @@ public class LocalAreaInterconnectionDesktop : Form
                 return;
             }
 
-            RunCli("diagnostic-export --out " + Quote(dialog.FileName)
+            RunNativeCli("diagnostic-export --out " + Quote(dialog.FileName)
                 + " --adapter-name LocalAreaInterconnection"
                 + " --expected-ip " + ip.Text
                 + " --subnet " + subnet.Text
@@ -651,6 +654,7 @@ public class LocalAreaInterconnectionDesktop : Form
                 + " --game-ports " + ports.Text
                 + " --game-name " + Quote(gameName.Text)
                 + " --ports " + ports.Text
+                + " --packet-io-backend wintun"
                 + NetshExportArgs());
             UpdateRoomDetails("exported");
         }
@@ -664,6 +668,59 @@ public class LocalAreaInterconnectionDesktop : Form
     void RunBroadcastTest()
     {
         RunPacketTestAndRefresh("udp-broadcast-test --port " + FirstPortText("39078") + " --message discover");
+    }
+
+    void RunNativeAdapterEnsure()
+    {
+        RunNativeCli("adapter-ensure --adapter-name LocalAreaInterconnection"
+            + " --subnet " + subnet.Text
+            + " --ip " + ip.Text
+            + " --adapter-scan true");
+    }
+
+    void RunNativeRuntimeSelfTest()
+    {
+        string observePath = packetObservations.Text.Trim();
+        if (observePath.Length == 0)
+        {
+            observePath = Path.Combine(AppDataDirectory(), "runtime-packets.txt");
+            packetObservations.Text = observePath;
+        }
+        string snapshotPath = Path.Combine(AppDataDirectory(), "runtime-snapshot.json");
+        string peer = SafePeerId(hostName.Text);
+        string nativeOutput = RunNativeCli("room-runtime-run"
+            + " --room-id desktop_self_test"
+            + " --peer-id " + Quote(peer)
+            + " --virtual-ip " + ip.Text
+            + " --bind 127.0.0.1:0"
+            + " --key desktop-test-room-key"
+            + " --game-ports 0"
+            + " --broadcast-ports 0"
+            + " --duration-ms 300"
+            + " --self-probe true"
+            + " --capture-self-probe true"
+            + " --forward-self-probe true"
+            + " --inject-self-probe true"
+            + " --packet-io-backend wintun"
+            + " --forward-raw-ipv4 true"
+            + " --wintun-runtime true"
+            + " --heartbeat-interval-ms 75"
+            + " --observe-file " + Quote(observePath)
+            + " --snapshot-out " + Quote(snapshotPath)
+            + " --snapshot-interval-ms 75");
+        string diagnosticOutput = RunNetworkDiagnoseAndReturn();
+        output.Text = nativeOutput + Environment.NewLine + Environment.NewLine + T("autoNetworkDiagnose") + Environment.NewLine + diagnosticOutput;
+    }
+
+    void RunNativeNatSelfTest()
+    {
+        RunNativeCli("nat-hole-punch-loopback-test"
+            + " --room-id desktop_self_test"
+            + " --peer-a " + Quote(SafePeerId(hostName.Text) + "_a")
+            + " --peer-b " + Quote(SafePeerId(hostName.Text) + "_b")
+            + " --attempts 3"
+            + " --interval-ms 0"
+            + " --message desktop-nat");
     }
 
     void RunTcpTest()
@@ -753,6 +810,21 @@ public class LocalAreaInterconnectionDesktop : Form
         return text.Length == 0 ? T("stateUnknown") : text;
     }
 
+    string SafePeerId(string value)
+    {
+        string text = value == null ? "" : value.Trim();
+        if (text.Length == 0) return "desktop_peer";
+        char[] chars = text.ToCharArray();
+        for (int i = 0; i < chars.Length; i++)
+        {
+            if (!Char.IsLetterOrDigit(chars[i]) && chars[i] != '_' && chars[i] != '-')
+            {
+                chars[i] = '_';
+            }
+        }
+        return new string(chars);
+    }
+
     string NetshExportArgs()
     {
         string path = netshOutput.Text.Trim();
@@ -803,7 +875,22 @@ public class LocalAreaInterconnectionDesktop : Form
             output.Text = T("missingCli") + exe;
             return output.Text;
         }
+        return RunExecutable(exe, arguments);
+    }
 
+    string RunNativeCli(string arguments)
+    {
+        string exe = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "LocalAreaInterconnection.Native.Cli.exe");
+        if (!File.Exists(exe))
+        {
+            output.Text = T("missingNativeCli") + exe;
+            return output.Text;
+        }
+        return RunExecutable(exe, arguments);
+    }
+
+    string RunExecutable(string exe, string arguments)
+    {
         ProcessStartInfo start = new ProcessStartInfo();
         start.FileName = exe;
         start.Arguments = arguments;
@@ -937,10 +1024,16 @@ public class LocalAreaInterconnectionDesktop : Form
 
     string SettingsPath()
     {
-        return Path.Combine(
+        return Path.Combine(AppDataDirectory(), "settings.lang");
+    }
+
+    string AppDataDirectory()
+    {
+        string directory = Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
-            "LocalAreaInterconnection",
-            "settings.lang");
+            "LocalAreaInterconnection");
+        if (!Directory.Exists(directory)) Directory.CreateDirectory(directory);
+        return directory;
     }
 
     string T(string key)
@@ -968,6 +1061,7 @@ public class LocalAreaInterconnectionDesktop : Form
             if (key == "joinRoom") return "加入房间";
             if (key == "adapterPlan") return "网卡计划";
             if (key == "adapterScan") return "扫描网卡";
+            if (key == "nativeAdapterEnsure") return "原生网卡检查";
             if (key == "gamePlan") return "游戏计划";
             if (key == "firewallPlan") return "防火墙计划";
             if (key == "firewallDiagnose") return "防火墙诊断";
@@ -977,6 +1071,8 @@ public class LocalAreaInterconnectionDesktop : Form
             if (key == "exportDiagnostics") return "导出诊断";
             if (key == "udpTest") return "UDP 测试";
             if (key == "broadcastTest") return "广播测试";
+            if (key == "nativeRuntimeSelfTest") return "原生隧道自检";
+            if (key == "nativeNatSelfTest") return "NAT 自检";
             if (key == "tcpTest") return "TCP 测试";
             if (key == "browseNetsh") return "选择 Netsh";
             if (key == "browsePackets") return "选择包文件";
@@ -1019,6 +1115,7 @@ public class LocalAreaInterconnectionDesktop : Form
             if (key == "textFilesFilter") return "文本文件 (*.txt)|*.txt|所有文件 (*.*)|*.*";
             if (key == "jsonFilesFilter") return "JSON 文件 (*.json)|*.json|所有文件 (*.*)|*.*";
             if (key == "missingCli") return "缺少 CLI 程序: ";
+            if (key == "missingNativeCli") return "缺少 Rust 原生 CLI 程序，请先重新生成 exe: ";
         }
         else
         {
@@ -1043,6 +1140,7 @@ public class LocalAreaInterconnectionDesktop : Form
             if (key == "joinRoom") return "Join room";
             if (key == "adapterPlan") return "Adapter plan";
             if (key == "adapterScan") return "Adapter scan";
+            if (key == "nativeAdapterEnsure") return "Native adapter check";
             if (key == "gamePlan") return "Game plan";
             if (key == "firewallPlan") return "Firewall plan";
             if (key == "firewallDiagnose") return "Firewall diagnose";
@@ -1052,6 +1150,8 @@ public class LocalAreaInterconnectionDesktop : Form
             if (key == "exportDiagnostics") return "Export diagnostics";
             if (key == "udpTest") return "UDP test";
             if (key == "broadcastTest") return "Broadcast test";
+            if (key == "nativeRuntimeSelfTest") return "Native tunnel self-test";
+            if (key == "nativeNatSelfTest") return "NAT self-test";
             if (key == "tcpTest") return "TCP test";
             if (key == "browseNetsh") return "Browse netsh";
             if (key == "browsePackets") return "Browse packets";
@@ -1094,6 +1194,7 @@ public class LocalAreaInterconnectionDesktop : Form
             if (key == "textFilesFilter") return "Text files (*.txt)|*.txt|All files (*.*)|*.*";
             if (key == "jsonFilesFilter") return "JSON files (*.json)|*.json|All files (*.*)|*.*";
             if (key == "missingCli") return "Missing CLI executable: ";
+            if (key == "missingNativeCli") return "Missing Rust native CLI executable. Build the latest exe first: ";
         }
         return key;
     }

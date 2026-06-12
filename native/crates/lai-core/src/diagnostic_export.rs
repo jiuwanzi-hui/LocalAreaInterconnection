@@ -54,6 +54,8 @@ pub struct DiagnosticExportSources {
     pub packets: Vec<PacketObservation>,
     pub packet_raw_lines: Vec<String>,
     pub packet_error: Option<String>,
+    pub packet_io_plan: Option<serde_json::Value>,
+    pub packet_io_probe: Option<serde_json::Value>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -68,6 +70,7 @@ pub struct DiagnosticExportBundle {
     pub firewall_scan: DiagnosticFirewallScanSection,
     pub ping: DiagnosticPingSection,
     pub packet_observations: DiagnosticPacketSection,
+    pub packet_io: DiagnosticPacketIoSection,
     pub network_observation: NetworkObservationReport,
     pub notes: Vec<String>,
 }
@@ -112,6 +115,16 @@ pub struct DiagnosticPacketSection {
     pub error: Option<String>,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct DiagnosticPacketIoSection {
+    pub status: String,
+    pub backend: Option<String>,
+    pub adapter_read_status: Option<String>,
+    pub adapter_write_status: Option<String>,
+    pub plan: Option<serde_json::Value>,
+    pub probe: Option<serde_json::Value>,
+}
+
 pub fn create_diagnostic_export_bundle(
     created_at_epoch_ms: u128,
     environment: DiagnosticExportEnvironment,
@@ -122,6 +135,7 @@ pub fn create_diagnostic_export_bundle(
     let firewall_scan = create_firewall_section(&inputs, &sources.firewall_netsh);
     let ping = create_ping_section(&inputs, sources.ping_output.as_ref());
     let packet_observations = create_packet_section(&inputs, &sources);
+    let packet_io = create_packet_io_section(&sources);
     let network_observation = evaluate_network_observations(NetworkObservationSnapshot {
         adapter: adapter_scan.observation.clone(),
         tunnel: ping.observation.clone(),
@@ -135,6 +149,7 @@ pub fn create_diagnostic_export_bundle(
         firewall_scan.status.as_str(),
         ping.status.as_str(),
         packet_observations.status.as_str(),
+        packet_io.status.as_str(),
         network_observation.status.as_str(),
     ]
     .iter()
@@ -147,7 +162,7 @@ pub fn create_diagnostic_export_bundle(
     .to_owned();
 
     DiagnosticExportBundle {
-        schema_version: 1,
+        schema_version: 2,
         status,
         created_at_epoch_ms,
         tool: "LocalAreaInterconnection Rust CLI".to_owned(),
@@ -157,6 +172,7 @@ pub fn create_diagnostic_export_bundle(
         firewall_scan,
         ping,
         packet_observations,
+        packet_io,
         network_observation,
         notes: vec![
             "This bundle is read-only and does not modify Windows Firewall or adapter settings."
@@ -322,6 +338,55 @@ fn packet_count(packets: &[PacketObservation], broadcast: bool, expected_ports: 
         .count()
 }
 
+fn create_packet_io_section(sources: &DiagnosticExportSources) -> DiagnosticPacketIoSection {
+    let backend = sources
+        .packet_io_probe
+        .as_ref()
+        .and_then(|probe| probe.get("backend"))
+        .or_else(|| {
+            sources
+                .packet_io_plan
+                .as_ref()
+                .and_then(|plan| plan.get("backend"))
+        })
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned);
+    let adapter_read_status = sources
+        .packet_io_probe
+        .as_ref()
+        .and_then(|probe| probe.get("adapterReadStatus"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned);
+    let adapter_write_status = sources
+        .packet_io_probe
+        .as_ref()
+        .and_then(|probe| probe.get("adapterWriteStatus"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned);
+    let probe_status = sources
+        .packet_io_probe
+        .as_ref()
+        .and_then(|probe| probe.get("status"))
+        .and_then(serde_json::Value::as_str);
+    let status = match probe_status {
+        Some("ready") => "ok",
+        Some("partial") | Some("unavailable") | Some("unknown-backend") => "needs-attention",
+        Some(_) => "ok",
+        None if sources.packet_io_plan.is_some() => "skipped",
+        None => "skipped",
+    }
+    .to_owned();
+
+    DiagnosticPacketIoSection {
+        status,
+        backend,
+        adapter_read_status,
+        adapter_write_status,
+        plan: sources.packet_io_plan.clone(),
+        probe: sources.packet_io_probe.clone(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -423,13 +488,25 @@ Approximate round trip times in milli-seconds:
                     "udp:10.77.12.2:10.77.12.1:39077:unicast:outbound:8".to_owned(),
                 ],
                 packet_error: None,
+                packet_io_plan: Some(serde_json::json!({
+                    "backend": "userspace-udp",
+                    "can_read_ipv4": false
+                })),
+                packet_io_probe: Some(serde_json::json!({
+                    "backend": "userspace-udp",
+                    "status": "ready",
+                    "adapterReadStatus": "not-required",
+                    "adapterWriteStatus": "not-required"
+                })),
             },
         );
 
-        assert_eq!(bundle.schema_version, 1);
+        assert_eq!(bundle.schema_version, 2);
         assert_eq!(bundle.status, "needs-attention");
         assert_eq!(bundle.adapter_scan.status, "ok");
         assert_eq!(bundle.ping.status, "ok");
+        assert_eq!(bundle.packet_io.status, "ok");
+        assert_eq!(bundle.packet_io.backend.as_deref(), Some("userspace-udp"));
         assert_eq!(bundle.packet_observations.broadcast_count, 1);
         assert_eq!(bundle.packet_observations.game_traffic_count, 1);
         assert_eq!(
