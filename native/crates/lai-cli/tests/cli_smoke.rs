@@ -1,6 +1,6 @@
 use serde_json::Value;
 use std::fs;
-use std::net::UdpSocket;
+use std::net::{TcpListener, UdpSocket};
 use std::process::Command;
 use std::process::Stdio;
 use std::time::Duration;
@@ -377,6 +377,244 @@ fn room_runtime_run_fetches_coordination_offer_before_bootstrap() {
         listener_output.status,
         String::from_utf8_lossy(&listener_output.stdout),
         String::from_utf8_lossy(&listener_output.stderr)
+    );
+}
+
+#[test]
+fn coordination_http_server_publishes_fetches_and_heartbeats_offers() {
+    let probe = TcpListener::bind("127.0.0.1:0").expect("free local port");
+    let server_addr = probe.local_addr().unwrap();
+    drop(probe);
+    let store_path = std::env::temp_dir().join(format!(
+        "lai-cli-coordination-http-store-{}.json",
+        std::process::id()
+    ));
+    let store_path_string = store_path.display().to_string();
+    fs::remove_file(&store_path).ok();
+
+    let server = Command::new(env!("CARGO_BIN_EXE_lai-cli"))
+        .args([
+            "coordination-http-serve",
+            "--bind",
+            &server_addr.to_string(),
+            "--store",
+            &store_path_string,
+            "--max-requests",
+            "4",
+            "--request-timeout-ms",
+            "5000",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn coordination http server");
+    std::thread::sleep(Duration::from_millis(100));
+    let server_url = format!("http://{server_addr}");
+
+    let offer_b = serde_json::json!({
+        "schema_version": 1,
+        "room_id": "room_test",
+        "peer_id": "peer_b",
+        "nonce": "nonce-b",
+        "created_at_ms": 1,
+        "candidates": [{
+            "candidate_type": "host",
+            "transport": "udp",
+            "endpoint": "127.0.0.1:39091",
+            "priority": 100,
+            "source": "test"
+        }]
+    });
+    let offer_b = serde_json::to_string(&offer_b).unwrap();
+    let publish = run_cli(&[
+        "coordination-http-offer-publish",
+        "--server",
+        &server_url,
+        "--offer",
+        &offer_b,
+        "--ttl-ms",
+        "30000",
+    ]);
+    let fetch = run_cli(&[
+        "coordination-http-offer-fetch",
+        "--server",
+        &server_url,
+        "--room-id",
+        "room_test",
+        "--peer-id",
+        "peer_a",
+    ]);
+    let heartbeat = run_cli(&[
+        "coordination-http-heartbeat",
+        "--server",
+        &server_url,
+        "--room-id",
+        "room_test",
+        "--peer-id",
+        "peer_a",
+        "--ttl-ms",
+        "30000",
+    ]);
+    let prune = run_cli(&["coordination-http-prune", "--server", &server_url]);
+    let server_output = server.wait_with_output().expect("server exits");
+    fs::remove_file(&store_path).ok();
+
+    assert_eq!(publish["status"], "ok");
+    assert_eq!(publish["peer_id"], "peer_b");
+    assert_eq!(fetch["status"], "ok");
+    assert_eq!(fetch["offers"][0]["peer_id"], "peer_b");
+    assert_eq!(heartbeat["status"], "ok");
+    assert_eq!(heartbeat["peer_id"], "peer_a");
+    assert_eq!(prune["status"], "ok");
+    assert!(
+        server_output.status.success(),
+        "server failed\nstatus: {}\nstdout: {}\nstderr: {}",
+        server_output.status,
+        String::from_utf8_lossy(&server_output.stdout),
+        String::from_utf8_lossy(&server_output.stderr)
+    );
+    let server_json: Value =
+        serde_json::from_slice(&server_output.stdout).expect("server final json");
+    assert_eq!(server_json["handledRequests"], 4);
+}
+
+#[test]
+fn room_runtime_run_fetches_http_coordination_offer_before_bootstrap() {
+    let http_probe = TcpListener::bind("127.0.0.1:0").expect("free local port");
+    let server_addr = http_probe.local_addr().unwrap();
+    drop(http_probe);
+    let handshake_probe = UdpSocket::bind("127.0.0.1:0").expect("free udp port");
+    let listener_addr = handshake_probe.local_addr().unwrap();
+    drop(handshake_probe);
+    let store_path = std::env::temp_dir().join(format!(
+        "lai-cli-runtime-coordination-http-store-{}.json",
+        std::process::id()
+    ));
+    let store_path_string = store_path.display().to_string();
+    fs::remove_file(&store_path).ok();
+
+    let server = Command::new(env!("CARGO_BIN_EXE_lai-cli"))
+        .args([
+            "coordination-http-serve",
+            "--bind",
+            &server_addr.to_string(),
+            "--store",
+            &store_path_string,
+            "--max-requests",
+            "2",
+            "--request-timeout-ms",
+            "5000",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn coordination http server");
+    std::thread::sleep(Duration::from_millis(100));
+
+    let listener = Command::new(env!("CARGO_BIN_EXE_lai-cli"))
+        .args([
+            "p2p-handshake-listen",
+            "--bind",
+            &listener_addr.to_string(),
+            "--key",
+            "test-room-key",
+            "--responder-peer-id",
+            "peer_b",
+            "--max-packets",
+            "1",
+            "--timeout-ms",
+            "2000",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn p2p listener");
+    std::thread::sleep(Duration::from_millis(80));
+
+    let server_url = format!("http://{server_addr}");
+    let remote_offer = serde_json::json!({
+        "schema_version": 1,
+        "room_id": "room_test",
+        "peer_id": "peer_b",
+        "nonce": "nonce-b",
+        "created_at_ms": 1,
+        "candidates": [{
+            "candidate_type": "host",
+            "transport": "udp",
+            "endpoint": listener_addr.to_string(),
+            "priority": 100,
+            "source": "test-listener"
+        }]
+    });
+    let remote_offer = serde_json::to_string(&remote_offer).unwrap();
+    run_cli(&[
+        "coordination-http-offer-publish",
+        "--server",
+        &server_url,
+        "--offer",
+        &remote_offer,
+        "--ttl-ms",
+        "30000",
+    ]);
+
+    let value = run_cli(&[
+        "room-runtime-run",
+        "--room-id",
+        "room_test",
+        "--peer-id",
+        "peer_a",
+        "--virtual-ip",
+        "10.77.12.2",
+        "--bind",
+        "127.0.0.1:0",
+        "--key",
+        "test-room-key",
+        "--duration-ms",
+        "50",
+        "--peer-timeout-ms",
+        "0",
+        "--coordination-server",
+        &server_url,
+        "--coordination-peer",
+        "peer_b,10.77.12.3",
+        "--nat-bootstrap-attempts",
+        "1",
+        "--nat-bootstrap-interval-ms",
+        "0",
+        "--nat-bootstrap-timeout-ms",
+        "2000",
+    ]);
+    let listener_output = listener.wait_with_output().expect("listener exits");
+    let server_output = server.wait_with_output().expect("server exits");
+    fs::remove_file(&store_path).ok();
+
+    assert_eq!(value["status"], "ok");
+    assert_eq!(value["plan"]["tunnel"]["peer_count"], 1);
+    assert_eq!(
+        value["plan"]["peers"][0]["endpoint"],
+        listener_addr.to_string()
+    );
+    assert_eq!(
+        value["coordinationBootstrapResults"][0]["source"],
+        "coordination-http"
+    );
+    assert_eq!(
+        value["coordinationBootstrapResults"][1]["result"]["selectedPeer"]["responderPeerId"],
+        "peer_b"
+    );
+    assert!(
+        listener_output.status.success(),
+        "listener failed\nstatus: {}\nstdout: {}\nstderr: {}",
+        listener_output.status,
+        String::from_utf8_lossy(&listener_output.stdout),
+        String::from_utf8_lossy(&listener_output.stderr)
+    );
+    assert!(
+        server_output.status.success(),
+        "server failed\nstatus: {}\nstdout: {}\nstderr: {}",
+        server_output.status,
+        String::from_utf8_lossy(&server_output.stdout),
+        String::from_utf8_lossy(&server_output.stderr)
     );
 }
 
@@ -1097,6 +1335,107 @@ fn nat_candidates_and_plan_exchange_endpoints() {
 }
 
 #[test]
+fn nat_candidates_can_query_stun_like_server_for_observed_endpoint() {
+    let probe = UdpSocket::bind("127.0.0.1:0").expect("free udp port");
+    let server_addr = probe.local_addr().unwrap();
+    drop(probe);
+
+    let server = Command::new(env!("CARGO_BIN_EXE_lai-cli"))
+        .args([
+            "stun-like-serve",
+            "--bind",
+            &server_addr.to_string(),
+            "--max-requests",
+            "1",
+            "--timeout-ms",
+            "5000",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn stun-like server");
+    std::thread::sleep(Duration::from_millis(80));
+
+    let value = run_cli(&[
+        "nat-candidates",
+        "--room-id",
+        "room_test",
+        "--peer-id",
+        "peer_a",
+        "--bind",
+        "127.0.0.1:0",
+        "--stun-server",
+        &server_addr.to_string(),
+        "--stun-timeout-ms",
+        "2000",
+        "--nonce",
+        "stun-nonce",
+    ]);
+    let server_output = server.wait_with_output().expect("server exits");
+
+    assert_eq!(value["status"], "ok");
+    assert!(value["offer"]["candidates"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|candidate| candidate["candidate_type"] == "srflx"
+            && candidate["source"] == "observed-endpoint"));
+    assert!(
+        server_output.status.success(),
+        "server failed\nstatus: {}\nstdout: {}\nstderr: {}",
+        server_output.status,
+        String::from_utf8_lossy(&server_output.stdout),
+        String::from_utf8_lossy(&server_output.stderr)
+    );
+    let server_json: Value =
+        serde_json::from_slice(&server_output.stdout).expect("server final json");
+    assert_eq!(server_json["handledRequests"], 1);
+}
+
+#[test]
+fn coordination_offer_publish_accepts_utf8_bom_offer_file() {
+    let store_path = std::env::temp_dir().join(format!(
+        "lai-cli-bom-coordination-store-{}.json",
+        std::process::id()
+    ));
+    let offer_path =
+        std::env::temp_dir().join(format!("lai-cli-bom-offer-{}.json", std::process::id()));
+    let store_path_string = store_path.display().to_string();
+    let offer_path_string = offer_path.display().to_string();
+    fs::remove_file(&store_path).ok();
+    fs::remove_file(&offer_path).ok();
+
+    let local = run_cli(&[
+        "nat-candidates",
+        "--room-id",
+        "room_test",
+        "--peer-id",
+        "peer_a",
+        "--bind",
+        "127.0.0.1:0",
+        "--nonce",
+        "nonce-a",
+    ]);
+    let offer = serde_json::to_string(&local["offer"]).unwrap();
+    fs::write(&offer_path, format!("\u{feff}{offer}")).unwrap();
+
+    let publish = run_cli(&[
+        "coordination-offer-publish",
+        "--store",
+        &store_path_string,
+        "--offer",
+        &offer_path_string,
+        "--ttl-ms",
+        "30000",
+    ]);
+    fs::remove_file(&store_path).ok();
+    fs::remove_file(&offer_path).ok();
+
+    assert_eq!(publish["status"], "ok");
+    assert_eq!(publish["peer_id"], "peer_a");
+}
+
+#[test]
 fn coordination_store_publishes_fetches_and_heartbeats_offers() {
     let path = std::env::temp_dir().join(format!(
         "lai-cli-coordination-store-{}.json",
@@ -1443,6 +1782,115 @@ fn diagnostic_export_writes_bundle_file() {
     assert_eq!(bundle["packet_io"]["status"], "ok");
     assert_eq!(bundle["packet_io"]["backend"], "userspace-udp");
     assert_eq!(bundle["packet_io"]["probe"]["status"], "ready");
+    assert_eq!(bundle["packet_observations"]["broadcast_count"], 1);
+    assert_eq!(bundle["packet_observations"]["game_traffic_count"], 1);
+}
+
+#[test]
+fn diagnostic_export_merges_runtime_snapshot_packet_io_evidence() {
+    let bundle_path = std::env::temp_dir().join(format!(
+        "lai-cli-diagnostic-export-runtime-{}.json",
+        std::process::id()
+    ));
+    let snapshot_path = std::env::temp_dir().join(format!(
+        "lai-cli-runtime-snapshot-{}.json",
+        std::process::id()
+    ));
+    let bundle_path_string = bundle_path.display().to_string();
+    let snapshot_path_string = snapshot_path.display().to_string();
+    fs::write(
+        &snapshot_path,
+        serde_json::to_string_pretty(&serde_json::json!({
+            "status": "ok",
+            "packetIoPlan": {
+                "backend": "wintun",
+                "adapterName": "LocalAreaInterconnection",
+                "canReadIpv4": true,
+                "canWriteIpv4": true
+            },
+            "packetIoProbe": {
+                "backend": "wintun",
+                "status": "partial",
+                "adapterReadStatus": "ready",
+                "adapterWriteStatus": "ready"
+            },
+            "adapterReadStatus": "ready",
+            "adapterWriteStatus": "ready",
+            "packetObservationLines": [
+                "udp:10.77.12.2:10.77.12.255:39078:broadcast:outbound:21",
+                "tcp:10.77.12.2:10.77.12.3:39077:unicast:outbound:32"
+            ],
+            "rawVirtualPackets": [{
+                "sourceIp": "10.77.12.2",
+                "destinationIp": "10.77.12.255",
+                "protocol": "udp",
+                "payloadBytes": 21
+            }],
+            "forwardedPackets": [{"bytes": 21}],
+            "injectedPackets": [{"bytes": 21}],
+            "wintunRuntime": {
+                "receivedPackets": [{"protocol": "udp"}],
+                "sentPackets": [{"protocol": "udp"}],
+                "errors": []
+            }
+        }))
+        .unwrap(),
+    )
+    .expect("write runtime snapshot");
+
+    let stdout = run_cli(&[
+        "diagnostic-export",
+        "--out",
+        &bundle_path_string,
+        "--adapter-name",
+        "LocalAreaInterconnection",
+        "--expected-ip",
+        "10.77.12.2",
+        "--assigned-ip",
+        "10.77.12.2",
+        "--subnet",
+        "10.77.12.0/24",
+        "--adapter-scan",
+        "false",
+        "--firewall-scan",
+        "false",
+        "--expected-peers",
+        "1",
+        "--runtime-snapshot",
+        &snapshot_path_string,
+        "--broadcast-ports",
+        "39078",
+        "--game-ports",
+        "39077",
+        "--ports",
+        "39077,39078",
+    ]);
+
+    assert_eq!(stdout["status"], "ok");
+
+    let bundle: Value =
+        serde_json::from_str(&fs::read_to_string(&bundle_path).expect("bundle file")).unwrap();
+    fs::remove_file(&bundle_path).ok();
+    fs::remove_file(&snapshot_path).ok();
+
+    assert_eq!(bundle["packet_io"]["backend"], "wintun");
+    assert_eq!(bundle["packet_io"]["adapter_read_status"], "ready");
+    assert_eq!(bundle["packet_io"]["adapter_write_status"], "ready");
+    assert_eq!(bundle["packet_io"]["runtime"]["status"], "ok");
+    assert_eq!(
+        bundle["packet_io"]["runtime"]["raw_virtual_packet_count"],
+        1
+    );
+    assert_eq!(bundle["packet_io"]["runtime"]["forwarded_packet_count"], 1);
+    assert_eq!(bundle["packet_io"]["runtime"]["injected_packet_count"], 1);
+    assert_eq!(
+        bundle["packet_io"]["runtime"]["wintun_received_packet_count"],
+        1
+    );
+    assert_eq!(
+        bundle["packet_io"]["runtime"]["wintun_sent_packet_count"],
+        1
+    );
     assert_eq!(bundle["packet_observations"]["broadcast_count"], 1);
     assert_eq!(bundle["packet_observations"]["game_traffic_count"], 1);
 }

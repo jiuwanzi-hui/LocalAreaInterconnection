@@ -19,8 +19,8 @@ use lai_core::{
 };
 use rand::RngCore;
 use std::fs;
-use std::io::{ErrorKind, Write};
-use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
+use std::io::{ErrorKind, Read, Write};
+use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::path::Path;
 use std::process::Command as ProcessCommand;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -102,6 +102,8 @@ enum Command {
         nat_bootstrap_remote_peers: Vec<String>,
         #[arg(long)]
         coordination_store: Option<String>,
+        #[arg(long)]
+        coordination_server: Option<String>,
         #[arg(long = "coordination-peer")]
         coordination_peers: Vec<String>,
         #[arg(long, default_value = "")]
@@ -420,6 +422,10 @@ enum Command {
         bind: String,
         #[arg(long)]
         observed_endpoint: Option<String>,
+        #[arg(long)]
+        stun_server: Option<String>,
+        #[arg(long, default_value_t = 1000)]
+        stun_timeout_ms: u64,
         #[arg(long = "relay")]
         relay_endpoints: Vec<String>,
         #[arg(long)]
@@ -446,6 +452,10 @@ enum Command {
         remote_offer: String,
         #[arg(long)]
         observed_endpoint: Option<String>,
+        #[arg(long)]
+        stun_server: Option<String>,
+        #[arg(long, default_value_t = 1000)]
+        stun_timeout_ms: u64,
         #[arg(long = "relay")]
         relay_endpoints: Vec<String>,
         #[arg(long, default_value_t = 8)]
@@ -472,6 +482,10 @@ enum Command {
         remote_offer: String,
         #[arg(long)]
         observed_endpoint: Option<String>,
+        #[arg(long)]
+        stun_server: Option<String>,
+        #[arg(long, default_value_t = 1000)]
+        stun_timeout_ms: u64,
         #[arg(long = "relay")]
         relay_endpoints: Vec<String>,
         #[arg(long, default_value_t = 4)]
@@ -494,6 +508,22 @@ enum Command {
         interval_ms: u64,
         #[arg(long, default_value = "nat-punch")]
         message: String,
+    },
+    StunLikeServe {
+        #[arg(long, default_value = "0.0.0.0:39120")]
+        bind: String,
+        #[arg(long, default_value_t = 0)]
+        max_requests: u32,
+        #[arg(long, default_value_t = 30000)]
+        timeout_ms: u64,
+    },
+    StunLikeQuery {
+        #[arg(long, default_value = "0.0.0.0:0")]
+        bind: String,
+        #[arg(long)]
+        server: String,
+        #[arg(long, default_value_t = 1000)]
+        timeout_ms: u64,
     },
     CoordinationStoreInit {
         #[arg(long)]
@@ -528,6 +558,46 @@ enum Command {
     CoordinationPrune {
         #[arg(long)]
         store: String,
+    },
+    CoordinationHttpServe {
+        #[arg(long, default_value = "127.0.0.1:39110")]
+        bind: String,
+        #[arg(long)]
+        store: String,
+        #[arg(long, default_value_t = 0)]
+        max_requests: u32,
+        #[arg(long, default_value_t = 30000)]
+        request_timeout_ms: u64,
+    },
+    CoordinationHttpOfferPublish {
+        #[arg(long)]
+        server: String,
+        #[arg(long)]
+        offer: String,
+        #[arg(long, default_value_t = 30000)]
+        ttl_ms: u128,
+    },
+    CoordinationHttpOfferFetch {
+        #[arg(long)]
+        server: String,
+        #[arg(long)]
+        room_id: String,
+        #[arg(long)]
+        peer_id: String,
+    },
+    CoordinationHttpHeartbeat {
+        #[arg(long)]
+        server: String,
+        #[arg(long)]
+        room_id: String,
+        #[arg(long)]
+        peer_id: String,
+        #[arg(long, default_value_t = 30000)]
+        ttl_ms: u128,
+    },
+    CoordinationHttpPrune {
+        #[arg(long)]
+        server: String,
     },
     UdpForward {
         #[arg(long, default_value = "0.0.0.0:39078")]
@@ -634,6 +704,8 @@ enum Command {
         packets: String,
         #[arg(long)]
         packet_observations: Option<String>,
+        #[arg(long)]
+        runtime_snapshot: Option<String>,
         #[arg(long, default_value = "Generic LAN Game")]
         game_name: String,
         #[arg(long, default_value = "manual_ports")]
@@ -830,6 +902,7 @@ fn run_main() -> Result<(), Box<dyn std::error::Error>> {
             nat_bootstrap_peers,
             nat_bootstrap_remote_peers,
             coordination_store,
+            coordination_server,
             coordination_peers,
             game_ports,
             broadcast_ports,
@@ -890,6 +963,20 @@ fn run_main() -> Result<(), Box<dyn std::error::Error>> {
                     nat_bootstrap_timeout_ms,
                 )?;
             runtime_peers.append(&mut coordination_bootstrapped_peers);
+            let (mut coordination_server_peers, mut coordination_server_results) =
+                run_runtime_coordination_server_bootstraps(
+                    coordination_server.as_deref(),
+                    &coordination_peers,
+                    &room_id,
+                    &peer_id,
+                    local_virtual_ip,
+                    &key,
+                    &bind,
+                    nat_bootstrap_attempts,
+                    nat_bootstrap_interval_ms,
+                    nat_bootstrap_timeout_ms,
+                )?;
+            runtime_peers.append(&mut coordination_server_peers);
             let plan = create_room_runtime_plan(
                 room_id,
                 peer_id,
@@ -929,6 +1016,7 @@ fn run_main() -> Result<(), Box<dyn std::error::Error>> {
                 game_ports,
             )?;
             result["natBootstrapResults"] = serde_json::Value::Array(nat_bootstrap_results);
+            coordination_bootstrap_results.append(&mut coordination_server_results);
             result["coordinationBootstrapResults"] =
                 serde_json::Value::Array(std::mem::take(&mut coordination_bootstrap_results));
             println!("{}", serde_json::to_string_pretty(&result)?);
@@ -1366,6 +1454,8 @@ fn run_main() -> Result<(), Box<dyn std::error::Error>> {
             peer_id,
             bind,
             observed_endpoint,
+            stun_server,
+            stun_timeout_ms,
             relay_endpoints,
             nonce,
         } => {
@@ -1375,6 +1465,12 @@ fn run_main() -> Result<(), Box<dyn std::error::Error>> {
                 .as_deref()
                 .map(str::parse::<SocketAddr>)
                 .transpose()?;
+            let observed_endpoint = resolve_observed_endpoint(
+                &socket,
+                observed_endpoint,
+                stun_server.as_deref(),
+                stun_timeout_ms,
+            )?;
             let relay_endpoints = relay_endpoints
                 .iter()
                 .map(|endpoint| endpoint.parse::<SocketAddr>())
@@ -1422,6 +1518,8 @@ fn run_main() -> Result<(), Box<dyn std::error::Error>> {
             bind,
             remote_offer,
             observed_endpoint,
+            stun_server,
+            stun_timeout_ms,
             relay_endpoints,
             attempts,
             interval_ms,
@@ -1443,6 +1541,8 @@ fn run_main() -> Result<(), Box<dyn std::error::Error>> {
                 &bind,
                 &remote,
                 observed_endpoint,
+                stun_server.as_deref(),
+                stun_timeout_ms,
                 relay_endpoints,
                 attempts,
                 interval_ms,
@@ -1459,6 +1559,8 @@ fn run_main() -> Result<(), Box<dyn std::error::Error>> {
             bind,
             remote_offer,
             observed_endpoint,
+            stun_server,
+            stun_timeout_ms,
             relay_endpoints,
             punch_attempts,
             punch_interval_ms,
@@ -1481,6 +1583,8 @@ fn run_main() -> Result<(), Box<dyn std::error::Error>> {
                 &bind,
                 &remote,
                 observed_endpoint,
+                stun_server.as_deref(),
+                stun_timeout_ms,
                 relay_endpoints,
                 punch_attempts,
                 punch_interval_ms,
@@ -1504,6 +1608,23 @@ fn run_main() -> Result<(), Box<dyn std::error::Error>> {
                 interval_ms,
                 &message,
             )?;
+            println!("{}", serde_json::to_string_pretty(&result)?);
+        }
+        Command::StunLikeServe {
+            bind,
+            max_requests,
+            timeout_ms,
+        } => {
+            let result = run_stun_like_server(&bind, max_requests, timeout_ms)?;
+            println!("{}", serde_json::to_string_pretty(&result)?);
+        }
+        Command::StunLikeQuery {
+            bind,
+            server,
+            timeout_ms,
+        } => {
+            let socket = UdpSocket::bind(&bind)?;
+            let result = query_stun_like_server(&socket, &server, timeout_ms)?;
             println!("{}", serde_json::to_string_pretty(&result)?);
         }
         Command::CoordinationStoreInit { out } => {
@@ -1574,6 +1695,46 @@ fn run_main() -> Result<(), Box<dyn std::error::Error>> {
             );
             write_json_file(&store, &coordination_store)?;
             println!("{}", serde_json::to_string_pretty(&report)?);
+        }
+        Command::CoordinationHttpServe {
+            bind,
+            store,
+            max_requests,
+            request_timeout_ms,
+        } => {
+            let result =
+                run_coordination_http_server(&bind, &store, max_requests, request_timeout_ms)?;
+            println!("{}", serde_json::to_string_pretty(&result)?);
+        }
+        Command::CoordinationHttpOfferPublish {
+            server,
+            offer,
+            ttl_ms,
+        } => {
+            let offer = load_nat_offer_argument(&offer)?;
+            let result = coordination_http_publish_offer(&server, &offer, ttl_ms)?;
+            println!("{}", serde_json::to_string_pretty(&result)?);
+        }
+        Command::CoordinationHttpOfferFetch {
+            server,
+            room_id,
+            peer_id,
+        } => {
+            let result = coordination_http_fetch_offers(&server, &room_id, &peer_id)?;
+            println!("{}", serde_json::to_string_pretty(&result)?);
+        }
+        Command::CoordinationHttpHeartbeat {
+            server,
+            room_id,
+            peer_id,
+            ttl_ms,
+        } => {
+            let result = coordination_http_heartbeat(&server, &room_id, &peer_id, ttl_ms)?;
+            println!("{}", serde_json::to_string_pretty(&result)?);
+        }
+        Command::CoordinationHttpPrune { server } => {
+            let result = coordination_http_prune(&server)?;
+            println!("{}", serde_json::to_string_pretty(&result)?);
         }
         Command::UdpForward {
             listen,
@@ -1708,6 +1869,7 @@ fn run_main() -> Result<(), Box<dyn std::error::Error>> {
             game_ports,
             packets,
             packet_observations,
+            runtime_snapshot,
             game_name,
             discovery,
             ports,
@@ -1727,22 +1889,37 @@ fn run_main() -> Result<(), Box<dyn std::error::Error>> {
             let broadcast_ports = parse_ports(&broadcast_ports)?;
             let game_ports = parse_ports(&game_ports)?;
             let packet_observations_path = packet_observations.clone();
-            let packet_data = load_packet_observations(packet_observations.as_deref(), &packets);
+            let mut packet_data =
+                load_packet_observations(packet_observations.as_deref(), &packets);
+            let (runtime_snapshot_value, runtime_snapshot_error) =
+                load_runtime_snapshot(runtime_snapshot.as_deref());
+            if let Some(snapshot) = runtime_snapshot_value.as_ref() {
+                merge_runtime_packet_observations(&mut packet_data, snapshot);
+            }
             let packet_io_plan =
                 lai_core::create_virtual_packet_io_plan(&adapter_name, &packet_io_backend, 1420);
-            let packet_io_probe_value = packet_io_probe.then(|| {
-                runtime_packet_io_probe(
-                    &packet_io_backend,
-                    &RuntimePacketIoProbeOptions {
-                        wintun_adapter_name: adapter_name.clone(),
-                        wintun_ring_capacity,
-                        wintun_probe_receive,
-                        wintun_receive_attempts,
-                        wintun_receive_poll_interval_ms,
-                        wintun_probe_send,
-                    },
-                )
-            });
+            let packet_io_plan_value = runtime_snapshot_value
+                .as_ref()
+                .and_then(|snapshot| snapshot.get("packetIoPlan").cloned())
+                .or(Some(serde_json::to_value(packet_io_plan)?));
+            let packet_io_probe_value = runtime_snapshot_value
+                .as_ref()
+                .and_then(|snapshot| snapshot.get("packetIoProbe").cloned())
+                .or_else(|| {
+                    packet_io_probe.then(|| {
+                        runtime_packet_io_probe(
+                            &packet_io_backend,
+                            &RuntimePacketIoProbeOptions {
+                                wintun_adapter_name: adapter_name.clone(),
+                                wintun_ring_capacity,
+                                wintun_probe_receive,
+                                wintun_receive_attempts,
+                                wintun_receive_poll_interval_ms,
+                                wintun_probe_send,
+                            },
+                        )
+                    })
+                });
             let inputs = DiagnosticExportInputs {
                 adapter_name: adapter_name.clone(),
                 expected_ip,
@@ -1773,8 +1950,10 @@ fn run_main() -> Result<(), Box<dyn std::error::Error>> {
                 packets: packet_data.packets,
                 packet_raw_lines: packet_data.raw_lines,
                 packet_error: packet_data.error,
-                packet_io_plan: Some(serde_json::to_value(packet_io_plan)?),
+                packet_io_plan: packet_io_plan_value,
                 packet_io_probe: packet_io_probe_value,
+                runtime_snapshot: runtime_snapshot_value,
+                runtime_snapshot_error,
             };
             let bundle = create_diagnostic_export_bundle(
                 current_epoch_ms(),
@@ -2120,6 +2299,8 @@ fn run_runtime_nat_bootstraps(
             bind,
             &remote_offer,
             None,
+            None,
+            0,
             Vec::new(),
             attempts,
             interval_ms,
@@ -2186,6 +2367,8 @@ fn run_runtime_coordination_bootstraps(
             bind,
             offer,
             None,
+            None,
+            0,
             Vec::new(),
             attempts,
             interval_ms,
@@ -2232,6 +2415,553 @@ fn run_runtime_coordination_bootstraps(
     Ok((peers, bootstrap_results))
 }
 
+fn run_runtime_coordination_server_bootstraps(
+    server: Option<&str>,
+    peer_specs: &[String],
+    room_id: &str,
+    local_peer_id: &str,
+    local_virtual_ip: Ipv4Addr,
+    key: &str,
+    bind: &str,
+    attempts: u16,
+    interval_ms: u64,
+    timeout_ms: u64,
+) -> Result<(Vec<RoomRuntimePeer>, Vec<serde_json::Value>), Box<dyn std::error::Error>> {
+    let Some(server) = server else {
+        return Ok((Vec::new(), Vec::new()));
+    };
+    let peer_specs = parse_coordination_peer_specs(peer_specs)?;
+    if peer_specs.is_empty() {
+        return Err(invalid_input(
+            "--coordination-server requires at least one --coordination-peer peer_id,virtual_ip"
+                .to_owned(),
+        ));
+    }
+    let fetch_value = coordination_http_fetch_offers(server, room_id, local_peer_id)?;
+    let fetch: lai_core::CoordinationFetchResult = serde_json::from_value(fetch_value.clone())?;
+    let mut peers = Vec::new();
+    let mut bootstrap_results = Vec::new();
+    let mut missing_peers = Vec::new();
+
+    for (remote_peer_id, remote_virtual_ip) in peer_specs {
+        let Some(offer) = fetch
+            .offers
+            .iter()
+            .find(|offer| offer.peer_id == remote_peer_id)
+        else {
+            missing_peers.push(remote_peer_id);
+            continue;
+        };
+        let result = run_nat_p2p_bootstrap(
+            room_id,
+            local_peer_id,
+            local_virtual_ip,
+            key,
+            bind,
+            offer,
+            None,
+            None,
+            0,
+            Vec::new(),
+            attempts,
+            interval_ms,
+            timeout_ms,
+        )?;
+        peers.push(runtime_peer_from_bootstrap_result(
+            &remote_peer_id,
+            remote_virtual_ip,
+            &result,
+        )?);
+        bootstrap_results.push(serde_json::json!({
+            "source": "coordination-http",
+            "server": server,
+            "peerId": remote_peer_id,
+            "result": result,
+        }));
+    }
+
+    if !missing_peers.is_empty() {
+        return Err(invalid_input(format!(
+            "coordination server did not contain active offers for peer(s): {}",
+            missing_peers.join(",")
+        )));
+    }
+    if bootstrap_results.is_empty() {
+        bootstrap_results.push(serde_json::json!({
+            "source": "coordination-http",
+            "server": server,
+            "fetch": fetch_value,
+            "status": "empty",
+        }));
+    } else {
+        bootstrap_results.insert(
+            0,
+            serde_json::json!({
+                "source": "coordination-http",
+                "server": server,
+                "fetch": fetch_value,
+                "status": "ok",
+            }),
+        );
+    }
+
+    Ok((peers, bootstrap_results))
+}
+
+fn run_coordination_http_server(
+    bind: &str,
+    store_path: &str,
+    max_requests: u32,
+    request_timeout_ms: u64,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    let listener = TcpListener::bind(bind)?;
+    let bound_addr = listener.local_addr()?;
+    let mut store = load_coordination_store_or_default(store_path)?;
+    let mut handled_requests = 0u32;
+
+    while max_requests == 0 || handled_requests < max_requests {
+        let (mut stream, remote_addr) = listener.accept()?;
+        stream.set_read_timeout(Some(Duration::from_millis(request_timeout_ms)))?;
+        stream.set_write_timeout(Some(Duration::from_millis(request_timeout_ms)))?;
+        let request_result = read_http_request(&mut stream);
+        let response = match request_result {
+            Ok(request) => handle_coordination_http_request(request, &mut store, store_path),
+            Err(err) => Ok((
+                400,
+                serde_json::json!({
+                    "status": "error",
+                    "error": err.to_string(),
+                }),
+            )),
+        };
+        let (status_code, body) = match response {
+            Ok(response) => response,
+            Err(err) => (
+                500,
+                serde_json::json!({
+                    "status": "error",
+                    "error": err.to_string(),
+                }),
+            ),
+        };
+        write_http_json_response(&mut stream, status_code, &body)?;
+        handled_requests = handled_requests.saturating_add(1);
+        let _ = remote_addr;
+    }
+
+    Ok(serde_json::json!({
+        "status": "ok",
+        "bind": bound_addr.to_string(),
+        "store": store_path,
+        "handledRequests": handled_requests,
+    }))
+}
+
+fn handle_coordination_http_request(
+    request: HttpRequest,
+    store: &mut lai_core::CoordinationStore,
+    store_path: &str,
+) -> Result<(u16, serde_json::Value), Box<dyn std::error::Error>> {
+    let path_segments = request
+        .path
+        .trim_matches('/')
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .map(percent_decode)
+        .collect::<Result<Vec<_>, _>>()?;
+    let path_segments = path_segments.iter().map(String::as_str).collect::<Vec<_>>();
+
+    if request.method == "GET" && request.path == "/health" {
+        return Ok((
+            200,
+            serde_json::json!({
+                "status": "ok",
+                "schemaVersion": store.schema_version,
+            }),
+        ));
+    }
+
+    match (request.method.as_str(), path_segments.as_slice()) {
+        ("POST", ["v1", "offers"]) => {
+            let body: serde_json::Value = serde_json::from_slice(&request.body)?;
+            let offer_value = body
+                .get("offer")
+                .ok_or_else(|| invalid_input("missing JSON field `offer`".to_owned()))?
+                .clone();
+            let offer: lai_core::NatTraversalOffer = serde_json::from_value(offer_value)?;
+            let ttl_ms = body
+                .get("ttlMs")
+                .or_else(|| body.get("ttl_ms"))
+                .and_then(serde_json::Value::as_u64)
+                .map(u128::from)
+                .unwrap_or(30_000);
+            let update =
+                lai_core::publish_coordination_offer(store, offer, current_epoch_ms(), ttl_ms);
+            write_json_file(store_path, store)?;
+            Ok((200, serde_json::to_value(update)?))
+        }
+        ("GET", ["v1", "rooms", room_id, "offers"]) => {
+            let peer_id = query_value(&request.query, "peer_id")
+                .or_else(|| query_value(&request.query, "peerId"))
+                .ok_or_else(|| invalid_input("missing query parameter `peer_id`".to_owned()))?;
+            let result = lai_core::fetch_coordination_offers(
+                store,
+                room_id.to_owned(),
+                peer_id,
+                current_epoch_ms(),
+            );
+            write_json_file(store_path, store)?;
+            Ok((200, serde_json::to_value(result)?))
+        }
+        ("POST", ["v1", "rooms", room_id, "peers", peer_id, "heartbeat"]) => {
+            let body = if request.body.is_empty() {
+                serde_json::json!({})
+            } else {
+                serde_json::from_slice::<serde_json::Value>(&request.body)?
+            };
+            let ttl_ms = body
+                .get("ttlMs")
+                .or_else(|| body.get("ttl_ms"))
+                .and_then(serde_json::Value::as_u64)
+                .map(u128::from)
+                .unwrap_or(30_000);
+            let update = lai_core::heartbeat_coordination_peer(
+                store,
+                room_id.to_owned(),
+                peer_id.to_owned(),
+                current_epoch_ms(),
+                ttl_ms,
+            );
+            write_json_file(store_path, store)?;
+            Ok((200, serde_json::to_value(update)?))
+        }
+        ("POST", ["v1", "prune"]) => {
+            let report = lai_core::prune_expired_coordination_peers(store, current_epoch_ms());
+            write_json_file(store_path, store)?;
+            Ok((200, serde_json::to_value(report)?))
+        }
+        _ => Ok((
+            404,
+            serde_json::json!({
+                "status": "error",
+                "error": "not found",
+                "method": request.method,
+                "path": request.path,
+            }),
+        )),
+    }
+}
+
+struct HttpRequest {
+    method: String,
+    path: String,
+    query: String,
+    body: Vec<u8>,
+}
+
+fn read_http_request(stream: &mut TcpStream) -> Result<HttpRequest, Box<dyn std::error::Error>> {
+    let mut bytes = Vec::new();
+    let mut buffer = [0u8; 1024];
+    let (header_end, content_length) = loop {
+        let read = stream.read(&mut buffer)?;
+        if read == 0 {
+            return Err(invalid_input(
+                "connection closed before HTTP headers".to_owned(),
+            ));
+        }
+        bytes.extend_from_slice(&buffer[..read]);
+        if bytes.len() > 1024 * 1024 {
+            return Err(invalid_input("HTTP request too large".to_owned()));
+        }
+        if let Some(header_end) = find_header_end(&bytes) {
+            let headers = String::from_utf8_lossy(&bytes[..header_end]).to_string();
+            let content_length = parse_content_length(&headers)?;
+            break (header_end, content_length);
+        }
+    };
+    let body_start = header_end + 4;
+    while bytes.len() < body_start.saturating_add(content_length) {
+        let read = stream.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        bytes.extend_from_slice(&buffer[..read]);
+    }
+    if bytes.len() < body_start.saturating_add(content_length) {
+        return Err(invalid_input(
+            "HTTP body shorter than Content-Length".to_owned(),
+        ));
+    }
+
+    let headers = String::from_utf8_lossy(&bytes[..header_end]).to_string();
+    let request_line = headers
+        .lines()
+        .next()
+        .ok_or_else(|| invalid_input("missing HTTP request line".to_owned()))?;
+    let mut request_parts = request_line.split_whitespace();
+    let method = request_parts
+        .next()
+        .ok_or_else(|| invalid_input("missing HTTP method".to_owned()))?
+        .to_owned();
+    let target = request_parts
+        .next()
+        .ok_or_else(|| invalid_input("missing HTTP target".to_owned()))?;
+    let (path, query) = split_path_query(target);
+    let body = bytes[body_start..body_start + content_length].to_vec();
+
+    Ok(HttpRequest {
+        method,
+        path,
+        query,
+        body,
+    })
+}
+
+fn write_http_json_response(
+    stream: &mut TcpStream,
+    status_code: u16,
+    body: &serde_json::Value,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let body_text = serde_json::to_string(body)?;
+    let status_text = match status_code {
+        200 => "OK",
+        400 => "Bad Request",
+        404 => "Not Found",
+        _ => "Internal Server Error",
+    };
+    let response = format!(
+        "HTTP/1.1 {status_code} {status_text}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body_text.as_bytes().len(),
+        body_text
+    );
+    stream.write_all(response.as_bytes())?;
+    stream.flush()?;
+    Ok(())
+}
+
+fn coordination_http_publish_offer(
+    server: &str,
+    offer: &lai_core::NatTraversalOffer,
+    ttl_ms: u128,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    http_post_json(
+        &format!("{}/v1/offers", trim_trailing_slash(server)),
+        &serde_json::json!({
+            "offer": offer,
+            "ttlMs": ttl_ms,
+        }),
+    )
+}
+
+fn coordination_http_fetch_offers(
+    server: &str,
+    room_id: &str,
+    peer_id: &str,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    http_get_json(&format!(
+        "{}/v1/rooms/{}/offers?peer_id={}",
+        trim_trailing_slash(server),
+        percent_encode(room_id),
+        percent_encode(peer_id)
+    ))
+}
+
+fn coordination_http_heartbeat(
+    server: &str,
+    room_id: &str,
+    peer_id: &str,
+    ttl_ms: u128,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    http_post_json(
+        &format!(
+            "{}/v1/rooms/{}/peers/{}/heartbeat",
+            trim_trailing_slash(server),
+            percent_encode(room_id),
+            percent_encode(peer_id)
+        ),
+        &serde_json::json!({ "ttlMs": ttl_ms }),
+    )
+}
+
+fn coordination_http_prune(server: &str) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    http_post_json(
+        &format!("{}/v1/prune", trim_trailing_slash(server)),
+        &serde_json::json!({}),
+    )
+}
+
+fn http_get_json(url: &str) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    send_http_json_request("GET", url, None)
+}
+
+fn http_post_json(
+    url: &str,
+    body: &serde_json::Value,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    send_http_json_request("POST", url, Some(&serde_json::to_string(body)?))
+}
+
+fn send_http_json_request(
+    method: &str,
+    url: &str,
+    body: Option<&str>,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    let parsed = parse_http_url(url)?;
+    let mut stream = TcpStream::connect((&parsed.host[..], parsed.port))?;
+    stream.set_read_timeout(Some(Duration::from_secs(30)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(30)))?;
+    let body = body.unwrap_or("");
+    let request = format!(
+        "{method} {} HTTP/1.1\r\nHost: {}\r\nAccept: application/json\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        parsed.path_and_query,
+        parsed.host_header,
+        body.as_bytes().len(),
+        body
+    );
+    stream.write_all(request.as_bytes())?;
+    stream.flush()?;
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response)?;
+    parse_http_json_response(&response)
+}
+
+struct ParsedHttpUrl {
+    host: String,
+    port: u16,
+    host_header: String,
+    path_and_query: String,
+}
+
+fn parse_http_url(url: &str) -> Result<ParsedHttpUrl, Box<dyn std::error::Error>> {
+    let without_scheme = url
+        .strip_prefix("http://")
+        .ok_or_else(|| invalid_input("only http:// coordination URLs are supported".to_owned()))?;
+    let (authority, path_and_query) = match without_scheme.split_once('/') {
+        Some((authority, path)) => (authority, format!("/{path}")),
+        None => (without_scheme, "/".to_owned()),
+    };
+    if authority.is_empty() {
+        return Err(invalid_input("missing HTTP host".to_owned()));
+    }
+    let (host, port) = match authority.rsplit_once(':') {
+        Some((host, port)) => (host.to_owned(), port.parse::<u16>()?),
+        None => (authority.to_owned(), 80),
+    };
+    if host.is_empty() {
+        return Err(invalid_input("missing HTTP host".to_owned()));
+    }
+    Ok(ParsedHttpUrl {
+        host,
+        port,
+        host_header: authority.to_owned(),
+        path_and_query,
+    })
+}
+
+fn parse_http_json_response(
+    response: &[u8],
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    let header_end = find_header_end(response)
+        .ok_or_else(|| invalid_input("HTTP response missing header terminator".to_owned()))?;
+    let headers = String::from_utf8_lossy(&response[..header_end]).to_string();
+    let status_line = headers
+        .lines()
+        .next()
+        .ok_or_else(|| invalid_input("HTTP response missing status line".to_owned()))?;
+    let status_code = status_line
+        .split_whitespace()
+        .nth(1)
+        .ok_or_else(|| invalid_input("HTTP response missing status code".to_owned()))?
+        .parse::<u16>()?;
+    let body = &response[header_end + 4..];
+    let value = if body.is_empty() {
+        serde_json::json!({})
+    } else {
+        serde_json::from_slice::<serde_json::Value>(body)?
+    };
+    if !(200..300).contains(&status_code) {
+        return Err(invalid_input(format!(
+            "HTTP request failed with status {status_code}: {value}"
+        )));
+    }
+    Ok(value)
+}
+
+fn find_header_end(bytes: &[u8]) -> Option<usize> {
+    bytes.windows(4).position(|window| window == b"\r\n\r\n")
+}
+
+fn parse_content_length(headers: &str) -> Result<usize, Box<dyn std::error::Error>> {
+    for line in headers.lines().skip(1) {
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        if name.trim().eq_ignore_ascii_case("content-length") {
+            return Ok(value.trim().parse::<usize>()?);
+        }
+    }
+    Ok(0)
+}
+
+fn split_path_query(target: &str) -> (String, String) {
+    match target.split_once('?') {
+        Some((path, query)) => (path.to_owned(), query.to_owned()),
+        None => (target.to_owned(), String::new()),
+    }
+}
+
+fn query_value(query: &str, name: &str) -> Option<String> {
+    query.split('&').find_map(|part| {
+        let (key, value) = part.split_once('=')?;
+        if key == name {
+            percent_decode(value).ok()
+        } else {
+            None
+        }
+    })
+}
+
+fn percent_encode(value: &str) -> String {
+    let mut encoded = String::new();
+    for byte in value.as_bytes() {
+        match *byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                encoded.push(*byte as char);
+            }
+            other => encoded.push_str(&format!("%{other:02X}")),
+        }
+    }
+    encoded
+}
+
+fn percent_decode(value: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0usize;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'%' if index + 2 < bytes.len() => {
+                let hex = std::str::from_utf8(&bytes[index + 1..index + 3])?;
+                decoded.push(u8::from_str_radix(hex, 16)?);
+                index += 3;
+            }
+            b'+' => {
+                decoded.push(b' ');
+                index += 1;
+            }
+            byte => {
+                decoded.push(byte);
+                index += 1;
+            }
+        }
+    }
+    Ok(String::from_utf8(decoded)?)
+}
+
+fn trim_trailing_slash(value: &str) -> &str {
+    value.trim_end_matches('/')
+}
+
 fn parse_coordination_peer_specs(
     values: &[String],
 ) -> Result<Vec<(String, Ipv4Addr)>, Box<dyn std::error::Error>> {
@@ -2257,11 +2987,15 @@ fn parse_coordination_peer_specs(
 
 fn load_json_argument(value: &str) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
     let text = if Path::new(value).exists() {
-        fs::read_to_string(value)?
+        let bytes = fs::read(value)?;
+        let bytes = bytes
+            .strip_prefix(&[0xef, 0xbb, 0xbf])
+            .unwrap_or(bytes.as_slice());
+        String::from_utf8(bytes.to_vec())?
     } else {
         value.to_owned()
     };
-    Ok(serde_json::from_str(&text)?)
+    Ok(serde_json::from_str(text.trim_start_matches('\u{feff}'))?)
 }
 
 fn load_coordination_store_or_default(
@@ -2523,6 +3257,50 @@ fn load_packet_observations(packet_observations: Option<&str>, packets: &str) ->
         packets: parsed,
         raw_lines,
         error,
+    }
+}
+
+fn load_runtime_snapshot(path: Option<&str>) -> (Option<serde_json::Value>, Option<String>) {
+    let Some(path) = path else {
+        return (None, None);
+    };
+    match fs::read_to_string(path) {
+        Ok(text) => match serde_json::from_str(&text) {
+            Ok(value) => (Some(value), None),
+            Err(err) => (None, Some(format!("runtime snapshot parse failed: {err}"))),
+        },
+        Err(err) => (None, Some(format!("runtime snapshot read failed: {err}"))),
+    }
+}
+
+fn merge_runtime_packet_observations(
+    packet_data: &mut PacketLoadResult,
+    runtime_snapshot: &serde_json::Value,
+) {
+    let Some(lines) = runtime_snapshot
+        .get("packetObservationLines")
+        .and_then(serde_json::Value::as_array)
+    else {
+        return;
+    };
+    for line in lines.iter().filter_map(serde_json::Value::as_str) {
+        let line = line.trim();
+        if !line.is_empty() {
+            packet_data.raw_lines.push(line.to_owned());
+        }
+    }
+    if packet_data.error.is_none() {
+        packet_data.packets.clear();
+        for line in &packet_data.raw_lines {
+            match lai_core::parse_packet_observation_line(line) {
+                Ok(packet) => packet_data.packets.push(packet),
+                Err(err) => {
+                    packet_data.error = Some(err.to_string());
+                    packet_data.packets.clear();
+                    break;
+                }
+            }
+        }
     }
 }
 
@@ -2989,11 +3767,145 @@ fn load_nat_offer_argument(
     value: &str,
 ) -> Result<lai_core::NatTraversalOffer, Box<dyn std::error::Error>> {
     let text = if Path::new(value).exists() {
-        fs::read_to_string(value)?
+        let bytes = fs::read(value)?;
+        let bytes = bytes
+            .strip_prefix(&[0xef, 0xbb, 0xbf])
+            .unwrap_or(bytes.as_slice());
+        String::from_utf8(bytes.to_vec())?
     } else {
         value.to_owned()
     };
     Ok(serde_json::from_str(&text)?)
+}
+
+fn resolve_observed_endpoint(
+    socket: &UdpSocket,
+    observed_endpoint: Option<SocketAddr>,
+    stun_server: Option<&str>,
+    stun_timeout_ms: u64,
+) -> Result<Option<SocketAddr>, Box<dyn std::error::Error>> {
+    if observed_endpoint.is_some() {
+        return Ok(observed_endpoint);
+    }
+    let Some(stun_server) = stun_server else {
+        return Ok(None);
+    };
+    let response = query_stun_like_server(socket, stun_server, stun_timeout_ms)?;
+    let observed = response
+        .get("observedEndpoint")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| invalid_input("STUN-like response is missing observedEndpoint".to_owned()))?
+        .parse::<SocketAddr>()?;
+    Ok(Some(observed))
+}
+
+fn run_stun_like_server(
+    bind: &str,
+    max_requests: u32,
+    timeout_ms: u64,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    let socket = UdpSocket::bind(bind)?;
+    socket.set_read_timeout(Some(Duration::from_millis(timeout_ms)))?;
+    let local_addr = socket.local_addr()?;
+    let mut handled_requests = 0u32;
+    let mut requests = Vec::new();
+    let mut buffer = [0u8; 2048];
+
+    while max_requests == 0 || handled_requests < max_requests {
+        match socket.recv_from(&mut buffer) {
+            Ok((received, peer)) => {
+                let request = serde_json::from_slice::<serde_json::Value>(&buffer[..received])
+                    .unwrap_or_else(|_| serde_json::json!({ "type": "unknown" }));
+                let response = serde_json::json!({
+                    "schemaVersion": 1,
+                    "type": "stun-like-response",
+                    "status": "ok",
+                    "observedEndpoint": peer.to_string(),
+                    "serverEndpoint": local_addr.to_string(),
+                    "receivedBytes": received,
+                    "request": request,
+                });
+                let response_bytes = serde_json::to_vec(&response)?;
+                socket.send_to(&response_bytes, peer)?;
+                handled_requests = handled_requests.saturating_add(1);
+                requests.push(serde_json::json!({
+                    "peer": peer.to_string(),
+                    "bytes": received,
+                    "request": request,
+                }));
+            }
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    ErrorKind::WouldBlock
+                        | ErrorKind::TimedOut
+                        | ErrorKind::Interrupted
+                        | ErrorKind::ConnectionReset
+                ) =>
+            {
+                break;
+            }
+            Err(err) => return Err(err.into()),
+        }
+    }
+
+    Ok(serde_json::json!({
+        "status": "ok",
+        "bind": local_addr.to_string(),
+        "handledRequests": handled_requests,
+        "requests": requests,
+    }))
+}
+
+fn query_stun_like_server(
+    socket: &UdpSocket,
+    server: &str,
+    timeout_ms: u64,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    let server = server.parse::<SocketAddr>()?;
+    let previous_timeout = socket.read_timeout()?;
+    socket.set_read_timeout(Some(Duration::from_millis(timeout_ms)))?;
+    let request = serde_json::json!({
+        "schemaVersion": 1,
+        "type": "stun-like-query",
+        "sentAtMs": current_epoch_ms(),
+        "localEndpoint": socket.local_addr()?.to_string(),
+    });
+    let request_bytes = serde_json::to_vec(&request)?;
+    let sent = socket.send_to(&request_bytes, server)?;
+    let mut buffer = [0u8; 2048];
+    let result = match socket.recv_from(&mut buffer) {
+        Ok((received, peer)) => {
+            let mut response: serde_json::Value = serde_json::from_slice(&buffer[..received])?;
+            response["status"] = serde_json::Value::String("ok".to_owned());
+            response["queryLocalEndpoint"] =
+                serde_json::Value::String(socket.local_addr()?.to_string());
+            response["server"] = serde_json::Value::String(server.to_string());
+            response["responsePeer"] = serde_json::Value::String(peer.to_string());
+            response["bytesSent"] = serde_json::Value::from(sent as u64);
+            response["bytesReceived"] = serde_json::Value::from(received as u64);
+            Ok(response)
+        }
+        Err(err)
+            if matches!(
+                err.kind(),
+                ErrorKind::WouldBlock
+                    | ErrorKind::TimedOut
+                    | ErrorKind::Interrupted
+                    | ErrorKind::ConnectionReset
+            ) =>
+        {
+            Ok(serde_json::json!({
+                "status": "timeout",
+                "server": server.to_string(),
+                "queryLocalEndpoint": socket.local_addr()?.to_string(),
+                "bytesSent": sent,
+            }))
+        }
+        Err(err) => Err(err.into()),
+    };
+    socket.set_read_timeout(previous_timeout)?;
+    result
 }
 
 fn run_nat_hole_punch(
@@ -3002,6 +3914,8 @@ fn run_nat_hole_punch(
     bind: &str,
     remote_offer: &lai_core::NatTraversalOffer,
     observed_endpoint: Option<SocketAddr>,
+    stun_server: Option<&str>,
+    stun_timeout_ms: u64,
     relay_endpoints: Vec<SocketAddr>,
     attempts: u16,
     interval_ms: u64,
@@ -3012,6 +3926,8 @@ fn run_nat_hole_punch(
     if receive_timeout_ms > 0 {
         socket.set_read_timeout(Some(Duration::from_millis(receive_timeout_ms)))?;
     }
+    let observed_endpoint =
+        resolve_observed_endpoint(&socket, observed_endpoint, stun_server, stun_timeout_ms)?;
     let local_offer = lai_core::create_nat_traversal_offer(
         room_id,
         peer_id,
@@ -3084,6 +4000,8 @@ fn run_nat_p2p_bootstrap(
     bind: &str,
     remote_offer: &lai_core::NatTraversalOffer,
     observed_endpoint: Option<SocketAddr>,
+    stun_server: Option<&str>,
+    stun_timeout_ms: u64,
     relay_endpoints: Vec<SocketAddr>,
     punch_attempts: u16,
     punch_interval_ms: u64,
@@ -3092,6 +4010,8 @@ fn run_nat_p2p_bootstrap(
     let socket = UdpSocket::bind(bind)?;
     socket.set_read_timeout(Some(Duration::from_millis(25)))?;
     let local_endpoint = socket.local_addr()?;
+    let observed_endpoint =
+        resolve_observed_endpoint(&socket, observed_endpoint, stun_server, stun_timeout_ms)?;
     let local_offer = lai_core::create_nat_traversal_offer(
         room_id,
         peer_id,

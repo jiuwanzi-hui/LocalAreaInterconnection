@@ -56,6 +56,8 @@ pub struct DiagnosticExportSources {
     pub packet_error: Option<String>,
     pub packet_io_plan: Option<serde_json::Value>,
     pub packet_io_probe: Option<serde_json::Value>,
+    pub runtime_snapshot: Option<serde_json::Value>,
+    pub runtime_snapshot_error: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -123,6 +125,20 @@ pub struct DiagnosticPacketIoSection {
     pub adapter_write_status: Option<String>,
     pub plan: Option<serde_json::Value>,
     pub probe: Option<serde_json::Value>,
+    pub runtime: DiagnosticRuntimePacketIoEvidence,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct DiagnosticRuntimePacketIoEvidence {
+    pub status: Option<String>,
+    pub error: Option<String>,
+    pub raw_virtual_packet_count: usize,
+    pub forwarded_packet_count: usize,
+    pub injected_packet_count: usize,
+    pub wintun_received_packet_count: usize,
+    pub wintun_sent_packet_count: usize,
+    pub wintun_error_count: usize,
+    pub raw_virtual_packets: Vec<serde_json::Value>,
 }
 
 pub fn create_diagnostic_export_bundle(
@@ -339,14 +355,30 @@ fn packet_count(packets: &[PacketObservation], broadcast: bool, expected_ports: 
 }
 
 fn create_packet_io_section(sources: &DiagnosticExportSources) -> DiagnosticPacketIoSection {
+    let packet_io_plan = sources.packet_io_plan.clone().or_else(|| {
+        sources
+            .runtime_snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.get("packetIoPlan"))
+            .cloned()
+    });
+    let packet_io_probe = sources.packet_io_probe.clone().or_else(|| {
+        sources
+            .runtime_snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.get("packetIoProbe"))
+            .cloned()
+    });
     let backend = sources
         .packet_io_probe
         .as_ref()
+        .or(packet_io_probe.as_ref())
         .and_then(|probe| probe.get("backend"))
         .or_else(|| {
             sources
                 .packet_io_plan
                 .as_ref()
+                .or(packet_io_plan.as_ref())
                 .and_then(|plan| plan.get("backend"))
         })
         .and_then(serde_json::Value::as_str)
@@ -354,37 +386,105 @@ fn create_packet_io_section(sources: &DiagnosticExportSources) -> DiagnosticPack
     let adapter_read_status = sources
         .packet_io_probe
         .as_ref()
+        .or(packet_io_probe.as_ref())
         .and_then(|probe| probe.get("adapterReadStatus"))
+        .or_else(|| {
+            sources
+                .runtime_snapshot
+                .as_ref()
+                .and_then(|snapshot| snapshot.get("adapterReadStatus"))
+        })
         .and_then(serde_json::Value::as_str)
         .map(str::to_owned);
     let adapter_write_status = sources
         .packet_io_probe
         .as_ref()
+        .or(packet_io_probe.as_ref())
         .and_then(|probe| probe.get("adapterWriteStatus"))
+        .or_else(|| {
+            sources
+                .runtime_snapshot
+                .as_ref()
+                .and_then(|snapshot| snapshot.get("adapterWriteStatus"))
+        })
         .and_then(serde_json::Value::as_str)
         .map(str::to_owned);
     let probe_status = sources
         .packet_io_probe
         .as_ref()
+        .or(packet_io_probe.as_ref())
         .and_then(|probe| probe.get("status"))
         .and_then(serde_json::Value::as_str);
-    let status = match probe_status {
-        Some("ready") => "ok",
-        Some("partial") | Some("unavailable") | Some("unknown-backend") => "needs-attention",
-        Some(_) => "ok",
-        None if sources.packet_io_plan.is_some() => "skipped",
-        None => "skipped",
-    }
-    .to_owned();
+    let runtime = create_runtime_packet_io_evidence(sources);
+    let status = if runtime.error.is_some() {
+        "needs-attention".to_owned()
+    } else {
+        match probe_status {
+            Some("ready") => "ok",
+            Some("partial") | Some("unavailable") | Some("unknown-backend") => "needs-attention",
+            Some(_) => "ok",
+            None if packet_io_plan.is_some() => "skipped",
+            None => "skipped",
+        }
+        .to_owned()
+    };
 
     DiagnosticPacketIoSection {
         status,
         backend,
         adapter_read_status,
         adapter_write_status,
-        plan: sources.packet_io_plan.clone(),
-        probe: sources.packet_io_probe.clone(),
+        plan: packet_io_plan,
+        probe: packet_io_probe,
+        runtime,
     }
+}
+
+fn create_runtime_packet_io_evidence(
+    sources: &DiagnosticExportSources,
+) -> DiagnosticRuntimePacketIoEvidence {
+    let Some(snapshot) = sources.runtime_snapshot.as_ref() else {
+        return DiagnosticRuntimePacketIoEvidence {
+            error: sources.runtime_snapshot_error.clone(),
+            ..DiagnosticRuntimePacketIoEvidence::default()
+        };
+    };
+    let raw_virtual_packets = json_array(snapshot, "rawVirtualPackets");
+    let wintun_runtime = snapshot.get("wintunRuntime");
+    DiagnosticRuntimePacketIoEvidence {
+        status: snapshot
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned),
+        error: sources.runtime_snapshot_error.clone(),
+        raw_virtual_packet_count: raw_virtual_packets.len(),
+        forwarded_packet_count: json_array(snapshot, "forwardedPackets").len(),
+        injected_packet_count: json_array(snapshot, "injectedPackets").len(),
+        wintun_received_packet_count: wintun_runtime
+            .and_then(|runtime| runtime.get("receivedPackets"))
+            .and_then(serde_json::Value::as_array)
+            .map(Vec::len)
+            .unwrap_or_default(),
+        wintun_sent_packet_count: wintun_runtime
+            .and_then(|runtime| runtime.get("sentPackets"))
+            .and_then(serde_json::Value::as_array)
+            .map(Vec::len)
+            .unwrap_or_default(),
+        wintun_error_count: wintun_runtime
+            .and_then(|runtime| runtime.get("errors"))
+            .and_then(serde_json::Value::as_array)
+            .map(Vec::len)
+            .unwrap_or_default(),
+        raw_virtual_packets,
+    }
+}
+
+fn json_array(value: &serde_json::Value, key: &str) -> Vec<serde_json::Value> {
+    value
+        .get(key)
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -498,6 +598,23 @@ Approximate round trip times in milli-seconds:
                     "adapterReadStatus": "not-required",
                     "adapterWriteStatus": "not-required"
                 })),
+                runtime_snapshot: Some(serde_json::json!({
+                    "status": "ok",
+                    "rawVirtualPackets": [{
+                        "sourceIp": "10.77.12.2",
+                        "destinationIp": "10.77.12.255",
+                        "protocol": "udp",
+                        "payloadBytes": 8
+                    }],
+                    "forwardedPackets": [{"bytes": 8}],
+                    "injectedPackets": [],
+                    "wintunRuntime": {
+                        "receivedPackets": [{"protocol": "udp"}],
+                        "sentPackets": [{"protocol": "udp"}],
+                        "errors": []
+                    }
+                })),
+                runtime_snapshot_error: None,
             },
         );
 
@@ -507,6 +624,8 @@ Approximate round trip times in milli-seconds:
         assert_eq!(bundle.ping.status, "ok");
         assert_eq!(bundle.packet_io.status, "ok");
         assert_eq!(bundle.packet_io.backend.as_deref(), Some("userspace-udp"));
+        assert_eq!(bundle.packet_io.runtime.raw_virtual_packet_count, 1);
+        assert_eq!(bundle.packet_io.runtime.wintun_received_packet_count, 1);
         assert_eq!(bundle.packet_observations.broadcast_count, 1);
         assert_eq!(bundle.packet_observations.game_traffic_count, 1);
         assert_eq!(

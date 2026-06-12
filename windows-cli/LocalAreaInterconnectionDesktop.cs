@@ -6,6 +6,7 @@ using System.Drawing;
 using System.Drawing.Drawing2D;
 using System.IO;
 using System.Runtime.InteropServices;
+using System.Text;
 using System.Windows.Forms;
 
 public class LocalAreaInterconnectionDesktop : Form
@@ -20,9 +21,13 @@ public class LocalAreaInterconnectionDesktop : Form
     TextBox netshOutput;
     TextBox pingTarget;
     TextBox packetObservations;
+    TextBox coordinationServer;
+    TextBox stunServer;
+    TextBox remotePeer;
     TextBox invite;
     TextBox output;
     Timer animation;
+    Timer runtimeStatusTimer;
     Random random = new Random();
     Particle[] particles;
     string language;
@@ -38,8 +43,20 @@ public class LocalAreaInterconnectionDesktop : Form
     FlowLayoutPanel actionsPanel;
     Dictionary<string, Label> labelControls = new Dictionary<string, Label>();
     Dictionary<string, Button> buttonControls = new Dictionary<string, Button>();
-    const int ActionRow = 11;
-    const int OutputRow = 12;
+    Process runtimeProcess;
+    Process coordinationProcess;
+    StringBuilder runtimeOutput = new StringBuilder();
+    StringBuilder coordinationOutput = new StringBuilder();
+    string runtimeStopFile = "";
+    string latestRuntimeSnapshot = "";
+    string latestRuntimeObservationFile = "";
+    string latestNativeOfferFile = "";
+    string coordinationStoreFile = "";
+    string lastRuntimeSnapshotText = "";
+    int lastRuntimeLogLength = 0;
+    DateTime lastCoordinationRefreshUtc = DateTime.MinValue;
+    const int ActionRow = 14;
+    const int OutputRow = 15;
 
     protected override CreateParams CreateParams
     {
@@ -142,12 +159,12 @@ public class LocalAreaInterconnectionDesktop : Form
         rootLayout.Dock = DockStyle.Fill;
         rootLayout.BackColor = Color.Transparent;
         rootLayout.ColumnCount = 3;
-        rootLayout.RowCount = 13;
+        rootLayout.RowCount = 16;
         rootLayout.Padding = new Padding(12);
         rootLayout.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 180));
         rootLayout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 54));
         rootLayout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 46));
-        for (int i = 0; i < 11; i++)
+        for (int i = 0; i < 14; i++)
         {
             rootLayout.RowStyles.Add(new RowStyle(SizeType.Absolute, 36));
         }
@@ -165,7 +182,10 @@ public class LocalAreaInterconnectionDesktop : Form
         netshOutput = AddField(rootLayout, 7, "netshOutputFile", "");
         pingTarget = AddField(rootLayout, 8, "pingTarget", "127.0.0.1");
         packetObservations = AddField(rootLayout, 9, "packetObservations", "");
-        invite = AddField(rootLayout, 10, "invite", "");
+        coordinationServer = AddField(rootLayout, 10, "coordinationServer", "");
+        stunServer = AddField(rootLayout, 11, "stunServer", "");
+        remotePeer = AddField(rootLayout, 12, "remotePeer", "");
+        invite = AddField(rootLayout, 13, "invite", "");
 
         actionsPanel = new FlowLayoutPanel();
         actionsPanel.Dock = DockStyle.Fill;
@@ -195,6 +215,11 @@ public class LocalAreaInterconnectionDesktop : Form
         AddButton(actionsPanel, "udpTest", delegate { RunUdpTest(); });
         AddButton(actionsPanel, "broadcastTest", delegate { RunBroadcastTest(); });
         AddButton(actionsPanel, "nativeRuntimeSelfTest", delegate { RunNativeRuntimeSelfTest(); });
+        AddButton(actionsPanel, "nativeOffer", delegate { RunNativeOffer(); });
+        AddButton(actionsPanel, "startCoordination", delegate { StartLocalCoordinationServer(); });
+        AddButton(actionsPanel, "stopCoordination", delegate { StopLocalCoordinationServer(); });
+        AddButton(actionsPanel, "startRuntime", delegate { StartNativeRuntime(); });
+        AddButton(actionsPanel, "stopRuntime", delegate { StopNativeRuntime(); });
         AddButton(actionsPanel, "nativeNatSelfTest", delegate { RunNativeNatSelfTest(); });
         AddButton(actionsPanel, "tcpTest", delegate { RunTcpTest(); });
         AddButton(actionsPanel, "browseNetsh", delegate { BrowseNetshOutput(); });
@@ -231,6 +256,15 @@ public class LocalAreaInterconnectionDesktop : Form
             Invalidate();
         };
         animation.Start();
+        runtimeStatusTimer = new Timer();
+        runtimeStatusTimer.Interval = 1500;
+        runtimeStatusTimer.Tick += delegate { RefreshRuntimeStatus(); };
+        runtimeStatusTimer.Start();
+        FormClosing += delegate
+        {
+            StopRuntimeProcess(1500);
+            StopCoordinationProcess(1500);
+        };
     }
 
     Control TitleBar()
@@ -650,6 +684,7 @@ public class LocalAreaInterconnectionDesktop : Form
                 + " --subnet " + subnet.Text
                 + PingArgs()
                 + PacketObservationArgs()
+                + RuntimeSnapshotArgs()
                 + " --broadcast-ports " + ports.Text
                 + " --game-ports " + ports.Text
                 + " --game-name " + Quote(gameName.Text)
@@ -687,6 +722,8 @@ public class LocalAreaInterconnectionDesktop : Form
             packetObservations.Text = observePath;
         }
         string snapshotPath = Path.Combine(AppDataDirectory(), "runtime-snapshot.json");
+        latestRuntimeSnapshot = snapshotPath;
+        latestRuntimeObservationFile = observePath;
         string peer = SafePeerId(hostName.Text);
         string nativeOutput = RunNativeCli("room-runtime-run"
             + " --room-id desktop_self_test"
@@ -712,6 +749,94 @@ public class LocalAreaInterconnectionDesktop : Form
         output.Text = nativeOutput + Environment.NewLine + Environment.NewLine + T("autoNetworkDiagnose") + Environment.NewLine + diagnosticOutput;
     }
 
+    void StartNativeRuntime()
+    {
+        if (runtimeProcess != null && !runtimeProcess.HasExited)
+        {
+            output.Text = T("runtimeAlreadyRunning") + Environment.NewLine + RuntimeStatusText();
+            return;
+        }
+
+        string observePath = packetObservations.Text.Trim();
+        if (observePath.Length == 0)
+        {
+            observePath = Path.Combine(AppDataDirectory(), "runtime-packets.txt");
+            packetObservations.Text = observePath;
+        }
+        latestRuntimeObservationFile = observePath;
+        latestRuntimeSnapshot = Path.Combine(AppDataDirectory(), "runtime-snapshot.json");
+        runtimeStopFile = Path.Combine(AppDataDirectory(), "runtime.stop");
+        if (File.Exists(runtimeStopFile)) File.Delete(runtimeStopFile);
+        string peer = SafePeerId(hostName.Text);
+        string publishOutput = PublishNativeOfferIfConfigured(peer, true);
+        string args = "room-runtime-run"
+            + " --room-id desktop_runtime"
+            + " --peer-id " + Quote(peer)
+            + " --virtual-ip " + ip.Text
+            + " --bind " + NativeRuntimeBind()
+            + " --key desktop-runtime-room-key"
+            + " --game-ports " + FirstPortText("27015")
+            + " --broadcast-ports " + FirstPortText("39078")
+            + " --duration-ms 3600000"
+            + " --peer-timeout-ms 0"
+            + " --self-probe true"
+            + " --capture-self-probe true"
+            + " --forward-self-probe true"
+            + " --inject-self-probe true"
+            + " --packet-io-backend wintun"
+            + " --forward-raw-ipv4 true"
+            + " --wintun-runtime true"
+            + " --heartbeat-interval-ms 1000"
+            + " --observe-file " + Quote(observePath)
+            + " --snapshot-out " + Quote(latestRuntimeSnapshot)
+            + " --snapshot-interval-ms 1000"
+            + " --stop-file " + Quote(runtimeStopFile)
+            + RuntimeCoordinationArgs();
+
+        runtimeOutput.Length = 0;
+        lastRuntimeLogLength = 0;
+        runtimeProcess = StartNativeRuntimeProcess(args);
+        if (runtimeProcess == null)
+        {
+            return;
+        }
+        output.Text = T("runtimeStarted")
+            + Environment.NewLine + RuntimeStatusText()
+            + Environment.NewLine + T("runtimeSnapshotPath") + latestRuntimeSnapshot
+            + Environment.NewLine + T("runtimeObservationPath") + observePath;
+        if (latestNativeOfferFile.Length > 0)
+        {
+            output.Text += Environment.NewLine + T("nativeOfferPath") + latestNativeOfferFile;
+        }
+        if (publishOutput.Length > 0)
+        {
+            output.Text += Environment.NewLine + Environment.NewLine + publishOutput;
+        }
+        UpdateRoomDetails("joined");
+    }
+
+    void StopNativeRuntime()
+    {
+        if (runtimeProcess == null || runtimeProcess.HasExited)
+        {
+            output.Text = T("runtimeNotRunning");
+            return;
+        }
+        if (runtimeStopFile.Length > 0)
+        {
+            File.WriteAllText(runtimeStopFile, "stop");
+        }
+        StopRuntimeProcess(5000);
+        output.Text = T("runtimeStopped")
+            + Environment.NewLine + RuntimeStatusText()
+            + Environment.NewLine + runtimeOutput.ToString();
+        if (latestRuntimeSnapshot.Length > 0 && File.Exists(latestRuntimeSnapshot))
+        {
+            output.Text += Environment.NewLine + T("runtimeSnapshotReady") + latestRuntimeSnapshot;
+            RefreshRuntimeStatus();
+        }
+    }
+
     void RunNativeNatSelfTest()
     {
         RunNativeCli("nat-hole-punch-loopback-test"
@@ -721,6 +846,64 @@ public class LocalAreaInterconnectionDesktop : Form
             + " --attempts 3"
             + " --interval-ms 0"
             + " --message desktop-nat");
+    }
+
+    void RunNativeOffer()
+    {
+        string peer = SafePeerId(hostName.Text);
+        string result = CreateNativeOffer(peer, true);
+        if (result.Length == 0) return;
+
+        string publishOutput = PublishNativeOfferFileIfConfigured(true);
+        if (publishOutput.Length > 0)
+        {
+            output.Text = result + Environment.NewLine + Environment.NewLine + publishOutput;
+        }
+    }
+
+    void StartLocalCoordinationServer()
+    {
+        if (coordinationProcess != null && !coordinationProcess.HasExited)
+        {
+            output.Text = T("coordinationAlreadyRunning") + Environment.NewLine + CoordinationStatusText();
+            return;
+        }
+        string bind = CoordinationBind();
+        if (coordinationServer.Text.Trim().Length == 0)
+        {
+            coordinationServer.Text = "http://" + bind;
+        }
+        coordinationStoreFile = Path.Combine(AppDataDirectory(), "coordination-store.json");
+        coordinationOutput.Length = 0;
+        coordinationProcess = StartNativeBackgroundProcess(
+            "coordination-http-serve"
+            + " --bind " + Quote(bind)
+            + " --store " + Quote(coordinationStoreFile)
+            + " --max-requests 0"
+            + " --request-timeout-ms 30000",
+            coordinationOutput,
+            T("coordinationExited"));
+        if (coordinationProcess == null)
+        {
+            return;
+        }
+        output.Text = T("coordinationStarted")
+            + Environment.NewLine + CoordinationStatusText()
+            + Environment.NewLine + T("coordinationServerUrl") + coordinationServer.Text.Trim()
+            + Environment.NewLine + T("coordinationStorePath") + coordinationStoreFile;
+    }
+
+    void StopLocalCoordinationServer()
+    {
+        if (coordinationProcess == null || coordinationProcess.HasExited)
+        {
+            output.Text = T("coordinationNotRunning");
+            return;
+        }
+        StopCoordinationProcess(2000);
+        output.Text = T("coordinationStopped")
+            + Environment.NewLine + CoordinationStatusText()
+            + Environment.NewLine + coordinationOutput.ToString();
     }
 
     void RunTcpTest()
@@ -770,6 +953,81 @@ public class LocalAreaInterconnectionDesktop : Form
         broadcastSummary.Text = T("detailBroadcast") + " " + broadcast + " | " + T("detailGameTraffic") + " " + gameTraffic;
         memberSummary.Text = T("detailMembers") + " " + SafeText(hostName.Text) + " @ " + SafeText(ip.Text);
         nextActionSummary.Text = T("detailNext") + " " + DiagnosticNextAction(adapter, tunnel, p2p, broadcast, gameTraffic);
+    }
+
+    void RefreshRuntimeStatus()
+    {
+        RefreshRuntimeLogTail();
+        RefreshCoordinationPresence();
+        if (latestRuntimeSnapshot.Length == 0 || !File.Exists(latestRuntimeSnapshot))
+        {
+            return;
+        }
+        string text;
+        try
+        {
+            text = File.ReadAllText(latestRuntimeSnapshot);
+        }
+        catch
+        {
+            return;
+        }
+        if (text.Length == 0 || text == lastRuntimeSnapshotText)
+        {
+            return;
+        }
+        lastRuntimeSnapshotText = text;
+        UpdateRoomDetailsFromRuntimeSnapshot(text);
+    }
+
+    void UpdateRoomDetailsFromRuntimeSnapshot(string json)
+    {
+        if (roomSummary == null) return;
+        string adapter = JsonStringValue(json, "virtual_adapter");
+        string tunnel = JsonStringValue(json, "tunnel");
+        string p2p = JsonStringValue(json, "p2p");
+        string broadcast = JsonStringValue(json, "broadcast");
+        string gameTraffic = JsonStringValue(json, "game_traffic");
+        string connectedPeers = JsonNumberValue(json, "connected_peer_count");
+        string heartbeatPackets = JsonNumberValue(json, "heartbeatPacketsSent");
+        string snapshotWrites = JsonNumberValue(json, "snapshotWriteCount");
+        if (adapter.Length == 0) adapter = T("stateUnknown");
+        if (tunnel.Length == 0) tunnel = T("stateUnknown");
+        if (p2p.Length == 0) p2p = T("stateUnknown");
+        if (broadcast.Length == 0) broadcast = T("stateUnknown");
+        if (gameTraffic.Length == 0) gameTraffic = T("stateUnknown");
+        if (connectedPeers.Length == 0) connectedPeers = "0";
+        if (heartbeatPackets.Length == 0) heartbeatPackets = "0";
+        if (snapshotWrites.Length == 0) snapshotWrites = "0";
+
+        roomSummary.Text = T("detailRoom") + " " + SafeText(roomName.Text) + " | " + T("detailSubnet") + " " + SafeText(subnet.Text);
+        connectionSummary.Text = T("detailConnection") + " " + RuntimeStatusText() + ", " + T("detailTunnel") + "=" + tunnel + ", P2P=" + p2p;
+        broadcastSummary.Text = T("detailBroadcast") + " " + broadcast + " | " + T("detailGameTraffic") + " " + gameTraffic;
+        memberSummary.Text = T("detailMembers") + " " + SafeText(hostName.Text) + " @ " + SafeText(ip.Text)
+            + ", " + T("runtimePeers") + "=" + connectedPeers
+            + ", " + T("runtimeHeartbeats") + "=" + heartbeatPackets
+            + ", " + T("runtimeSnapshots") + "=" + snapshotWrites;
+        nextActionSummary.Text = T("detailNext") + " " + DiagnosticNextAction(adapter, tunnel, p2p, broadcast, gameTraffic);
+    }
+
+    void RefreshRuntimeLogTail()
+    {
+        if (runtimeProcess == null || runtimeProcess.HasExited || output == null)
+        {
+            return;
+        }
+        if (runtimeOutput.Length == lastRuntimeLogLength)
+        {
+            return;
+        }
+        lastRuntimeLogLength = runtimeOutput.Length;
+        string current = output.Text ?? "";
+        if (!current.StartsWith(T("runtimeStarted"), StringComparison.Ordinal)
+            && !current.StartsWith(T("runtimeLogTail"), StringComparison.Ordinal))
+        {
+            return;
+        }
+        output.Text = T("runtimeLogTail") + Environment.NewLine + TailText(runtimeOutput.ToString(), 80);
     }
 
     string ConnectionText(string mode)
@@ -846,6 +1104,148 @@ public class LocalAreaInterconnectionDesktop : Form
         return " --packet-observations " + Quote(path);
     }
 
+    string RuntimeSnapshotArgs()
+    {
+        string path = latestRuntimeSnapshot;
+        if (path.Length == 0)
+        {
+            path = Path.Combine(AppDataDirectory(), "runtime-snapshot.json");
+        }
+        if (!File.Exists(path)) return "";
+        return " --runtime-snapshot " + Quote(path);
+    }
+
+    string RuntimeCoordinationArgs()
+    {
+        string args = "";
+        string server = coordinationServer.Text.Trim();
+        string peer = remotePeer.Text.Trim();
+        if (server.Length > 0 && peer.Length > 0)
+        {
+            args += " --coordination-server " + Quote(server);
+            args += " --coordination-peer " + Quote(peer);
+        }
+        return args;
+    }
+
+    void RefreshCoordinationPresence()
+    {
+        if (runtimeProcess == null || runtimeProcess.HasExited)
+        {
+            return;
+        }
+        if (coordinationServer.Text.Trim().Length == 0)
+        {
+            return;
+        }
+        if ((DateTime.UtcNow - lastCoordinationRefreshUtc).TotalSeconds < 15)
+        {
+            return;
+        }
+        lastCoordinationRefreshUtc = DateTime.UtcNow;
+        string peer = SafePeerId(hostName.Text);
+        if (latestNativeOfferFile.Length == 0 || !File.Exists(latestNativeOfferFile))
+        {
+            CreateNativeOffer(peer, false);
+        }
+        PublishNativeOfferFileIfConfigured(false);
+    }
+
+    string PublishNativeOfferIfConfigured(string peer, bool showOutput)
+    {
+        if (coordinationServer.Text.Trim().Length == 0) return "";
+        if (CreateNativeOffer(peer, false).Length == 0) return output.Text;
+        return PublishNativeOfferFileIfConfigured(showOutput);
+    }
+
+    string PublishNativeOfferFileIfConfigured(bool showOutput)
+    {
+        string server = coordinationServer.Text.Trim();
+        if (server.Length == 0 || latestNativeOfferFile.Length == 0 || !File.Exists(latestNativeOfferFile))
+        {
+            return "";
+        }
+        string arguments = "coordination-http-offer-publish"
+            + " --server " + Quote(server)
+            + " --offer " + Quote(latestNativeOfferFile)
+            + " --ttl-ms 30000";
+        return showOutput ? RunNativeCli(arguments) : RunNativeCliCapture(arguments);
+    }
+
+    string CreateNativeOffer(string peer, bool showOutput)
+    {
+        latestNativeOfferFile = Path.Combine(AppDataDirectory(), "native-offer-" + peer + ".json");
+        string arguments = "nat-candidates"
+            + " --room-id desktop_runtime"
+            + " --peer-id " + Quote(peer)
+            + " --bind " + NativeRuntimeBind()
+            + StunArgs()
+            + " --nonce " + Quote(peer + "-desktop-offer");
+        string text = showOutput ? RunNativeCli(arguments) : RunNativeCliCapture(arguments);
+        string offer = JsonObjectValue(text, "offer");
+        if (offer.Length > 0)
+        {
+            File.WriteAllText(latestNativeOfferFile, offer + Environment.NewLine, Encoding.UTF8);
+            if (showOutput)
+            {
+                output.Text = text + Environment.NewLine + T("nativeOfferPath") + latestNativeOfferFile;
+            }
+            return text;
+        }
+        if (showOutput)
+        {
+            output.Text = text;
+        }
+        return "";
+    }
+
+    string StunArgs()
+    {
+        string server = stunServer.Text.Trim();
+        if (server.Length == 0) return "";
+        return " --stun-server " + Quote(server) + " --stun-timeout-ms 1000";
+    }
+
+    string NativeRuntimeBind()
+    {
+        return "0.0.0.0:39090";
+    }
+
+    string CoordinationBind()
+    {
+        string value = coordinationServer.Text.Trim();
+        if (value.Length == 0) return "127.0.0.1:39110";
+        if (value.StartsWith("http://", StringComparison.OrdinalIgnoreCase))
+        {
+            value = value.Substring("http://".Length);
+        }
+        if (value.StartsWith("https://", StringComparison.OrdinalIgnoreCase))
+        {
+            value = value.Substring("https://".Length);
+        }
+        int slash = value.IndexOf('/');
+        if (slash >= 0)
+        {
+            value = value.Substring(0, slash);
+        }
+        return value.Length == 0 ? "127.0.0.1:39110" : value;
+    }
+
+    string TailText(string value, int maxLines)
+    {
+        if (value.Length == 0) return "";
+        string[] lines = value.Replace("\r\n", "\n").Replace('\r', '\n').Split('\n');
+        int start = Math.Max(0, lines.Length - maxLines);
+        StringBuilder builder = new StringBuilder();
+        for (int i = start; i < lines.Length; i++)
+        {
+            if (lines[i].Length == 0 && i == lines.Length - 1) continue;
+            if (builder.Length > 0) builder.AppendLine();
+            builder.Append(lines[i]);
+        }
+        return builder.ToString();
+    }
+
     string PingArgs()
     {
         string target = pingTarget.Text.Trim();
@@ -889,7 +1289,141 @@ public class LocalAreaInterconnectionDesktop : Form
         return RunExecutable(exe, arguments);
     }
 
+    string RunNativeCliCapture(string arguments)
+    {
+        string exe = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "LocalAreaInterconnection.Native.Cli.exe");
+        if (!File.Exists(exe))
+        {
+            return T("missingNativeCli") + exe;
+        }
+        return RunExecutableCapture(exe, arguments);
+    }
+
+    Process StartNativeRuntimeProcess(string arguments)
+    {
+        return StartNativeBackgroundProcess(arguments, runtimeOutput, T("runtimeExited"));
+    }
+
+    Process StartNativeBackgroundProcess(string arguments, StringBuilder log, string exitedPrefix)
+    {
+        string exe = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "LocalAreaInterconnection.Native.Cli.exe");
+        if (!File.Exists(exe))
+        {
+            output.Text = T("missingNativeCli") + exe;
+            return null;
+        }
+
+        ProcessStartInfo start = new ProcessStartInfo();
+        start.FileName = exe;
+        start.Arguments = arguments;
+        start.UseShellExecute = false;
+        start.RedirectStandardOutput = true;
+        start.RedirectStandardError = true;
+        start.CreateNoWindow = true;
+
+        Process process = new Process();
+        process.StartInfo = start;
+        process.EnableRaisingEvents = true;
+        process.OutputDataReceived += delegate(object sender, DataReceivedEventArgs e)
+        {
+            if (e.Data != null) log.AppendLine(e.Data);
+        };
+        process.ErrorDataReceived += delegate(object sender, DataReceivedEventArgs e)
+        {
+            if (e.Data != null) log.AppendLine(e.Data);
+        };
+        process.Exited += delegate
+        {
+            if (IsDisposed || !IsHandleCreated) return;
+            try
+            {
+                BeginInvoke((MethodInvoker)delegate
+                {
+                    if (output != null && !IsDisposed)
+                    {
+                        output.Text = exitedPrefix + Environment.NewLine + log.ToString();
+                    }
+                });
+            }
+            catch
+            {
+            }
+        };
+        process.Start();
+        process.BeginOutputReadLine();
+        process.BeginErrorReadLine();
+        return process;
+    }
+
+    void StopRuntimeProcess(int waitMs)
+    {
+        if (runtimeProcess == null) return;
+        try
+        {
+            if (!runtimeProcess.HasExited)
+            {
+                if (runtimeStopFile.Length > 0 && !File.Exists(runtimeStopFile))
+                {
+                    File.WriteAllText(runtimeStopFile, "stop");
+                }
+                if (!runtimeProcess.WaitForExit(waitMs))
+                {
+                    runtimeProcess.Kill();
+                    runtimeProcess.WaitForExit(2000);
+                }
+            }
+            runtimeProcess.Dispose();
+            runtimeProcess = null;
+        }
+        catch
+        {
+        }
+    }
+
+    string RuntimeStatusText()
+    {
+        if (runtimeProcess != null && !runtimeProcess.HasExited)
+        {
+            return T("runtimeRunning");
+        }
+        return T("runtimeStoppedState");
+    }
+
+    void StopCoordinationProcess(int waitMs)
+    {
+        if (coordinationProcess == null) return;
+        try
+        {
+            if (!coordinationProcess.HasExited)
+            {
+                coordinationProcess.Kill();
+                coordinationProcess.WaitForExit(waitMs);
+            }
+            coordinationProcess.Dispose();
+            coordinationProcess = null;
+        }
+        catch
+        {
+        }
+    }
+
+    string CoordinationStatusText()
+    {
+        if (coordinationProcess != null && !coordinationProcess.HasExited)
+        {
+            return T("coordinationRunning");
+        }
+        return T("coordinationStoppedState");
+    }
+
     string RunExecutable(string exe, string arguments)
+    {
+        string text = RunExecutableCapture(exe, arguments);
+        output.Text = text;
+        return text;
+    }
+
+    string RunExecutableCapture(string exe, string arguments)
     {
         ProcessStartInfo start = new ProcessStartInfo();
         start.FileName = exe;
@@ -904,13 +1438,13 @@ public class LocalAreaInterconnectionDesktop : Form
             string stdout = process.StandardOutput.ReadToEnd();
             string stderr = process.StandardError.ReadToEnd();
             process.WaitForExit();
-            output.Text = stdout;
+            string text = stdout;
             if (stderr.Length > 0)
             {
-                output.Text += Environment.NewLine + stderr;
+                text += Environment.NewLine + stderr;
             }
+            return text;
         }
-        return output.Text;
     }
 
     string JsonStringValue(string json, string key)
@@ -923,6 +1457,60 @@ public class LocalAreaInterconnectionDesktop : Form
         int end = json.IndexOf('"', start + 1);
         if (end < 0) return "";
         return json.Substring(start + 1, end - start - 1).Replace("\\\"", "\"").Replace("\\\\", "\\");
+    }
+
+    string JsonObjectValue(string json, string key)
+    {
+        string marker = "\"" + key + "\":";
+        int markerStart = json.IndexOf(marker, StringComparison.Ordinal);
+        if (markerStart < 0) return "";
+        int start = json.IndexOf('{', markerStart + marker.Length);
+        if (start < 0) return "";
+        int depth = 0;
+        bool inString = false;
+        bool escaped = false;
+        for (int i = start; i < json.Length; i++)
+        {
+            char ch = json[i];
+            if (escaped)
+            {
+                escaped = false;
+                continue;
+            }
+            if (ch == '\\' && inString)
+            {
+                escaped = true;
+                continue;
+            }
+            if (ch == '"')
+            {
+                inString = !inString;
+                continue;
+            }
+            if (inString) continue;
+            if (ch == '{') depth++;
+            else if (ch == '}')
+            {
+                depth--;
+                if (depth == 0)
+                {
+                    return json.Substring(start, i - start + 1);
+                }
+            }
+        }
+        return "";
+    }
+
+    string JsonNumberValue(string json, string key)
+    {
+        string marker = "\"" + key + "\":";
+        int start = json.IndexOf(marker, StringComparison.Ordinal);
+        if (start < 0) return "";
+        start += marker.Length;
+        while (start < json.Length && Char.IsWhiteSpace(json[start])) start++;
+        int end = start;
+        while (end < json.Length && (Char.IsDigit(json[end]) || json[end] == '.' || json[end] == '-')) end++;
+        return end > start ? json.Substring(start, end - start) : "";
     }
 
     string FirewallDiagnoseArgs()
@@ -1072,6 +1660,10 @@ public class LocalAreaInterconnectionDesktop : Form
             if (key == "udpTest") return "UDP 测试";
             if (key == "broadcastTest") return "广播测试";
             if (key == "nativeRuntimeSelfTest") return "原生隧道自检";
+            if (key == "startRuntime") return "启动 runtime";
+            if (key == "stopRuntime") return "停止 runtime";
+            if (key == "startCoordination") return "启动协调";
+            if (key == "stopCoordination") return "停止协调";
             if (key == "nativeNatSelfTest") return "NAT 自检";
             if (key == "tcpTest") return "TCP 测试";
             if (key == "browseNetsh") return "选择 Netsh";
@@ -1112,6 +1704,34 @@ public class LocalAreaInterconnectionDesktop : Form
             if (key == "selectNetshOutput") return "选择 netsh 输出文件";
             if (key == "selectPacketObservations") return "选择或创建包观测文件";
             if (key == "saveDiagnosticBundle") return "保存诊断包";
+            if (key == "runtimeAlreadyRunning") return "runtime 已在运行。";
+            if (key == "runtimeStarted") return "runtime 已启动，正在写入 snapshot 和包观测文件。";
+            if (key == "runtimeStopped") return "runtime 已停止。";
+            if (key == "runtimeNotRunning") return "runtime 当前没有运行。";
+            if (key == "runtimeRunning") return "runtime: 运行中";
+            if (key == "runtimeStoppedState") return "runtime: 已停止";
+            if (key == "runtimeExited") return "runtime 进程已退出:";
+            if (key == "runtimeSnapshotPath") return "Snapshot: ";
+            if (key == "runtimeObservationPath") return "包观测: ";
+            if (key == "runtimeSnapshotReady") return "可用于诊断导出的 snapshot: ";
+            if (key == "nativeOffer") return "生成 Offer";
+            if (key == "coordinationServer") return "协调服务";
+            if (key == "stunServer") return "STUN 服务";
+            if (key == "remotePeer") return "远端 Peer";
+            if (key == "nativeOfferPath") return "Offer 文件: ";
+            if (key == "runtimePeers") return "peer";
+            if (key == "runtimeHeartbeats") return "心跳";
+            if (key == "runtimeSnapshots") return "snapshot";
+            if (key == "runtimeLogTail") return "runtime 最近日志:";
+            if (key == "coordinationAlreadyRunning") return "协调服务已在运行。";
+            if (key == "coordinationStarted") return "协调服务已启动。";
+            if (key == "coordinationStopped") return "协调服务已停止。";
+            if (key == "coordinationNotRunning") return "协调服务当前没有运行。";
+            if (key == "coordinationRunning") return "coordination: 运行中";
+            if (key == "coordinationStoppedState") return "coordination: 已停止";
+            if (key == "coordinationExited") return "协调服务进程已退出:";
+            if (key == "coordinationServerUrl") return "协调服务: ";
+            if (key == "coordinationStorePath") return "协调存储: ";
             if (key == "textFilesFilter") return "文本文件 (*.txt)|*.txt|所有文件 (*.*)|*.*";
             if (key == "jsonFilesFilter") return "JSON 文件 (*.json)|*.json|所有文件 (*.*)|*.*";
             if (key == "missingCli") return "缺少 CLI 程序: ";
@@ -1151,6 +1771,10 @@ public class LocalAreaInterconnectionDesktop : Form
             if (key == "udpTest") return "UDP test";
             if (key == "broadcastTest") return "Broadcast test";
             if (key == "nativeRuntimeSelfTest") return "Native tunnel self-test";
+            if (key == "startRuntime") return "Start runtime";
+            if (key == "stopRuntime") return "Stop runtime";
+            if (key == "startCoordination") return "Start coordination";
+            if (key == "stopCoordination") return "Stop coordination";
             if (key == "nativeNatSelfTest") return "NAT self-test";
             if (key == "tcpTest") return "TCP test";
             if (key == "browseNetsh") return "Browse netsh";
@@ -1191,6 +1815,34 @@ public class LocalAreaInterconnectionDesktop : Form
             if (key == "selectNetshOutput") return "Select netsh output";
             if (key == "selectPacketObservations") return "Select or create packet observation file";
             if (key == "saveDiagnosticBundle") return "Save diagnostic bundle";
+            if (key == "runtimeAlreadyRunning") return "runtime is already running.";
+            if (key == "runtimeStarted") return "runtime started and is writing snapshots and packet observations.";
+            if (key == "runtimeStopped") return "runtime stopped.";
+            if (key == "runtimeNotRunning") return "runtime is not running.";
+            if (key == "runtimeRunning") return "runtime: running";
+            if (key == "runtimeStoppedState") return "runtime: stopped";
+            if (key == "runtimeExited") return "runtime process exited:";
+            if (key == "runtimeSnapshotPath") return "Snapshot: ";
+            if (key == "runtimeObservationPath") return "Packet observations: ";
+            if (key == "runtimeSnapshotReady") return "Snapshot available for diagnostic export: ";
+            if (key == "nativeOffer") return "Create offer";
+            if (key == "coordinationServer") return "Coordination server";
+            if (key == "stunServer") return "STUN server";
+            if (key == "remotePeer") return "Remote peer";
+            if (key == "nativeOfferPath") return "Offer file: ";
+            if (key == "runtimePeers") return "peers";
+            if (key == "runtimeHeartbeats") return "heartbeats";
+            if (key == "runtimeSnapshots") return "snapshots";
+            if (key == "runtimeLogTail") return "Recent runtime log:";
+            if (key == "coordinationAlreadyRunning") return "coordination server is already running.";
+            if (key == "coordinationStarted") return "coordination server started.";
+            if (key == "coordinationStopped") return "coordination server stopped.";
+            if (key == "coordinationNotRunning") return "coordination server is not running.";
+            if (key == "coordinationRunning") return "coordination: running";
+            if (key == "coordinationStoppedState") return "coordination: stopped";
+            if (key == "coordinationExited") return "coordination server process exited:";
+            if (key == "coordinationServerUrl") return "Coordination server: ";
+            if (key == "coordinationStorePath") return "Coordination store: ";
             if (key == "textFilesFilter") return "Text files (*.txt)|*.txt|All files (*.*)|*.*";
             if (key == "jsonFilesFilter") return "JSON files (*.json)|*.json|All files (*.*)|*.*";
             if (key == "missingCli") return "Missing CLI executable: ";

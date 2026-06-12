@@ -1,7 +1,12 @@
 node_modules/
+.run/
 .idea/
 dist/
 coverage/
 native/target/
+tools/*.exe
 .DS_Store
 *.log
+FUNCTIONAL_DESIGN.md
+IMPLEMENTATION_PROGRESS.md
+docs/
