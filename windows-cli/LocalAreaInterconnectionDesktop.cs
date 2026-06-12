@@ -220,6 +220,7 @@ public class LocalAreaInterconnectionDesktop : Form
         AddButton(actionsPanel, "stopCoordination", delegate { StopLocalCoordinationServer(); });
         AddButton(actionsPanel, "startRuntime", delegate { StartNativeRuntime(); });
         AddButton(actionsPanel, "stopRuntime", delegate { StopNativeRuntime(); });
+        AddButton(actionsPanel, "closeRoom", delegate { CloseCoordinationRoom(); });
         AddButton(actionsPanel, "nativeNatSelfTest", delegate { RunNativeNatSelfTest(); });
         AddButton(actionsPanel, "tcpTest", delegate { RunTcpTest(); });
         AddButton(actionsPanel, "browseNetsh", delegate { BrowseNetshOutput(); });
@@ -818,12 +819,17 @@ public class LocalAreaInterconnectionDesktop : Form
 
     void StopNativeRuntime()
     {
+        StopNativeRuntime(true);
+    }
+
+    void StopNativeRuntime(bool leaveCoordination)
+    {
         if (runtimeProcess == null || runtimeProcess.HasExited)
         {
             output.Text = T("runtimeNotRunning");
             return;
         }
-        string leaveOutput = LeaveCoordinationRoomIfConfigured();
+        string leaveOutput = leaveCoordination ? LeaveCoordinationRoomIfConfigured() : "";
         if (runtimeStopFile.Length > 0)
         {
             File.WriteAllText(runtimeStopFile, "stop");
@@ -841,6 +847,30 @@ public class LocalAreaInterconnectionDesktop : Form
             output.Text += Environment.NewLine + T("runtimeSnapshotReady") + latestRuntimeSnapshot;
             RefreshRuntimeStatus();
         }
+    }
+
+    void CloseCoordinationRoom()
+    {
+        if (coordinationServer.Text.Trim().Length == 0)
+        {
+            output.Text = T("coordinationServerRequired");
+            return;
+        }
+        string closeOutput = CloseCoordinationRoomIfConfigured();
+        if (runtimeProcess != null && !runtimeProcess.HasExited)
+        {
+            StopNativeRuntime(false);
+            if (closeOutput.Length > 0)
+            {
+                output.Text += Environment.NewLine + Environment.NewLine + closeOutput;
+            }
+        }
+        else if (closeOutput.Length > 0)
+        {
+            output.Text = closeOutput;
+        }
+        UpdateRoomDetails("closed");
+        RefreshCoordinationRoomView(false);
     }
 
     void RunNativeNatSelfTest()
@@ -1088,6 +1118,7 @@ public class LocalAreaInterconnectionDesktop : Form
         if (mode == "created") return T("connectionHostReady");
         if (mode == "joined") return T("connectionJoined");
         if (mode == "exported") return T("connectionExported");
+        if (mode == "closed") return T("connectionClosed");
         return T("stateUnknown");
     }
 
@@ -1103,6 +1134,7 @@ public class LocalAreaInterconnectionDesktop : Form
         if (mode == "joined") return T("nextFindLanRoom");
         if (mode == "decoded") return T("nextJoinRoom");
         if (mode == "exported") return T("nextShareBundle");
+        if (mode == "closed") return T("nextCreateOrJoin");
         return T("nextCreateOrJoin");
     }
 
@@ -1240,6 +1272,19 @@ public class LocalAreaInterconnectionDesktop : Form
             + " --peer-id " + Quote(peer));
         RefreshCoordinationRoomView(false);
         return T("coordinationLeft") + Environment.NewLine + result;
+    }
+
+    string CloseCoordinationRoomIfConfigured()
+    {
+        string server = coordinationServer.Text.Trim();
+        if (server.Length == 0)
+        {
+            return T("coordinationServerRequired");
+        }
+        string result = RunNativeCliCapture("coordination-http-close"
+            + " --server " + Quote(server)
+            + " --room-id desktop_runtime");
+        return T("coordinationRoomClosed") + Environment.NewLine + result;
     }
 
     string CreateNativeOffer(string peer, bool showOutput)
@@ -1843,6 +1888,7 @@ public class LocalAreaInterconnectionDesktop : Form
             if (key == "stopRuntime") return "停止 runtime";
             if (key == "startCoordination") return "启动协调";
             if (key == "stopCoordination") return "停止协调";
+            if (key == "closeRoom") return "关闭房间";
             if (key == "nativeNatSelfTest") return "NAT 自检";
             if (key == "tcpTest") return "TCP 测试";
             if (key == "browseNetsh") return "选择 Netsh";
@@ -1864,6 +1910,7 @@ public class LocalAreaInterconnectionDesktop : Form
             if (key == "connectionHostReady") return "房主模式，等待朋友加入";
             if (key == "connectionJoined") return "已加入，等待连通性验证";
             if (key == "connectionExported") return "诊断包已导出";
+            if (key == "connectionClosed") return "房间已关闭";
             if (key == "nextCreateLanRoom") return "复制邀请码给朋友，然后启动游戏并创建 LAN 房间。";
             if (key == "nextFindLanRoom") return "进入游戏 LAN 页面查找房间；找不到时运行网络诊断。";
             if (key == "nextJoinRoom") return "点击加入房间，获得建议虚拟 IP。";
@@ -1915,6 +1962,8 @@ public class LocalAreaInterconnectionDesktop : Form
             if (key == "coordinationOnline") return "在线";
             if (key == "coordinationExpired") return "过期";
             if (key == "coordinationLeft") return "已从协调房间离开:";
+            if (key == "coordinationRoomClosed") return "协调房间已关闭:";
+            if (key == "coordinationServerRequired") return "需要先填写或启动协调服务。";
             if (key == "textFilesFilter") return "文本文件 (*.txt)|*.txt|所有文件 (*.*)|*.*";
             if (key == "jsonFilesFilter") return "JSON 文件 (*.json)|*.json|所有文件 (*.*)|*.*";
             if (key == "missingCli") return "缺少 CLI 程序: ";
@@ -1958,6 +2007,7 @@ public class LocalAreaInterconnectionDesktop : Form
             if (key == "stopRuntime") return "Stop runtime";
             if (key == "startCoordination") return "Start coordination";
             if (key == "stopCoordination") return "Stop coordination";
+            if (key == "closeRoom") return "Close room";
             if (key == "nativeNatSelfTest") return "NAT self-test";
             if (key == "tcpTest") return "TCP test";
             if (key == "browseNetsh") return "Browse netsh";
@@ -1979,6 +2029,7 @@ public class LocalAreaInterconnectionDesktop : Form
             if (key == "connectionHostReady") return "Host mode, waiting for friends";
             if (key == "connectionJoined") return "Joined, waiting for connectivity checks";
             if (key == "connectionExported") return "Diagnostic bundle exported";
+            if (key == "connectionClosed") return "Room closed";
             if (key == "nextCreateLanRoom") return "Copy the invite to friends, then start the game and create a LAN room.";
             if (key == "nextFindLanRoom") return "Open the game LAN page; run network diagnostics if the room is missing.";
             if (key == "nextJoinRoom") return "Click join room to get the suggested virtual IP.";
@@ -2030,6 +2081,8 @@ public class LocalAreaInterconnectionDesktop : Form
             if (key == "coordinationOnline") return "online";
             if (key == "coordinationExpired") return "expired";
             if (key == "coordinationLeft") return "Left coordination room:";
+            if (key == "coordinationRoomClosed") return "Coordination room closed:";
+            if (key == "coordinationServerRequired") return "Fill or start the coordination server first.";
             if (key == "textFilesFilter") return "Text files (*.txt)|*.txt|All files (*.*)|*.*";
             if (key == "jsonFilesFilter") return "JSON files (*.json)|*.json|All files (*.*)|*.*";
             if (key == "missingCli") return "Missing CLI executable: ";
