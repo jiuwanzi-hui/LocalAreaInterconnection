@@ -1,10 +1,14 @@
 # LocalAreaInterconnection
 
+[English](#english) | [中文](#中文)
+
+## English
+
 LocalAreaInterconnection is a Windows virtual LAN tool for LAN-only PC games.
 
-It helps players in different places create an encrypted virtual LAN, so games that only support local network discovery or direct LAN IP joining can connect over the internet.
+It helps players in different places create an encrypted virtual LAN so games that only support local network discovery or direct LAN IP joining can connect over the internet.
 
-## Download
+### Download
 
 Prebuilt Windows executables will be published on the GitHub Releases page:
 
@@ -12,7 +16,7 @@ Prebuilt Windows executables will be published on the GitHub Releases page:
 
 The repository stores source code only. Release `.exe` files are built separately and uploaded to Releases.
 
-## Features
+### Features
 
 - Create or join a virtual LAN room.
 - Copy room invite codes and virtual IP addresses.
@@ -26,7 +30,7 @@ The repository stores source code only. Release `.exe` files are built separatel
 - Export a read-only diagnostic bundle for troubleshooting.
 - Switch the desktop UI language between English and Chinese inside the app.
 
-## Current Status
+### Current Status
 
 The project is still under active MVP development.
 
@@ -43,7 +47,7 @@ Real cross-network gameplay still needs validation on two Windows machines with:
 - A created and openable Wintun adapter.
 - Real game traffic on different NAT networks.
 
-## Which EXE To Run
+### Which EXE To Run
 
 For normal use, run:
 
@@ -60,7 +64,7 @@ LocalAreaInterconnection.Native.Cli.exe
 
 Those CLI executables are mainly for testing, diagnostics, and native networking experiments.
 
-## Build From Source
+### Build From Source
 
 Requirements:
 
@@ -107,7 +111,7 @@ Or double-click:
 build-and-run-exe.bat
 ```
 
-## Development Notes
+### Development Notes
 
 - `native/` contains the Rust native core and CLI.
 - `windows-cli/` contains the current Windows desktop test shell source.
@@ -115,6 +119,127 @@ build-and-run-exe.bat
 - Compiled outputs under `dist/` and `native/target/` are not committed.
 - Planning and progress documents are local development references and are not required for release downloads.
 
-## License
+### License
 
 This project currently uses the license file included in the repository.
+
+## 中文
+
+LocalAreaInterconnection 是一个面向仅支持局域网联机的 PC 游戏的 Windows 虚拟局域网工具。
+
+它帮助不同地点的玩家创建加密虚拟 LAN，让只支持局域网发现或直接输入 LAN IP 加入的游戏可以通过互联网连接。
+
+### 下载
+
+预编译的 Windows 可执行文件会发布到 GitHub Releases 页面：
+
+[从 Releases 下载](https://github.com/jiuwanzi-hui/LocalAreaInterconnection/releases)
+
+仓库只存放源代码。Release 中的 `.exe` 文件会单独构建并上传。
+
+### 功能
+
+- 创建或加入虚拟 LAN 房间。
+- 复制房间邀请码和虚拟 IP。
+- 显示房间成员和各自的虚拟 IP。
+- 在玩家之间使用加密 UDP 隧道。
+- 通过本地或 HTTP 协调交换 P2P/NAT 穿透信息。
+- 转发局域网游戏发现常用的 UDP 广播流量。
+- 支持 IPv4 UDP、广播和核心 TCP 包路径。
+- 探测并报告 Wintun 虚拟网卡就绪状态。
+- 诊断网卡、防火墙、Ping、广播和游戏流量问题。
+- 导出只读诊断包用于排障。
+- 在应用内切换桌面 UI 的中英文。
+
+### 当前状态
+
+项目仍处在 MVP 持续开发阶段。
+
+当前已实现 Windows 桌面测试壳、Rust 原生 CLI、房间与邀请模型、诊断、加密隧道封装、NAT/P2P bootstrap、本地 JSON coordination store、轻量 HTTP 协调服务、UDP 转发、原始 IPv4 UDP/TCP 包处理和 Wintun 运行时探测。
+
+最近的原生构建还加入了一个轻量 STUN-like UDP 观测器，用于端点发现，并支持把 `room-runtime-run` 的 snapshot 文件导入诊断导出。这样故障包里就能包含运行时的 packet I/O 证据，例如原始虚拟包计数、Wintun 收发摘要和运行期间记录的包观测行。
+
+桌面测试壳可以启动和停止一个受控的 native runtime。runtime snapshot 和包观测文件会写到用户的应用数据目录，诊断导出按钮在存在最近 snapshot 时会自动合并进去。
+
+真实跨网络联机仍需要在两台 Windows 机器上验证，并满足以下条件：
+
+- 管理员权限。
+- `wintun.dll`。
+- 已创建且可打开的 Wintun 网卡。
+- 不同 NAT 网络下的真实游戏流量。
+
+### 运行哪个 EXE
+
+正常使用运行：
+
+```text
+LocalAreaInterconnection.exe
+```
+
+开发和诊断构建还可能生成：
+
+```text
+LocalAreaInterconnection.Cli.exe
+LocalAreaInterconnection.Native.Cli.exe
+```
+
+这些 CLI 程序主要用于测试、诊断和原生网络实验。
+
+### 从源码构建
+
+要求：
+
+- Windows。
+- 带 Cargo 的 Rust 工具链。
+- .NET SDK，或桌面测试壳所用的构建工具。
+
+运行 Rust 测试：
+
+```powershell
+cd native
+cargo test
+```
+
+常用原生诊断：
+
+```powershell
+.\dist\LocalAreaInterconnection.Native.Cli.exe stun-like-serve --bind 0.0.0.0:39120
+.\dist\LocalAreaInterconnection.Native.Cli.exe nat-candidates --stun-server <server-ip>:39120
+.\dist\LocalAreaInterconnection.Native.Cli.exe diagnostic-export --out diag.json --runtime-snapshot runtime.json
+```
+
+构建最新 Windows 测试壳：
+
+```powershell
+.\scripts\build-windows-test-shell.ps1
+```
+
+或者双击：
+
+```text
+build-latest-exe.bat
+```
+
+构建并启动：
+
+```powershell
+.\scripts\run-windows-test-shell.ps1
+```
+
+或者双击：
+
+```text
+build-and-run-exe.bat
+```
+
+### 开发说明
+
+- `native/` 是 Rust 原生核心和 CLI。
+- `windows-cli/` 是当前 Windows 桌面测试壳源码。
+- `scripts/` 放本地构建辅助脚本。
+- `dist/` 和 `native/target/` 下的编译产物不提交。
+- 设计和进度文档只作为本地开发参考，不属于发布内容。
+
+### 许可证
+
+本项目当前使用仓库中附带的 license 文件。
