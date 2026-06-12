@@ -237,6 +237,60 @@ fn game_profile_plan_reads_catalog_and_outputs_network_plan() {
 }
 
 #[test]
+fn game_profile_list_filters_catalog_summaries() {
+    let path = std::env::temp_dir().join(format!(
+        "lai-cli-game-profile-list-{}.json",
+        std::process::id()
+    ));
+    let path_string = path.display().to_string();
+    fs::write(
+        &path,
+        serde_json::json!({
+            "profiles": [
+                {
+                    "game_name": "Zeta Direct",
+                    "steam_app_id": "200",
+                    "discovery": "direct_ip",
+                    "ports": [7777, 7777],
+                    "compatibility": "B"
+                },
+                {
+                    "game_name": "Alpha Broadcast",
+                    "steam_app_id": "100",
+                    "discovery": "udp_broadcast",
+                    "ports": [27016, 27015],
+                    "compatibility": "A"
+                }
+            ]
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let all = run_cli(&["game-profile-list", "--catalog", &path_string]);
+    let filtered = run_cli(&[
+        "game-profile-list",
+        "--catalog",
+        &path_string,
+        "--query",
+        "direct",
+    ]);
+    fs::remove_file(&path).ok();
+
+    assert_eq!(all["status"], "ok");
+    assert_eq!(all["total_count"], 2);
+    assert_eq!(all["matched_count"], 2);
+    assert_eq!(all["profiles"][0]["game_name"], "Alpha Broadcast");
+    assert_eq!(all["profiles"][0]["discovery"], "udp_broadcast");
+    assert_eq!(all["profiles"][0]["ports"].as_array().unwrap().len(), 2);
+
+    assert_eq!(filtered["matched_count"], 1);
+    assert_eq!(filtered["profiles"][0]["game_name"], "Zeta Direct");
+    assert_eq!(filtered["profiles"][0]["port_count"], 1);
+    assert_eq!(filtered["profiles"][0]["ports"][0], 7777);
+}
+
+#[test]
 fn room_runtime_run_can_bootstrap_nat_remote_peer_before_starting() {
     let probe = UdpSocket::bind("127.0.0.1:0").expect("free udp port");
     let listener_addr = probe.local_addr().unwrap();

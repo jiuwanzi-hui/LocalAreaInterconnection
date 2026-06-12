@@ -13,6 +13,17 @@ pub struct GameProfileMatch {
     pub matched_by: String,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct GameProfileSummary {
+    pub game_name: String,
+    pub steam_app_id: Option<String>,
+    pub discovery: DiscoveryMode,
+    pub compatibility: CompatibilityLevel,
+    pub port_count: usize,
+    pub ports: Vec<u16>,
+    pub join_method: String,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
 enum GameProfileCatalogInput {
@@ -102,6 +113,52 @@ pub fn find_game_profile(
             profile: profile.clone(),
             matched_by: "game_name_contains".to_owned(),
         })
+}
+
+pub fn list_game_profile_summaries(
+    catalog: &GameProfileCatalog,
+    query: Option<&str>,
+) -> Vec<GameProfileSummary> {
+    let query = query
+        .map(|value| value.trim().to_lowercase())
+        .filter(|value| !value.is_empty());
+    let mut profiles = catalog
+        .profiles
+        .iter()
+        .filter(|profile| match &query {
+            Some(query) => {
+                profile.game_name.to_lowercase().contains(query)
+                    || profile
+                        .steam_app_id
+                        .as_deref()
+                        .is_some_and(|steam_app_id| steam_app_id.to_lowercase().contains(query))
+            }
+            None => true,
+        })
+        .map(profile_summary)
+        .collect::<Vec<_>>();
+    profiles.sort_by(|left, right| {
+        left.game_name
+            .to_lowercase()
+            .cmp(&right.game_name.to_lowercase())
+            .then_with(|| left.steam_app_id.cmp(&right.steam_app_id))
+    });
+    profiles
+}
+
+pub fn profile_summary(profile: &GameProfile) -> GameProfileSummary {
+    let mut ports = profile.ports.clone();
+    ports.sort_unstable();
+    ports.dedup();
+    GameProfileSummary {
+        game_name: profile.game_name.clone(),
+        steam_app_id: profile.steam_app_id.clone(),
+        discovery: profile.discovery.clone(),
+        compatibility: profile.compatibility.clone(),
+        port_count: ports.len(),
+        ports,
+        join_method: profile.join_method.clone(),
+    }
 }
 
 impl TryFrom<GameProfileCatalogEntry> for GameProfile {
@@ -208,5 +265,40 @@ mod tests {
         assert_eq!(matched.matched_by, "steam_app_id");
         assert_eq!(matched.profile.join_method, "lan_list_or_direct_ip");
         assert_eq!(matched.profile.compatibility, CompatibilityLevel::B);
+    }
+
+    #[test]
+    fn catalog_lists_sorted_summaries_and_filters_query() {
+        let catalog = parse_game_profile_catalog_json(
+            r#"{
+                "profiles": [
+                    {
+                        "game_name": "Zeta Direct",
+                        "steam_app_id": "200",
+                        "discovery": "direct_ip",
+                        "ports": [7777, 7777],
+                        "compatibility": "B"
+                    },
+                    {
+                        "game_name": "Alpha Broadcast",
+                        "steam_app_id": "100",
+                        "discovery": "udp_broadcast",
+                        "ports": [27016, 27015],
+                        "compatibility": "A"
+                    }
+                ]
+            }"#,
+        )
+        .unwrap();
+
+        let all = list_game_profile_summaries(&catalog, None);
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0].game_name, "Alpha Broadcast");
+        assert_eq!(all[0].ports, vec![27015, 27016]);
+
+        let filtered = list_game_profile_summaries(&catalog, Some("200"));
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].game_name, "Zeta Direct");
+        assert_eq!(filtered[0].port_count, 1);
     }
 }

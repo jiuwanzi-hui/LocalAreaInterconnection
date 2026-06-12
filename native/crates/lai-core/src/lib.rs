@@ -81,7 +81,8 @@ pub use game_profile::{
     normalize_ports, recommended_join_instruction, CompatibilityLevel, DiscoveryMode, GameProfile,
 };
 pub use game_profile_catalog::{
-    find_game_profile, parse_game_profile_catalog_json, GameProfileCatalog, GameProfileMatch,
+    find_game_profile, list_game_profile_summaries, parse_game_profile_catalog_json,
+    profile_summary, GameProfileCatalog, GameProfileMatch, GameProfileSummary,
 };
 pub use invite::{create_invite, decode_invite, verify_invite, InvitePayload};
 pub use ip::{broadcast_address, host_address, peer_address, subnet_for_room, Ipv4Subnet};

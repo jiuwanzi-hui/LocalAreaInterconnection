@@ -723,7 +723,8 @@ public class LocalAreaInterconnectionDesktop : Form
         {
             args += " --local-ip " + localIp;
         }
-        RunNativeCli(args);
+        string text = RunNativeCli(args);
+        UpdateFromGameProfilePlan(text);
     }
 
     void RunUdpTest()
@@ -1121,6 +1122,60 @@ public class LocalAreaInterconnectionDesktop : Form
             + ", " + T("coordinationExpired") + "=" + expiredCount;
         memberSummary.Text = T("detailMembers") + " " + members;
         nextActionSummary.Text = T("detailNext") + " " + nextAction;
+    }
+
+    void UpdateFromGameProfilePlan(string json)
+    {
+        if (json.Trim().Length == 0) return;
+        string profile = JsonObjectValue(json, "profile");
+        string plan = JsonObjectValue(json, "plan");
+        string profileName = JsonStringValue(profile, "game_name");
+        string discovery = JsonStringValue(profile, "discovery");
+        string compatibility = JsonStringValue(profile, "compatibility");
+        string profilePorts = JsonPortArrayCsv(JsonArrayValue(profile, "ports"));
+        string joinInstruction = JsonStringValue(plan, "join_instruction");
+        string broadcast = JsonObjectValue(plan, "broadcast");
+        string broadcastExpectation = JsonStringValue(broadcast, "expectation");
+
+        if (profileName.Length > 0)
+        {
+            gameName.Text = profileName;
+        }
+        if (profilePorts.Length > 0)
+        {
+            ports.Text = profilePorts;
+        }
+        if (joinInstruction.Length == 0)
+        {
+            joinInstruction = NextActionText("created");
+        }
+        if (broadcastExpectation.Length == 0)
+        {
+            broadcastExpectation = T("stateUnknown");
+        }
+        if (discovery.Length == 0)
+        {
+            discovery = T("stateUnknown");
+        }
+        if (compatibility.Length == 0)
+        {
+            compatibility = T("stateUnknown");
+        }
+
+        UpdateRoomDetailsFromGameProfilePlan(profileName, discovery, compatibility, profilePorts, broadcastExpectation, joinInstruction);
+    }
+
+    void UpdateRoomDetailsFromGameProfilePlan(string profileName, string discovery, string compatibility, string profilePorts, string broadcastExpectation, string joinInstruction)
+    {
+        if (roomSummary == null) return;
+        if (profileName.Length == 0) profileName = SafeText(gameName.Text);
+        if (profilePorts.Length == 0) profilePorts = SafeText(ports.Text);
+        roomSummary.Text = T("detailRoom") + " " + SafeText(roomName.Text) + " | " + T("detailSubnet") + " " + SafeText(subnet.Text);
+        connectionSummary.Text = T("detailConnection") + " " + T("detailGameProfile") + "=" + profileName
+            + ", " + T("detailCompatibility") + "=" + compatibility;
+        broadcastSummary.Text = T("detailBroadcast") + " " + discovery + " | " + T("detailGamePorts") + " " + profilePorts;
+        memberSummary.Text = T("detailMembers") + " " + SafeText(hostName.Text) + " @ " + SafeText(ip.Text);
+        nextActionSummary.Text = T("detailNext") + " " + joinInstruction + " " + broadcastExpectation;
     }
 
     void RefreshRuntimeLogTail()
@@ -1767,6 +1822,32 @@ public class LocalAreaInterconnectionDesktop : Form
         return end > start ? json.Substring(start, end - start) : "";
     }
 
+    string JsonPortArrayCsv(string array)
+    {
+        if (array.Length == 0) return "";
+        List<string> values = new List<string>();
+        int index = 0;
+        while (index < array.Length)
+        {
+            while (index < array.Length && !Char.IsDigit(array[index])) index++;
+            int start = index;
+            while (index < array.Length && Char.IsDigit(array[index])) index++;
+            if (index > start)
+            {
+                int port;
+                if (Int32.TryParse(array.Substring(start, index - start), out port) && port > 0 && port <= 65535)
+                {
+                    string text = port.ToString();
+                    if (!values.Contains(text))
+                    {
+                        values.Add(text);
+                    }
+                }
+            }
+        }
+        return String.Join(",", values.ToArray());
+    }
+
     string FirewallDiagnoseArgs()
     {
         string args = "firewall-diagnose --game-name " + Quote(gameName.Text) + " --subnet " + subnet.Text + " --ports " + ports.Text;
@@ -1964,6 +2045,9 @@ public class LocalAreaInterconnectionDesktop : Form
             if (key == "detailAdapter") return "网卡";
             if (key == "detailTunnel") return "隧道";
             if (key == "detailGameTraffic") return "游戏流量:";
+            if (key == "detailGameProfile") return "游戏模板";
+            if (key == "detailCompatibility") return "兼容等级";
+            if (key == "detailGamePorts") return "端口:";
             if (key == "detailHost") return "房主";
             if (key == "stateUnknown") return "未知";
             if (key == "connectionHostReady") return "房主模式，等待朋友加入";
@@ -2088,6 +2172,9 @@ public class LocalAreaInterconnectionDesktop : Form
             if (key == "detailAdapter") return "Adapter";
             if (key == "detailTunnel") return "Tunnel";
             if (key == "detailGameTraffic") return "Game traffic:";
+            if (key == "detailGameProfile") return "Game profile";
+            if (key == "detailCompatibility") return "Compatibility";
+            if (key == "detailGamePorts") return "Ports:";
             if (key == "detailHost") return "Host";
             if (key == "stateUnknown") return "unknown";
             if (key == "connectionHostReady") return "Host mode, waiting for friends";

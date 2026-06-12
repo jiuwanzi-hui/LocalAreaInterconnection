@@ -6,16 +6,17 @@ use lai_core::{
     create_p2p_handshake_hello, create_room, create_room_runtime_plan, create_room_session,
     create_windows_firewall_plan, create_windows_virtual_adapter_ensure_report,
     create_windows_virtual_adapter_plan, decode_invite, evaluate_firewall_diagnostics,
-    evaluate_network_observations, find_game_profile, network_snapshot_from_runtime,
-    observation_from_expected_rule, open_tunnel_payload, parse_game_profile_catalog_json,
-    parse_netsh_adapter_observation, parse_netsh_firewall_rules, parse_windows_ping_observation,
-    seal_tunnel_payload, udp_forward_summary, AdapterObservation, CommandExecutionRecord,
-    CommandExecutionStatus, CompatibilityLevel, DiagnosticExportEnvironment,
-    DiagnosticExportInputs, DiagnosticExportSources, DiagnosticSnapshot, DiagnosticTextSource,
-    DiscoveryMode, FirewallRule, FirewallRuleObservation, GameProfile, Ipv4Subnet, NetworkCommand,
-    NetworkObservationSnapshot, P2pHandshakeAck, P2pHandshakeHello, PacketCaptureSummary,
-    PacketObservation, RoomRuntimePeer, RoomRuntimePlan, TunnelEnvelope, TunnelObservation,
-    TunnelServiceSnapshot, UdpForwardObservation, VirtualUdpPacket,
+    evaluate_network_observations, find_game_profile, list_game_profile_summaries,
+    network_snapshot_from_runtime, observation_from_expected_rule, open_tunnel_payload,
+    parse_game_profile_catalog_json, parse_netsh_adapter_observation, parse_netsh_firewall_rules,
+    parse_windows_ping_observation, seal_tunnel_payload, udp_forward_summary, AdapterObservation,
+    CommandExecutionRecord, CommandExecutionStatus, CompatibilityLevel,
+    DiagnosticExportEnvironment, DiagnosticExportInputs, DiagnosticExportSources,
+    DiagnosticSnapshot, DiagnosticTextSource, DiscoveryMode, FirewallRule, FirewallRuleObservation,
+    GameProfile, Ipv4Subnet, NetworkCommand, NetworkObservationSnapshot, P2pHandshakeAck,
+    P2pHandshakeHello, PacketCaptureSummary, PacketObservation, RoomRuntimePeer, RoomRuntimePlan,
+    TunnelEnvelope, TunnelObservation, TunnelServiceSnapshot, UdpForwardObservation,
+    VirtualUdpPacket,
 };
 use rand::RngCore;
 use std::fs;
@@ -198,6 +199,12 @@ enum Command {
         local_ip: Option<String>,
         #[arg(long, default_value_t = 30)]
         max_broadcast_packets_per_second: u16,
+    },
+    GameProfileList {
+        #[arg(long)]
+        catalog: String,
+        #[arg(long)]
+        query: Option<String>,
     },
     FirewallPlan {
         #[arg(long, default_value = "Generic LAN Game")]
@@ -1148,6 +1155,20 @@ fn run_main() -> Result<(), Box<dyn std::error::Error>> {
                     "matched_by": matched.matched_by,
                     "profile": matched.profile,
                     "plan": plan,
+                }))?
+            );
+        }
+        Command::GameProfileList { catalog, query } => {
+            let catalog_text = fs::read_to_string(catalog)?;
+            let catalog = parse_game_profile_catalog_json(&catalog_text)?;
+            let profiles = list_game_profile_summaries(&catalog, query.as_deref());
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "status": "ok",
+                    "total_count": catalog.profiles.len(),
+                    "matched_count": profiles.len(),
+                    "profiles": profiles,
                 }))?
             );
         }
