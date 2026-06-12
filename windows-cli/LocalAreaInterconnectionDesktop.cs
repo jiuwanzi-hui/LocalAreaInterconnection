@@ -16,6 +16,7 @@ public class LocalAreaInterconnectionDesktop : Form
     TextBox subnet;
     TextBox ip;
     TextBox gameName;
+    TextBox gameCatalog;
     TextBox ports;
     TextBox observed;
     TextBox netshOutput;
@@ -55,8 +56,8 @@ public class LocalAreaInterconnectionDesktop : Form
     string lastRuntimeSnapshotText = "";
     int lastRuntimeLogLength = 0;
     DateTime lastCoordinationRefreshUtc = DateTime.MinValue;
-    const int ActionRow = 14;
-    const int OutputRow = 15;
+    const int ActionRow = 15;
+    const int OutputRow = 16;
 
     protected override CreateParams CreateParams
     {
@@ -159,12 +160,12 @@ public class LocalAreaInterconnectionDesktop : Form
         rootLayout.Dock = DockStyle.Fill;
         rootLayout.BackColor = Color.Transparent;
         rootLayout.ColumnCount = 3;
-        rootLayout.RowCount = 16;
+        rootLayout.RowCount = 17;
         rootLayout.Padding = new Padding(12);
         rootLayout.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 180));
         rootLayout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 54));
         rootLayout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 46));
-        for (int i = 0; i < 14; i++)
+        for (int i = 0; i < 15; i++)
         {
             rootLayout.RowStyles.Add(new RowStyle(SizeType.Absolute, 36));
         }
@@ -177,15 +178,16 @@ public class LocalAreaInterconnectionDesktop : Form
         subnet = AddField(rootLayout, 2, "virtualSubnet", "10.77.12.0/24");
         ip = AddField(rootLayout, 3, "myVirtualIp", "10.77.12.2");
         gameName = AddField(rootLayout, 4, "gameName", "Example Game");
-        ports = AddField(rootLayout, 5, "gamePorts", "27015");
-        observed = AddField(rootLayout, 6, "observedRules", "udp:27015");
-        netshOutput = AddField(rootLayout, 7, "netshOutputFile", "");
-        pingTarget = AddField(rootLayout, 8, "pingTarget", "127.0.0.1");
-        packetObservations = AddField(rootLayout, 9, "packetObservations", "");
-        coordinationServer = AddField(rootLayout, 10, "coordinationServer", "");
-        stunServer = AddField(rootLayout, 11, "stunServer", "");
-        remotePeer = AddField(rootLayout, 12, "remotePeer", "");
-        invite = AddField(rootLayout, 13, "invite", "");
+        gameCatalog = AddField(rootLayout, 5, "gameCatalog", "");
+        ports = AddField(rootLayout, 6, "gamePorts", "27015");
+        observed = AddField(rootLayout, 7, "observedRules", "udp:27015");
+        netshOutput = AddField(rootLayout, 8, "netshOutputFile", "");
+        pingTarget = AddField(rootLayout, 9, "pingTarget", "127.0.0.1");
+        packetObservations = AddField(rootLayout, 10, "packetObservations", "");
+        coordinationServer = AddField(rootLayout, 11, "coordinationServer", "");
+        stunServer = AddField(rootLayout, 12, "stunServer", "");
+        remotePeer = AddField(rootLayout, 13, "remotePeer", "");
+        invite = AddField(rootLayout, 14, "invite", "");
 
         actionsPanel = new FlowLayoutPanel();
         actionsPanel.Dock = DockStyle.Fill;
@@ -206,6 +208,7 @@ public class LocalAreaInterconnectionDesktop : Form
         AddButton(actionsPanel, "adapterScan", delegate { RunCli("adapter-scan --adapter-name LocalAreaInterconnection --subnet " + subnet.Text + " --ip " + ip.Text); });
         AddButton(actionsPanel, "nativeAdapterEnsure", delegate { RunNativeAdapterEnsure(); });
         AddButton(actionsPanel, "gamePlan", delegate { RunCli("game-plan --game-name " + Quote(gameName.Text) + " --subnet " + subnet.Text + " --ports " + ports.Text); });
+        AddButton(actionsPanel, "gameProfilePlan", delegate { RunGameProfilePlan(); });
         AddButton(actionsPanel, "firewallPlan", delegate { RunCli("firewall-plan --game-name " + Quote(gameName.Text) + " --subnet " + subnet.Text + " --ports " + ports.Text); });
         AddButton(actionsPanel, "firewallDiagnose", delegate { RunCli(FirewallDiagnoseArgs()); });
         AddButton(actionsPanel, "firewallScan", delegate { RunCli("firewall-scan --game-name " + Quote(gameName.Text) + " --subnet " + subnet.Text + " --ports " + ports.Text); });
@@ -223,6 +226,7 @@ public class LocalAreaInterconnectionDesktop : Form
         AddButton(actionsPanel, "closeRoom", delegate { CloseCoordinationRoom(); });
         AddButton(actionsPanel, "nativeNatSelfTest", delegate { RunNativeNatSelfTest(); });
         AddButton(actionsPanel, "tcpTest", delegate { RunTcpTest(); });
+        AddButton(actionsPanel, "browseGameCatalog", delegate { BrowseGameCatalog(); });
         AddButton(actionsPanel, "browseNetsh", delegate { BrowseNetshOutput(); });
         AddButton(actionsPanel, "browsePackets", delegate { BrowsePacketObservations(); });
         AddButton(actionsPanel, "copyOutput", delegate { if (output.Text.Length > 0) Clipboard.SetText(output.Text); });
@@ -694,6 +698,32 @@ public class LocalAreaInterconnectionDesktop : Form
                 + NetshExportArgs());
             UpdateRoomDetails("exported");
         }
+    }
+
+    void RunGameProfilePlan()
+    {
+        string catalog = gameCatalog.Text.Trim();
+        if (catalog.Length == 0)
+        {
+            output.Text = T("missingGameCatalog");
+            return;
+        }
+
+        string args = "game-profile-plan"
+            + " --catalog " + Quote(catalog)
+            + " --game-name " + Quote(gameName.Text)
+            + " --subnet " + subnet.Text;
+        string hostIp = pingTarget.Text.Trim();
+        string localIp = ip.Text.Trim();
+        if (LooksLikeIpv4(hostIp))
+        {
+            args += " --host-ip " + hostIp;
+        }
+        if (LooksLikeIpv4(localIp))
+        {
+            args += " --local-ip " + localIp;
+        }
+        RunNativeCli(args);
     }
 
     void RunUdpTest()
@@ -1774,6 +1804,32 @@ public class LocalAreaInterconnectionDesktop : Form
         }
     }
 
+    void BrowseGameCatalog()
+    {
+        using (OpenFileDialog dialog = new OpenFileDialog())
+        {
+            dialog.Title = T("selectGameCatalog");
+            dialog.Filter = T("jsonFilesFilter");
+            if (dialog.ShowDialog(this) == DialogResult.OK)
+            {
+                gameCatalog.Text = dialog.FileName;
+            }
+        }
+    }
+
+    bool LooksLikeIpv4(string value)
+    {
+        string[] parts = value.Split('.');
+        if (parts.Length != 4) return false;
+        for (int i = 0; i < parts.Length; i++)
+        {
+            int number;
+            if (!Int32.TryParse(parts[i], out number)) return false;
+            if (number < 0 || number > 255) return false;
+        }
+        return true;
+    }
+
     void ApplyLanguage()
     {
         Text = T("appTitle");
@@ -1858,6 +1914,7 @@ public class LocalAreaInterconnectionDesktop : Form
             if (key == "virtualSubnet") return "虚拟网段";
             if (key == "myVirtualIp") return "我的虚拟 IP";
             if (key == "gameName") return "游戏名称";
+            if (key == "gameCatalog") return "游戏模板库";
             if (key == "gamePorts") return "游戏端口";
             if (key == "observedRules") return "已观测规则";
             if (key == "netshOutputFile") return "Netsh 输出文件";
@@ -1875,6 +1932,7 @@ public class LocalAreaInterconnectionDesktop : Form
             if (key == "adapterScan") return "扫描网卡";
             if (key == "nativeAdapterEnsure") return "原生网卡检查";
             if (key == "gamePlan") return "游戏计划";
+            if (key == "gameProfilePlan") return "模板游戏计划";
             if (key == "firewallPlan") return "防火墙计划";
             if (key == "firewallDiagnose") return "防火墙诊断";
             if (key == "firewallScan") return "扫描防火墙";
@@ -1891,6 +1949,7 @@ public class LocalAreaInterconnectionDesktop : Form
             if (key == "closeRoom") return "关闭房间";
             if (key == "nativeNatSelfTest") return "NAT 自检";
             if (key == "tcpTest") return "TCP 测试";
+            if (key == "browseGameCatalog") return "选择模板库";
             if (key == "browseNetsh") return "选择 Netsh";
             if (key == "browsePackets") return "选择包文件";
             if (key == "copyOutput") return "复制输出";
@@ -1928,6 +1987,7 @@ public class LocalAreaInterconnectionDesktop : Form
             if (key == "maximizeTip") return "最大化 / 还原";
             if (key == "closeTip") return "关闭";
             if (key == "selectNetshOutput") return "选择 netsh 输出文件";
+            if (key == "selectGameCatalog") return "选择游戏模板库 JSON";
             if (key == "selectPacketObservations") return "选择或创建包观测文件";
             if (key == "saveDiagnosticBundle") return "保存诊断包";
             if (key == "runtimeAlreadyRunning") return "runtime 已在运行。";
@@ -1968,6 +2028,7 @@ public class LocalAreaInterconnectionDesktop : Form
             if (key == "jsonFilesFilter") return "JSON 文件 (*.json)|*.json|所有文件 (*.*)|*.*";
             if (key == "missingCli") return "缺少 CLI 程序: ";
             if (key == "missingNativeCli") return "缺少 Rust 原生 CLI 程序，请先重新生成 exe: ";
+            if (key == "missingGameCatalog") return "请先选择游戏模板库 JSON 文件。";
         }
         else
         {
@@ -1977,6 +2038,7 @@ public class LocalAreaInterconnectionDesktop : Form
             if (key == "virtualSubnet") return "Virtual subnet";
             if (key == "myVirtualIp") return "My virtual IP";
             if (key == "gameName") return "Game name";
+            if (key == "gameCatalog") return "Game catalog";
             if (key == "gamePorts") return "Game ports";
             if (key == "observedRules") return "Observed rules";
             if (key == "netshOutputFile") return "Netsh output file";
@@ -1994,6 +2056,7 @@ public class LocalAreaInterconnectionDesktop : Form
             if (key == "adapterScan") return "Adapter scan";
             if (key == "nativeAdapterEnsure") return "Native adapter check";
             if (key == "gamePlan") return "Game plan";
+            if (key == "gameProfilePlan") return "Profile game plan";
             if (key == "firewallPlan") return "Firewall plan";
             if (key == "firewallDiagnose") return "Firewall diagnose";
             if (key == "firewallScan") return "Firewall scan";
@@ -2010,6 +2073,7 @@ public class LocalAreaInterconnectionDesktop : Form
             if (key == "closeRoom") return "Close room";
             if (key == "nativeNatSelfTest") return "NAT self-test";
             if (key == "tcpTest") return "TCP test";
+            if (key == "browseGameCatalog") return "Browse catalog";
             if (key == "browseNetsh") return "Browse netsh";
             if (key == "browsePackets") return "Browse packets";
             if (key == "copyOutput") return "Copy output";
@@ -2047,6 +2111,7 @@ public class LocalAreaInterconnectionDesktop : Form
             if (key == "maximizeTip") return "Maximize / restore";
             if (key == "closeTip") return "Close";
             if (key == "selectNetshOutput") return "Select netsh output";
+            if (key == "selectGameCatalog") return "Select game catalog JSON";
             if (key == "selectPacketObservations") return "Select or create packet observation file";
             if (key == "saveDiagnosticBundle") return "Save diagnostic bundle";
             if (key == "runtimeAlreadyRunning") return "runtime is already running.";
@@ -2087,6 +2152,7 @@ public class LocalAreaInterconnectionDesktop : Form
             if (key == "jsonFilesFilter") return "JSON files (*.json)|*.json|All files (*.*)|*.*";
             if (key == "missingCli") return "Missing CLI executable: ";
             if (key == "missingNativeCli") return "Missing Rust native CLI executable. Build the latest exe first: ";
+            if (key == "missingGameCatalog") return "Select a game catalog JSON file first.";
         }
         return key;
     }
