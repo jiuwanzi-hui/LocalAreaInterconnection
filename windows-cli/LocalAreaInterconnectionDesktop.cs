@@ -813,6 +813,7 @@ public class LocalAreaInterconnectionDesktop : Form
             output.Text += Environment.NewLine + Environment.NewLine + publishOutput;
         }
         UpdateRoomDetails("joined");
+        RefreshCoordinationRoomView(false);
     }
 
     void StopNativeRuntime()
@@ -859,6 +860,7 @@ public class LocalAreaInterconnectionDesktop : Form
         {
             output.Text = result + Environment.NewLine + Environment.NewLine + publishOutput;
         }
+        RefreshCoordinationRoomView(false);
     }
 
     void StartLocalCoordinationServer()
@@ -891,6 +893,7 @@ public class LocalAreaInterconnectionDesktop : Form
             + Environment.NewLine + CoordinationStatusText()
             + Environment.NewLine + T("coordinationServerUrl") + coordinationServer.Text.Trim()
             + Environment.NewLine + T("coordinationStorePath") + coordinationStoreFile;
+        RefreshCoordinationRoomView(false);
     }
 
     void StopLocalCoordinationServer()
@@ -904,6 +907,27 @@ public class LocalAreaInterconnectionDesktop : Form
         output.Text = T("coordinationStopped")
             + Environment.NewLine + CoordinationStatusText()
             + Environment.NewLine + coordinationOutput.ToString();
+    }
+
+    void RefreshCoordinationRoomView(bool showOutput)
+    {
+        if (coordinationStoreFile.Length == 0 || !File.Exists(coordinationStoreFile))
+        {
+            return;
+        }
+        string currentSubnet = subnet.Text.Trim();
+        if (currentSubnet.Length == 0)
+        {
+            return;
+        }
+        string peer = SafePeerId(hostName.Text);
+        string arguments = "coordination-room-view"
+            + " --store " + Quote(coordinationStoreFile)
+            + " --room-id desktop_runtime"
+            + " --peer-id " + Quote(peer)
+            + " --subnet " + Quote(currentSubnet);
+        string text = showOutput ? RunNativeCli(arguments) : RunNativeCliCapture(arguments);
+        UpdateRoomDetailsFromCoordinationView(text);
     }
 
     void RunTcpTest()
@@ -1008,6 +1032,30 @@ public class LocalAreaInterconnectionDesktop : Form
             + ", " + T("runtimeHeartbeats") + "=" + heartbeatPackets
             + ", " + T("runtimeSnapshots") + "=" + snapshotWrites;
         nextActionSummary.Text = T("detailNext") + " " + DiagnosticNextAction(adapter, tunnel, p2p, broadcast, gameTraffic);
+    }
+
+    void UpdateRoomDetailsFromCoordinationView(string json)
+    {
+        if (roomSummary == null || json.Trim().Length == 0) return;
+        string status = JsonStringValue(json, "status");
+        string memberCount = JsonNumberValue(json, "member_count");
+        string onlineCount = JsonNumberValue(json, "online_count");
+        string expiredCount = JsonNumberValue(json, "expired_count");
+        string nextAction = JsonStringValue(json, "next_action");
+        string members = CoordinationMembersText(json);
+        if (status.Length == 0) status = T("stateUnknown");
+        if (memberCount.Length == 0) memberCount = "0";
+        if (onlineCount.Length == 0) onlineCount = "0";
+        if (expiredCount.Length == 0) expiredCount = "0";
+        if (nextAction.Length == 0) nextAction = NextActionText("joined");
+        if (members.Length == 0) members = MemberText("joined");
+
+        roomSummary.Text = T("detailRoom") + " desktop_runtime | " + T("detailSubnet") + " " + SafeText(subnet.Text);
+        connectionSummary.Text = T("detailConnection") + " " + T("coordinationRoomStatus") + "=" + status
+            + ", " + T("coordinationOnline") + "=" + onlineCount + "/" + memberCount
+            + ", " + T("coordinationExpired") + "=" + expiredCount;
+        memberSummary.Text = T("detailMembers") + " " + members;
+        nextActionSummary.Text = T("detailNext") + " " + nextAction;
     }
 
     void RefreshRuntimeLogTail()
@@ -1149,6 +1197,7 @@ public class LocalAreaInterconnectionDesktop : Form
             CreateNativeOffer(peer, false);
         }
         PublishNativeOfferFileIfConfigured(false);
+        RefreshCoordinationRoomView(false);
     }
 
     string PublishNativeOfferIfConfigured(string peer, bool showOutput)
@@ -1501,6 +1550,115 @@ public class LocalAreaInterconnectionDesktop : Form
         return "";
     }
 
+    string CoordinationMembersText(string json)
+    {
+        string array = JsonArrayValue(json, "members");
+        if (array.Length == 0) return "";
+        List<string> members = new List<string>();
+        int search = 0;
+        while (search < array.Length && members.Count < 4)
+        {
+            int start = array.IndexOf('{', search);
+            if (start < 0) break;
+            int end = MatchingJsonBrace(array, start);
+            if (end < 0) break;
+            string member = array.Substring(start, end - start + 1);
+            string peer = JsonStringValue(member, "peer_id");
+            string virtualIp = JsonStringValue(member, "virtual_ip");
+            string status = JsonStringValue(member, "status");
+            if (peer.Length > 0)
+            {
+                string text = peer;
+                if (virtualIp.Length > 0) text += " @ " + virtualIp;
+                if (status.Length > 0) text += " (" + status + ")";
+                members.Add(text);
+            }
+            search = end + 1;
+        }
+        int memberCount;
+        if (Int32.TryParse(JsonNumberValue(json, "member_count"), out memberCount) && memberCount > members.Count)
+        {
+            members.Add("+" + (memberCount - members.Count).ToString());
+        }
+        return String.Join(", ", members.ToArray());
+    }
+
+    string JsonArrayValue(string json, string key)
+    {
+        string marker = "\"" + key + "\":";
+        int markerStart = json.IndexOf(marker, StringComparison.Ordinal);
+        if (markerStart < 0) return "";
+        int start = json.IndexOf('[', markerStart + marker.Length);
+        if (start < 0) return "";
+        int depth = 0;
+        bool inString = false;
+        bool escaped = false;
+        for (int i = start; i < json.Length; i++)
+        {
+            char ch = json[i];
+            if (escaped)
+            {
+                escaped = false;
+                continue;
+            }
+            if (ch == '\\' && inString)
+            {
+                escaped = true;
+                continue;
+            }
+            if (ch == '"')
+            {
+                inString = !inString;
+                continue;
+            }
+            if (inString) continue;
+            if (ch == '[') depth++;
+            else if (ch == ']')
+            {
+                depth--;
+                if (depth == 0)
+                {
+                    return json.Substring(start, i - start + 1);
+                }
+            }
+        }
+        return "";
+    }
+
+    int MatchingJsonBrace(string json, int start)
+    {
+        int depth = 0;
+        bool inString = false;
+        bool escaped = false;
+        for (int i = start; i < json.Length; i++)
+        {
+            char ch = json[i];
+            if (escaped)
+            {
+                escaped = false;
+                continue;
+            }
+            if (ch == '\\' && inString)
+            {
+                escaped = true;
+                continue;
+            }
+            if (ch == '"')
+            {
+                inString = !inString;
+                continue;
+            }
+            if (inString) continue;
+            if (ch == '{') depth++;
+            else if (ch == '}')
+            {
+                depth--;
+                if (depth == 0) return i;
+            }
+        }
+        return -1;
+    }
+
     string JsonNumberValue(string json, string key)
     {
         string marker = "\"" + key + "\":";
@@ -1732,6 +1890,9 @@ public class LocalAreaInterconnectionDesktop : Form
             if (key == "coordinationExited") return "协调服务进程已退出:";
             if (key == "coordinationServerUrl") return "协调服务: ";
             if (key == "coordinationStorePath") return "协调存储: ";
+            if (key == "coordinationRoomStatus") return "房间";
+            if (key == "coordinationOnline") return "在线";
+            if (key == "coordinationExpired") return "过期";
             if (key == "textFilesFilter") return "文本文件 (*.txt)|*.txt|所有文件 (*.*)|*.*";
             if (key == "jsonFilesFilter") return "JSON 文件 (*.json)|*.json|所有文件 (*.*)|*.*";
             if (key == "missingCli") return "缺少 CLI 程序: ";
@@ -1843,6 +2004,9 @@ public class LocalAreaInterconnectionDesktop : Form
             if (key == "coordinationExited") return "coordination server process exited:";
             if (key == "coordinationServerUrl") return "Coordination server: ";
             if (key == "coordinationStorePath") return "Coordination store: ";
+            if (key == "coordinationRoomStatus") return "room";
+            if (key == "coordinationOnline") return "online";
+            if (key == "coordinationExpired") return "expired";
             if (key == "textFilesFilter") return "Text files (*.txt)|*.txt|All files (*.*)|*.*";
             if (key == "jsonFilesFilter") return "JSON files (*.json)|*.json|All files (*.*)|*.*";
             if (key == "missingCli") return "Missing CLI executable: ";
