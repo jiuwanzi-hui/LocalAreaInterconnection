@@ -224,6 +224,7 @@ public class LocalAreaInterconnectionDesktop : Form
         AddButton(actionsPanel, "startRuntime", delegate { StartNativeRuntime(); });
         AddButton(actionsPanel, "stopRuntime", delegate { StopNativeRuntime(); });
         AddButton(actionsPanel, "closeRoom", delegate { CloseCoordinationRoom(); });
+        AddButton(actionsPanel, "kickPeer", delegate { KickCoordinationPeer(); });
         AddButton(actionsPanel, "nativeNatSelfTest", delegate { RunNativeNatSelfTest(); });
         AddButton(actionsPanel, "tcpTest", delegate { RunTcpTest(); });
         AddButton(actionsPanel, "browseGameCatalog", delegate { BrowseGameCatalog(); });
@@ -904,6 +905,16 @@ public class LocalAreaInterconnectionDesktop : Form
         RefreshCoordinationRoomView(false);
     }
 
+    void KickCoordinationPeer()
+    {
+        string result = KickCoordinationPeerIfConfigured();
+        if (result.Length > 0)
+        {
+            output.Text = result;
+        }
+        RefreshCoordinationRoomView(false);
+    }
+
     void RunNativeNatSelfTest()
     {
         RunNativeCli("nat-hole-punch-loopback-test"
@@ -1370,6 +1381,42 @@ public class LocalAreaInterconnectionDesktop : Form
             + " --server " + Quote(server)
             + " --room-id desktop_runtime");
         return T("coordinationRoomClosed") + Environment.NewLine + result;
+    }
+
+    string KickCoordinationPeerIfConfigured()
+    {
+        string server = coordinationServer.Text.Trim();
+        if (server.Length == 0)
+        {
+            return T("coordinationServerRequired");
+        }
+        string peer = RemotePeerIdForKick();
+        if (peer.Length == 0)
+        {
+            return T("coordinationPeerRequired");
+        }
+        string kickedBy = SafePeerId(hostName.Text);
+        string result = RunNativeCliCapture("coordination-http-kick"
+            + " --server " + Quote(server)
+            + " --room-id desktop_runtime"
+            + " --peer-id " + Quote(peer)
+            + " --kicked-by " + Quote(kickedBy));
+        return T("coordinationPeerKicked") + Environment.NewLine + result;
+    }
+
+    string RemotePeerIdForKick()
+    {
+        string value = remotePeer.Text.Trim();
+        if (value.Length == 0)
+        {
+            return "";
+        }
+        int comma = value.IndexOf(',');
+        if (comma >= 0)
+        {
+            value = value.Substring(0, comma).Trim();
+        }
+        return SafePeerId(value);
     }
 
     string CreateNativeOffer(string peer, bool showOutput)
@@ -2028,6 +2075,7 @@ public class LocalAreaInterconnectionDesktop : Form
             if (key == "startCoordination") return "启动协调";
             if (key == "stopCoordination") return "停止协调";
             if (key == "closeRoom") return "关闭房间";
+            if (key == "kickPeer") return "踢出 Peer";
             if (key == "nativeNatSelfTest") return "NAT 自检";
             if (key == "tcpTest") return "TCP 测试";
             if (key == "browseGameCatalog") return "选择模板库";
@@ -2108,6 +2156,8 @@ public class LocalAreaInterconnectionDesktop : Form
             if (key == "coordinationLeft") return "已从协调房间离开:";
             if (key == "coordinationRoomClosed") return "协调房间已关闭:";
             if (key == "coordinationServerRequired") return "需要先填写或启动协调服务。";
+            if (key == "coordinationPeerRequired") return "需要先填写远端 Peer。";
+            if (key == "coordinationPeerKicked") return "已请求踢出远端 Peer:";
             if (key == "textFilesFilter") return "文本文件 (*.txt)|*.txt|所有文件 (*.*)|*.*";
             if (key == "jsonFilesFilter") return "JSON 文件 (*.json)|*.json|所有文件 (*.*)|*.*";
             if (key == "missingCli") return "缺少 CLI 程序: ";
@@ -2155,6 +2205,7 @@ public class LocalAreaInterconnectionDesktop : Form
             if (key == "startCoordination") return "Start coordination";
             if (key == "stopCoordination") return "Stop coordination";
             if (key == "closeRoom") return "Close room";
+            if (key == "kickPeer") return "Kick peer";
             if (key == "nativeNatSelfTest") return "NAT self-test";
             if (key == "tcpTest") return "TCP test";
             if (key == "browseGameCatalog") return "Browse catalog";
@@ -2235,6 +2286,8 @@ public class LocalAreaInterconnectionDesktop : Form
             if (key == "coordinationLeft") return "Left coordination room:";
             if (key == "coordinationRoomClosed") return "Coordination room closed:";
             if (key == "coordinationServerRequired") return "Fill or start the coordination server first.";
+            if (key == "coordinationPeerRequired") return "Fill the remote peer first.";
+            if (key == "coordinationPeerKicked") return "Requested remote peer kick:";
             if (key == "textFilesFilter") return "Text files (*.txt)|*.txt|All files (*.*)|*.*";
             if (key == "jsonFilesFilter") return "JSON files (*.json)|*.json|All files (*.*)|*.*";
             if (key == "missingCli") return "Missing CLI executable: ";

@@ -49,10 +49,10 @@ pub use coordination_room_view::{
 };
 pub use coordination_store::{
     close_coordination_room, create_coordination_store, fetch_coordination_offers,
-    heartbeat_coordination_peer, leave_coordination_room, prune_expired_coordination_peers,
-    publish_coordination_offer, CoordinationCloseReport, CoordinationFetchResult,
-    CoordinationLeaveReport, CoordinationPeer, CoordinationPruneReport, CoordinationRoom,
-    CoordinationStore, CoordinationStoreUpdate,
+    heartbeat_coordination_peer, kick_coordination_peer, leave_coordination_room,
+    prune_expired_coordination_peers, publish_coordination_offer, CoordinationCloseReport,
+    CoordinationFetchResult, CoordinationKickReport, CoordinationLeaveReport, CoordinationPeer,
+    CoordinationPruneReport, CoordinationRoom, CoordinationStore, CoordinationStoreUpdate,
 };
 pub use diagnostic_export::{
     create_diagnostic_export_bundle, DiagnosticAdapterScanSection, DiagnosticExportBundle,

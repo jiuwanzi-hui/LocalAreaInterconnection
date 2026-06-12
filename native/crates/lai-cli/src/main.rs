@@ -586,6 +586,16 @@ enum Command {
         #[arg(long)]
         peer_id: String,
     },
+    CoordinationKick {
+        #[arg(long)]
+        store: String,
+        #[arg(long)]
+        room_id: String,
+        #[arg(long)]
+        peer_id: String,
+        #[arg(long)]
+        kicked_by: String,
+    },
     CoordinationClose {
         #[arg(long)]
         store: String,
@@ -649,6 +659,16 @@ enum Command {
         room_id: String,
         #[arg(long)]
         peer_id: String,
+    },
+    CoordinationHttpKick {
+        #[arg(long)]
+        server: String,
+        #[arg(long)]
+        room_id: String,
+        #[arg(long)]
+        peer_id: String,
+        #[arg(long)]
+        kicked_by: String,
     },
     CoordinationHttpClose {
         #[arg(long)]
@@ -1825,6 +1845,23 @@ fn run_main() -> Result<(), Box<dyn std::error::Error>> {
             write_json_file(&store, &coordination_store)?;
             println!("{}", serde_json::to_string_pretty(&report)?);
         }
+        Command::CoordinationKick {
+            store,
+            room_id,
+            peer_id,
+            kicked_by,
+        } => {
+            let mut coordination_store = load_coordination_store_or_default(&store)?;
+            let report = lai_core::kick_coordination_peer(
+                &mut coordination_store,
+                room_id,
+                peer_id,
+                kicked_by,
+                current_epoch_ms(),
+            );
+            write_json_file(&store, &coordination_store)?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
+        }
         Command::CoordinationClose { store, room_id } => {
             let mut coordination_store = load_coordination_store_or_default(&store)?;
             let report = lai_core::close_coordination_room(&mut coordination_store, room_id);
@@ -1898,6 +1935,15 @@ fn run_main() -> Result<(), Box<dyn std::error::Error>> {
             peer_id,
         } => {
             let result = coordination_http_leave(&server, &room_id, &peer_id)?;
+            println!("{}", serde_json::to_string_pretty(&result)?);
+        }
+        Command::CoordinationHttpKick {
+            server,
+            room_id,
+            peer_id,
+            kicked_by,
+        } => {
+            let result = coordination_http_kick(&server, &room_id, &peer_id, &kicked_by)?;
             println!("{}", serde_json::to_string_pretty(&result)?);
         }
         Command::CoordinationHttpClose { server, room_id } => {
@@ -2817,6 +2863,27 @@ fn handle_coordination_http_request(
             write_json_file(store_path, store)?;
             Ok((200, serde_json::to_value(report)?))
         }
+        ("POST", ["v1", "rooms", room_id, "peers", peer_id, "kick"]) => {
+            let body = if request.body.is_empty() {
+                serde_json::json!({})
+            } else {
+                serde_json::from_slice::<serde_json::Value>(&request.body)?
+            };
+            let kicked_by = body
+                .get("kickedBy")
+                .or_else(|| body.get("kicked_by"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown");
+            let report = lai_core::kick_coordination_peer(
+                store,
+                room_id.to_owned(),
+                peer_id.to_owned(),
+                kicked_by.to_owned(),
+                current_epoch_ms(),
+            );
+            write_json_file(store_path, store)?;
+            Ok((200, serde_json::to_value(report)?))
+        }
         ("POST", ["v1", "rooms", room_id, "close"]) => {
             let report = lai_core::close_coordination_room(store, room_id.to_owned());
             write_json_file(store_path, store)?;
@@ -2983,6 +3050,23 @@ fn coordination_http_leave(
             percent_encode(peer_id)
         ),
         &serde_json::json!({}),
+    )
+}
+
+fn coordination_http_kick(
+    server: &str,
+    room_id: &str,
+    peer_id: &str,
+    kicked_by: &str,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    http_post_json(
+        &format!(
+            "{}/v1/rooms/{}/peers/{}/kick",
+            trim_trailing_slash(server),
+            percent_encode(room_id),
+            percent_encode(peer_id)
+        ),
+        &serde_json::json!({ "kickedBy": kicked_by }),
     )
 }
 
