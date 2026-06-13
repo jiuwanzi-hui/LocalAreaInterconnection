@@ -21,7 +21,7 @@ use lai_core::{
 };
 use rand::RngCore;
 use serde::Serialize;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{ErrorKind, Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
@@ -547,6 +547,32 @@ enum Command {
         timeout_ms: u64,
         #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
         wait_reply: bool,
+    },
+    RelayUdpServer {
+        #[arg(long, default_value = "0.0.0.0:39091")]
+        bind: String,
+        #[arg(long)]
+        key: String,
+        #[arg(long, default_value = "room_test")]
+        room_id: String,
+        #[arg(long = "allowed-peer")]
+        allowed_peers: Vec<String>,
+        #[arg(long, default_value_t = 0)]
+        max_packets: u16,
+        #[arg(long, default_value_t = 30000)]
+        timeout_ms: u64,
+    },
+    RelayUdpLoopbackTest {
+        #[arg(long, default_value = "127.0.0.1:0")]
+        bind: String,
+        #[arg(long)]
+        key: String,
+        #[arg(long, default_value = "room_test")]
+        room_id: String,
+        #[arg(long, default_value = "relay ping")]
+        message: String,
+        #[arg(long, default_value_t = 2000)]
+        timeout_ms: u64,
     },
     P2pHandshakeLoopbackTest {
         #[arg(long, default_value = "127.0.0.1:0")]
@@ -2200,6 +2226,34 @@ fn run_main() -> Result<(), Box<dyn std::error::Error>> {
             wait_reply,
         } => {
             let result = run_tunnel_send(&bind, &peer, &key, &message, timeout_ms, wait_reply)?;
+            println!("{}", serde_json::to_string_pretty(&result)?);
+        }
+        Command::RelayUdpServer {
+            bind,
+            key,
+            room_id,
+            allowed_peers,
+            max_packets,
+            timeout_ms,
+        } => {
+            let result = run_relay_udp_server(
+                &bind,
+                &key,
+                &room_id,
+                &allowed_peers,
+                max_packets,
+                timeout_ms,
+            )?;
+            println!("{}", serde_json::to_string_pretty(&result)?);
+        }
+        Command::RelayUdpLoopbackTest {
+            bind,
+            key,
+            room_id,
+            message,
+            timeout_ms,
+        } => {
+            let result = run_relay_udp_loopback_test(&bind, &key, &room_id, &message, timeout_ms)?;
             println!("{}", serde_json::to_string_pretty(&result)?);
         }
         Command::P2pHandshakeLoopbackTest {
@@ -4971,6 +5025,366 @@ fn run_tunnel_send(
         "bytesSent": sent,
         "reply": reply,
     }))
+}
+
+fn run_relay_udp_server(
+    bind: &str,
+    key: &str,
+    room_id: &str,
+    allowed_peers: &[String],
+    max_packets: u16,
+    timeout_ms: u64,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    let socket = UdpSocket::bind(bind)?;
+    socket.set_read_timeout(Some(Duration::from_millis(timeout_ms)))?;
+    let allowed_peers = allowed_peers
+        .iter()
+        .filter(|peer| !peer.trim().is_empty())
+        .cloned()
+        .collect::<HashSet<_>>();
+    let mut peer_endpoints = HashMap::<String, SocketAddr>::new();
+    let mut packets = Vec::new();
+    let mut forwarded_packets = 0u64;
+    let mut dropped_packets = 0u64;
+    let mut decrypted_packets = 0u64;
+    let mut buffer = vec![0u8; 65_535];
+
+    loop {
+        if max_packets > 0 && packets.len() >= max_packets as usize {
+            break;
+        }
+        match socket.recv_from(&mut buffer) {
+            Ok((received, source)) => {
+                let observed_at_ms = current_epoch_ms();
+                let event = match relay_packet_event(
+                    &socket,
+                    key,
+                    room_id,
+                    &allowed_peers,
+                    &mut peer_endpoints,
+                    &buffer[..received],
+                    received,
+                    source,
+                    observed_at_ms,
+                ) {
+                    Ok(event) => {
+                        decrypted_packets += 1;
+                        if event.get("status").and_then(serde_json::Value::as_str)
+                            == Some("forwarded")
+                        {
+                            forwarded_packets += 1;
+                        } else if event.get("status").and_then(serde_json::Value::as_str)
+                            != Some("registered")
+                        {
+                            dropped_packets += 1;
+                        }
+                        event
+                    }
+                    Err(err) => {
+                        dropped_packets += 1;
+                        serde_json::json!({
+                            "status": "dropped",
+                            "reason": "invalid-relay-packet",
+                            "source": source.to_string(),
+                            "bytesReceived": received,
+                            "observedAtMs": observed_at_ms,
+                            "error": err.to_string(),
+                        })
+                    }
+                };
+                packets.push(event);
+            }
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    ErrorKind::WouldBlock
+                        | ErrorKind::TimedOut
+                        | ErrorKind::Interrupted
+                        | ErrorKind::ConnectionReset
+                ) =>
+            {
+                break;
+            }
+            Err(err) => return Err(err.into()),
+        }
+    }
+
+    Ok(serde_json::json!({
+        "status": if forwarded_packets > 0 {
+            "ok"
+        } else if packets.is_empty() {
+            "timeout"
+        } else {
+            "no-forward"
+        },
+        "bind": socket.local_addr()?.to_string(),
+        "roomId": room_id,
+        "allowedPeerCount": allowed_peers.len(),
+        "knownPeerCount": peer_endpoints.len(),
+        "decryptedPackets": decrypted_packets,
+        "forwardedPackets": forwarded_packets,
+        "droppedPackets": dropped_packets,
+        "packets": packets,
+        "knownPeers": relay_known_peers(&peer_endpoints),
+    }))
+}
+
+fn relay_packet_event(
+    socket: &UdpSocket,
+    key: &str,
+    room_id: &str,
+    allowed_peers: &HashSet<String>,
+    peer_endpoints: &mut HashMap<String, SocketAddr>,
+    wire: &[u8],
+    received: usize,
+    source: SocketAddr,
+    observed_at_ms: u128,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    let envelope: TunnelEnvelope = serde_json::from_slice(wire)?;
+    let payload = open_tunnel_payload(key, &envelope)?;
+    let request: serde_json::Value = serde_json::from_slice(&payload.plaintext)?;
+    let request_room_id = request
+        .get("room_id")
+        .or_else(|| request.get("roomId"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    let from_peer_id = request
+        .get("from_peer_id")
+        .or_else(|| request.get("fromPeerId"))
+        .or_else(|| request.get("peer_id"))
+        .or_else(|| request.get("peerId"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    let to_peer_id = request
+        .get("to_peer_id")
+        .or_else(|| request.get("toPeerId"))
+        .or_else(|| request.get("target_peer_id"))
+        .or_else(|| request.get("targetPeerId"))
+        .and_then(serde_json::Value::as_str);
+
+    if request_room_id != room_id {
+        return Ok(serde_json::json!({
+            "status": "dropped",
+            "reason": "room-mismatch",
+            "source": source.to_string(),
+            "roomId": request_room_id,
+            "expectedRoomId": room_id,
+            "bytesReceived": received,
+            "observedAtMs": observed_at_ms,
+            "packetKind": payload.metadata.packet_kind,
+            "sequence": payload.metadata.sequence,
+        }));
+    }
+    if from_peer_id.is_empty() {
+        return Ok(serde_json::json!({
+            "status": "dropped",
+            "reason": "missing-from-peer",
+            "source": source.to_string(),
+            "bytesReceived": received,
+            "observedAtMs": observed_at_ms,
+            "packetKind": payload.metadata.packet_kind,
+            "sequence": payload.metadata.sequence,
+        }));
+    }
+    if !allowed_peers.is_empty() && !allowed_peers.contains(from_peer_id) {
+        return Ok(serde_json::json!({
+            "status": "dropped",
+            "reason": "from-peer-not-allowed",
+            "source": source.to_string(),
+            "fromPeerId": from_peer_id,
+            "bytesReceived": received,
+            "observedAtMs": observed_at_ms,
+            "packetKind": payload.metadata.packet_kind,
+            "sequence": payload.metadata.sequence,
+        }));
+    }
+
+    peer_endpoints.insert(from_peer_id.to_owned(), source);
+    let Some(to_peer_id) = to_peer_id else {
+        return Ok(serde_json::json!({
+            "status": "registered",
+            "source": source.to_string(),
+            "fromPeerId": from_peer_id,
+            "knownPeerCount": peer_endpoints.len(),
+            "bytesReceived": received,
+            "observedAtMs": observed_at_ms,
+            "packetKind": payload.metadata.packet_kind,
+            "sequence": payload.metadata.sequence,
+        }));
+    };
+    if !allowed_peers.is_empty() && !allowed_peers.contains(to_peer_id) {
+        return Ok(serde_json::json!({
+            "status": "dropped",
+            "reason": "target-peer-not-allowed",
+            "source": source.to_string(),
+            "fromPeerId": from_peer_id,
+            "toPeerId": to_peer_id,
+            "knownPeerCount": peer_endpoints.len(),
+            "bytesReceived": received,
+            "observedAtMs": observed_at_ms,
+            "packetKind": payload.metadata.packet_kind,
+            "sequence": payload.metadata.sequence,
+        }));
+    }
+    let Some(target) = peer_endpoints.get(to_peer_id).copied() else {
+        return Ok(serde_json::json!({
+            "status": "dropped",
+            "reason": "target-peer-unknown",
+            "source": source.to_string(),
+            "fromPeerId": from_peer_id,
+            "toPeerId": to_peer_id,
+            "knownPeerCount": peer_endpoints.len(),
+            "bytesReceived": received,
+            "observedAtMs": observed_at_ms,
+            "packetKind": payload.metadata.packet_kind,
+            "sequence": payload.metadata.sequence,
+        }));
+    };
+    let sent = socket.send_to(wire, target)?;
+    Ok(serde_json::json!({
+        "status": "forwarded",
+        "source": source.to_string(),
+        "target": target.to_string(),
+        "fromPeerId": from_peer_id,
+        "toPeerId": to_peer_id,
+        "knownPeerCount": peer_endpoints.len(),
+        "bytesReceived": received,
+        "bytesSent": sent,
+        "observedAtMs": observed_at_ms,
+        "packetKind": payload.metadata.packet_kind,
+        "sequence": payload.metadata.sequence,
+    }))
+}
+
+fn relay_known_peers(peer_endpoints: &HashMap<String, SocketAddr>) -> Vec<serde_json::Value> {
+    let mut peers = peer_endpoints
+        .iter()
+        .map(|(peer_id, endpoint)| {
+            serde_json::json!({
+                "peerId": peer_id,
+                "endpoint": endpoint.to_string(),
+            })
+        })
+        .collect::<Vec<_>>();
+    peers.sort_by(|left, right| {
+        left.get("peerId")
+            .and_then(serde_json::Value::as_str)
+            .cmp(&right.get("peerId").and_then(serde_json::Value::as_str))
+    });
+    peers
+}
+
+fn run_relay_udp_loopback_test(
+    bind: &str,
+    key: &str,
+    room_id: &str,
+    message: &str,
+    timeout_ms: u64,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    let relay = UdpSocket::bind(bind)?;
+    relay.set_read_timeout(Some(Duration::from_millis(timeout_ms)))?;
+    let relay_addr = relay.local_addr()?;
+    let peer_a = UdpSocket::bind("127.0.0.1:0")?;
+    let peer_b = UdpSocket::bind("127.0.0.1:0")?;
+    peer_b.set_read_timeout(Some(Duration::from_millis(timeout_ms)))?;
+    let allowed_peers = ["peer_a".to_owned(), "peer_b".to_owned()]
+        .into_iter()
+        .collect::<HashSet<_>>();
+    let mut peer_endpoints = HashMap::<String, SocketAddr>::new();
+    let mut relay_events = Vec::new();
+
+    let register_b = relay_packet(key, "relay-register", 1, room_id, "peer_b", None, b"")?;
+    let sent_register = peer_b.send_to(&register_b, relay_addr)?;
+    let mut buffer = vec![0u8; 65_535];
+    let (received_register, register_source) = relay.recv_from(&mut buffer)?;
+    relay_events.push(relay_packet_event(
+        &relay,
+        key,
+        room_id,
+        &allowed_peers,
+        &mut peer_endpoints,
+        &buffer[..received_register],
+        received_register,
+        register_source,
+        current_epoch_ms(),
+    )?);
+
+    let forward = relay_packet(
+        key,
+        "relay-udp-forward",
+        2,
+        room_id,
+        "peer_a",
+        Some("peer_b"),
+        message.as_bytes(),
+    )?;
+    let sent_forward = peer_a.send_to(&forward, relay_addr)?;
+    let (received_forward, forward_source) = relay.recv_from(&mut buffer)?;
+    relay_events.push(relay_packet_event(
+        &relay,
+        key,
+        room_id,
+        &allowed_peers,
+        &mut peer_endpoints,
+        &buffer[..received_forward],
+        received_forward,
+        forward_source,
+        current_epoch_ms(),
+    )?);
+
+    let (delivered_bytes, delivered_source) = peer_b.recv_from(&mut buffer)?;
+    let delivered_envelope: TunnelEnvelope = serde_json::from_slice(&buffer[..delivered_bytes])?;
+    let delivered_payload = open_tunnel_payload(key, &delivered_envelope)?;
+    let delivered_request: serde_json::Value =
+        serde_json::from_slice(&delivered_payload.plaintext)?;
+    let delivered_message = delivered_request
+        .get("bytes")
+        .and_then(serde_json::Value::as_str)
+        .map(|encoded| STANDARD_NO_PAD.decode(encoded.as_bytes()))
+        .transpose()
+        .map_err(|err| invalid_input(format!("invalid relay payload bytes: {err}")))?
+        .unwrap_or_default();
+
+    Ok(serde_json::json!({
+        "status": if delivered_message == message.as_bytes() { "ok" } else { "mismatch" },
+        "relay": relay_addr.to_string(),
+        "peerA": peer_a.local_addr()?.to_string(),
+        "peerB": peer_b.local_addr()?.to_string(),
+        "bytesSentToRegister": sent_register,
+        "bytesSentToForward": sent_forward,
+        "deliveredBytes": delivered_bytes,
+        "deliveredFrom": delivered_source.to_string(),
+        "deliveredMessage": String::from_utf8_lossy(&delivered_message),
+        "relayEvents": relay_events,
+        "knownPeers": relay_known_peers(&peer_endpoints),
+    }))
+}
+
+fn relay_packet(
+    key: &str,
+    packet_kind: &str,
+    sequence: u64,
+    room_id: &str,
+    from_peer_id: &str,
+    to_peer_id: Option<&str>,
+    payload: &[u8],
+) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let body = serde_json::json!({
+        "schemaVersion": 1,
+        "room_id": room_id,
+        "from_peer_id": from_peer_id,
+        "to_peer_id": to_peer_id,
+        "bytes": STANDARD_NO_PAD.encode(payload),
+        "sentAtMs": current_epoch_ms(),
+    });
+    let envelope = seal_tunnel_payload(
+        key,
+        packet_kind,
+        sequence,
+        current_epoch_ms(),
+        serde_json::to_string(&body)?.as_bytes(),
+    )?;
+    serde_json::to_vec(&envelope).map_err(Into::into)
 }
 
 fn run_p2p_handshake_loopback_test(

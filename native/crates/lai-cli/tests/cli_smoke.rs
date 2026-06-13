@@ -120,6 +120,31 @@ fn network_observe_reports_connection_path_relay() {
 }
 
 #[test]
+fn relay_udp_loopback_forwards_encrypted_peer_payload() {
+    let value = run_cli(&[
+        "relay-udp-loopback-test",
+        "--key",
+        "room-key",
+        "--room-id",
+        "room_test",
+        "--message",
+        "relay hello",
+    ]);
+
+    assert_eq!(value["status"], "ok");
+    assert_eq!(value["deliveredMessage"], "relay hello");
+    assert_eq!(value["relayEvents"][0]["status"], "registered");
+    assert_eq!(value["relayEvents"][1]["status"], "forwarded");
+    assert_eq!(value["relayEvents"][1]["fromPeerId"], "peer_a");
+    assert_eq!(value["relayEvents"][1]["toPeerId"], "peer_b");
+    assert!(value["knownPeers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|peer| peer["peerId"] == "peer_b"));
+}
+
+#[test]
 fn network_observe_reports_room_route_present() {
     let route_path = std::env::temp_dir().join(format!(
         "lai-cli-network-observe-route-{}.txt",

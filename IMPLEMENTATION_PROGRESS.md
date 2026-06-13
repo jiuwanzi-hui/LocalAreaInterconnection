@@ -22,13 +22,13 @@
 | 防火墙计划/诊断 | 部分完成 | 已有 dry-run 计划、规则诊断和 netsh 文本解析；真实管理员权限修改未验证。 |
 | UDP/TCP/广播测试 | 部分完成 | 测试命令和桌面按钮已可生成 packet observation；还不是真实游戏流量捕获。 |
 | 网络观测与下一步动作 | 部分完成 | 已合并 adapter/tunnel/P2P/broadcast/game traffic/route 观测并输出建议；桌面“网络诊断”已切到 Rust native `network-observe` 并可现场扫描 adapter、ping 和 route；真实隧道状态仍需更深入接入。 |
-| P2P 失败中继兜底计划 | 部分完成 | 已新增 core/CLI relay fallback plan，可根据 NAT offers 和 P2P 状态输出 P2P/relay/no-path/needs-relay 判断，桌面壳已有中继计划按钮，并可选写入诊断导出包；真实 relay runtime 尚未实现。 |
+| P2P 失败中继兜底计划 | 部分完成 | 已新增 core/CLI relay fallback plan，可根据 NAT offers 和 P2P 状态输出 P2P/relay/no-path/needs-relay 判断，桌面壳已有中继计划按钮，并可选写入诊断导出包；Rust native 已新增最小 UDP relay runtime 和本机加密转发 loopback 验证，公网 relay 部署和两机切换仍未验证。 |
 | 诊断导出包 | 部分完成 | C# 测试壳和 Rust core/CLI 均可导出 JSON bundle，schema v18 已包含可选 relay fallback、connection path、runtime relay fallback summaries、带 latency/lastSeen/lastSent/heartbeat ack/loss/health 的 runtime peer summaries、runtime cleanup plan/report、route table evidence、broadcast forward report、顶层 route scan、game port scan 和带 firewall/connection-path/runtime-peer check 的 game readiness 结构化区段；可从 runtime snapshot 自动采用 connection path report 和成员级 runtime 摘要；真实服务采集仍未完全接入。 |
 | 游戏配置模板 | 部分完成 | Rust core/CLI 已支持读取、搜索、列出本地游戏模板 catalog、生成网络计划、通过 netstat 扫描目标游戏端口绑定，并可生成独立/导出包 game readiness 报告；桌面测试壳已有默认示例 catalog、模板计划按钮、端口回填、模板化端口扫描/防火墙计划/游戏就绪检查和详情摘要；真实兼容性数据和游戏联调未完成。 |
-| Rust 工具链与 native 测试 | 已完成 | `cargo 1.96.0`、`rustc 1.96.0` 可用；`native/` 下 `cargo test` 通过 86 个核心测试和 74 个 CLI 集成测试。 |
+| Rust 工具链与 native 测试 | 已完成 | `cargo 1.96.0`、`rustc 1.96.0` 可用；`native/` 下 `cargo test` 通过 86 个核心测试和 75 个 CLI 集成测试。 |
 | Rust 原生代码格式化 | 已完成 | 已执行 `cargo fmt`，并在格式化后复测通过。 |
 | 真实虚拟网卡集成 | 部分完成 | 已选择并接入 Wintun 方向，Rust core/CLI 具备 detect/create/open/session/send/receive probe 和桌面检测入口；仍需要管理员权限机器验证真实 adapter 创建、打开、读写和清理闭环。 |
-| 真实隧道服务 | 部分完成 | 已有 userspace UDP runtime、加密 tunnel envelope、心跳/ack、runtime peer 摘要、路径统计和 Wintun runtime packet I/O 接入边界；真实跨机器 P2P/relay 数据面和重连稳定性仍需两机验证。 |
+| 真实隧道服务 | 部分完成 | 已有 userspace UDP runtime、最小 UDP relay runtime、加密 tunnel envelope、心跳/ack、runtime peer 摘要、路径统计和 Wintun runtime packet I/O 接入边界；真实跨机器 P2P/relay 数据面和重连稳定性仍需两机验证。 |
 | 真实广播/游戏包捕获与转发 | 部分完成 | 已有 packet capture summary、userspace UDP 捕获/转发、自检包观测、广播限速策略和 Wintun 虚拟包读写边界；真实虚拟网卡游戏流量捕获、广播发现和跨机器转发仍需管理员与两台 Windows 验证。 |
 | Runtime 退出清理计划 | 部分完成 | 已新增 core/CLI runtime cleanup plan、cleanup report、route residue 检查、route cleanup dry-run 命令和显式确认的 cleanup apply 入口，`room-runtime-run` 退出 JSON 会输出清理计划，桌面壳已有“清理计划/报告/应用清理”入口；真实系统网卡/路由还原仍需管理员终端实测。 |
 | 真实房间成员生命周期 | 部分完成 | Rust core 已有本地房间成员生命周期模型、coordination room view、peer leave、room close、host kick、host 权限校验和 runtime coordination monitor；被踢或房间关闭时 runtime 可主动停止；尚未完成真实协调服务部署和两机联调。 |
@@ -36,7 +36,7 @@
 
 ## 当前状态
 
-状态：Windows 客户端 Rust 原生核心继续推进；已新增网络观测诊断边界、Windows 网卡 netsh 观测解析、UDP/TCP/广播包观测文件链路、ping 连通性观测、只读诊断导出包、coordination room view、host kick/close 权限边界、P2P 失败 relay fallback plan、connection path 诊断、runtime peer 摘要、runtime relay fallback summaries、runtime 退出清理计划、本地游戏模板 catalog 读取/搜索/计划生成和 Wintun 检测/探针入口；已生成可双击启动的 Windows 桌面测试程序与 CLI 后端；Rust 工具链已可用，`native/` 已通过编译和测试
+状态：Windows 客户端 Rust 原生核心继续推进；已新增网络观测诊断边界、Windows 网卡 netsh 观测解析、UDP/TCP/广播包观测文件链路、ping 连通性观测、只读诊断导出包、coordination room view、host kick/close 权限边界、P2P 失败 relay fallback plan、最小 UDP relay runtime、connection path 诊断、runtime peer 摘要、runtime relay fallback summaries、runtime 退出清理计划、本地游戏模板 catalog 读取/搜索/计划生成和 Wintun 检测/探针入口；已生成可双击启动的 Windows 桌面测试程序与 CLI 后端；Rust 工具链已可用，`native/` 已通过编译和测试
 
 最后更新：2026-06-13
 
@@ -71,6 +71,37 @@
 - 当前目录已初始化为 Git 仓库，并已创建首次基线提交。
 
 ## 本轮进展
+
+### 2026-06-13 本次会话：最小 relay UDP runtime 和 GitHub 推送重试
+
+已完成：
+
+- 继续检查进度文件和当前代码，确认此前本地提交已存在但 GitHub 远程未更新的原因是 `git push origin master` 连接 GitHub 失败，不是本地未提交。
+- 更新 `native/crates/lai-cli/src/main.rs`：
+  - 新增 `relay-udp-server` 命令，使用现有 `TunnelEnvelope`/ChaCha20Poly1305 加密格式接收 relay register/forward 包。
+  - relay 会按 `room_id`、`from_peer_id`、`to_peer_id` 和可选 `--allowed-peer` 做基础校验，维护 peer id 到 UDP 源地址的最近映射。
+  - relay 会把目标已知的加密 UDP 包原样转发到目标 peer 地址，并结构化输出 registered/forwarded/dropped 事件、丢弃原因、known peers 和计数。
+  - 新增 `relay-udp-loopback-test`，在本机启动 relay socket 和两个本地 UDP peer，验证 peer A 的加密 payload 可通过 relay 转发给 peer B。
+- 更新 `native/crates/lai-cli/tests/cli_smoke.rs`：
+  - 新增 `relay_udp_loopback_forwards_encrypted_peer_payload`，覆盖 register、forward 和 delivered message。
+
+测试结果：
+
+- `cargo fmt --check`：通过。
+- `cargo test`：通过。
+  - Rust CLI 集成测试：75 个通过。
+  - Rust core 单元测试：86 个通过。
+  - doc-tests：通过。
+
+未完成：
+
+- 新增 relay runtime 已在本机 loopback 下验证数据面转发，但还不是公网 relay 部署，也未完成两台 Windows 的 P2P 失败后自动切 relay 联调。
+- GitHub 推送仍取决于当前机器到 GitHub 的网络连接状态；前两次失败分别为 443 超时和连接重置，本轮提交后会继续重试。
+
+下一轮建议：
+
+- 网络恢复后确认 `git push origin master` 成功。
+- 在两机环境中用 coordination/NAT bootstrap 产生真实 relay candidate，再验证 P2P timeout 后 relay path 的实际游戏数据面。
 
 ### 2026-06-13 本次会话：整体测试、native packet 测试入口和进度收口
 
