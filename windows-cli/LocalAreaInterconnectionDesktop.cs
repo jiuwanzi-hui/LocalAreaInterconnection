@@ -34,7 +34,6 @@ public class LocalAreaInterconnectionDesktop : Form
     TextBox remotePeer;
     TextBox invite;
     TextBox output;
-    Timer animation;
     Timer runtimeStatusTimer;
     Random random = new Random();
     Particle[] particles;
@@ -48,7 +47,15 @@ public class LocalAreaInterconnectionDesktop : Form
     Button languageButton;
     ToolTip chromeTips;
     TableLayoutPanel rootLayout;
+    Panel actionsHost;
+    Panel actionsViewport;
+    Panel actionScrollBar;
+    Panel actionScrollThumb;
     FlowLayoutPanel actionsPanel;
+    int actionScrollOffset = 0;
+    bool draggingActionScrollThumb = false;
+    int actionScrollDragStartY = 0;
+    int actionScrollStartOffset = 0;
     Dictionary<string, Label> labelControls = new Dictionary<string, Label>();
     Dictionary<string, Button> buttonControls = new Dictionary<string, Button>();
     Process runtimeProcess;
@@ -63,7 +70,8 @@ public class LocalAreaInterconnectionDesktop : Form
     string lastRuntimeSnapshotText = "";
     int lastRuntimeLogLength = 0;
     DateTime lastCoordinationRefreshUtc = DateTime.MinValue;
-    const int ActionRow = 15;
+    const int ActionStartRow = 12;
+    const int ActionRowSpan = 4;
     const int OutputRow = 16;
 
     protected override CreateParams CreateParams
@@ -79,6 +87,7 @@ public class LocalAreaInterconnectionDesktop : Form
 
     protected override void WndProc(ref Message m)
     {
+        const int wmNcCalcSize = 0x83;
         const int wmNcHitTest = 0x84;
         const int htClient = 1;
         const int htLeft = 10;
@@ -89,6 +98,12 @@ public class LocalAreaInterconnectionDesktop : Form
         const int htBottom = 15;
         const int htBottomLeft = 16;
         const int htBottomRight = 17;
+
+        if (m.Msg == wmNcCalcSize && m.WParam != IntPtr.Zero)
+        {
+            m.Result = IntPtr.Zero;
+            return;
+        }
 
         base.WndProc(ref m);
         if (m.Msg != wmNcHitTest || (int)m.Result != htClient || WindowState == FormWindowState.Maximized)
@@ -177,7 +192,7 @@ public class LocalAreaInterconnectionDesktop : Form
         {
             rootLayout.RowStyles.Add(new RowStyle(SizeType.Absolute, 36));
         }
-        rootLayout.RowStyles.Add(new RowStyle(SizeType.Absolute, 122));
+        rootLayout.RowStyles.Add(new RowStyle(SizeType.Absolute, 36));
         rootLayout.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
         shell.Controls.Add(rootLayout, 0, 1);
 
@@ -197,17 +212,49 @@ public class LocalAreaInterconnectionDesktop : Form
         remotePeer = AddField(rootLayout, 13, "remotePeer", "");
         invite = AddField(rootLayout, 14, "invite", "");
 
+        actionsHost = new Panel();
+        actionsHost.Dock = DockStyle.Fill;
+        actionsHost.BackColor = Color.FromArgb(13, 42, 64);
+        actionsHost.Padding = new Padding(8);
+        actionsHost.Margin = new Padding(12, 4, 0, 6);
+        actionsHost.MouseWheel += ScrollActionsWheel;
+
+        actionsViewport = new Panel();
+        actionsViewport.Dock = DockStyle.Fill;
+        actionsViewport.BackColor = Color.FromArgb(13, 42, 64);
+        actionsViewport.MouseWheel += ScrollActionsWheel;
+        actionsViewport.Resize += delegate { AdjustActionLayout(); };
+
         actionsPanel = new FlowLayoutPanel();
-        actionsPanel.Dock = DockStyle.Fill;
-        actionsPanel.BackColor = Color.FromArgb(18, 58, 86);
-        actionsPanel.Padding = new Padding(8, 8, 2, 8);
-        actionsPanel.Margin = new Padding(0, 4, 0, 6);
+        actionsPanel.BackColor = Color.Transparent;
+        actionsPanel.Padding = new Padding(0);
+        actionsPanel.Margin = new Padding(0);
         actionsPanel.WrapContents = true;
-        actionsPanel.AutoScroll = true;
-        actionsPanel.HorizontalScroll.Enabled = false;
-        actionsPanel.HorizontalScroll.Visible = false;
-        rootLayout.Controls.Add(new Label(), 0, ActionRow);
-        rootLayout.Controls.Add(actionsPanel, 1, ActionRow);
+        actionsPanel.AutoScroll = false;
+        actionsPanel.MouseWheel += ScrollActionsWheel;
+        actionsViewport.Controls.Add(actionsPanel);
+
+        actionScrollBar = new Panel();
+        actionScrollBar.Dock = DockStyle.Right;
+        actionScrollBar.Width = 10;
+        actionScrollBar.BackColor = Color.FromArgb(8, 28, 45);
+        actionScrollBar.MouseWheel += ScrollActionsWheel;
+        actionScrollBar.Paint += PaintActionScrollBar;
+
+        actionScrollThumb = new Panel();
+        actionScrollThumb.Left = 2;
+        actionScrollThumb.Width = 6;
+        actionScrollThumb.BackColor = Color.FromArgb(88, 168, 207);
+        actionScrollThumb.Cursor = Cursors.Hand;
+        actionScrollThumb.MouseDown += BeginActionScrollThumbDrag;
+        actionScrollThumb.MouseMove += DragActionScrollThumb;
+        actionScrollThumb.MouseUp += EndActionScrollThumbDrag;
+        actionScrollBar.Controls.Add(actionScrollThumb);
+
+        actionsHost.Controls.Add(actionsViewport);
+        actionsHost.Controls.Add(actionScrollBar);
+        rootLayout.Controls.Add(actionsHost, 2, ActionStartRow);
+        rootLayout.SetRowSpan(actionsHost, ActionRowSpan);
 
         AddButton(actionsPanel, "createRoom", delegate { CreateRoom(); });
         AddButton(actionsPanel, "copyInvite", delegate { CopyInvite(); });
@@ -274,14 +321,6 @@ public class LocalAreaInterconnectionDesktop : Form
         Resize += delegate { AdjustActionLayout(); };
         AdjustActionLayout();
 
-        animation = new Timer();
-        animation.Interval = 80;
-        animation.Tick += delegate
-        {
-            MoveParticles();
-            Invalidate();
-        };
-        animation.Start();
         runtimeStatusTimer = new Timer();
         runtimeStatusTimer.Interval = 1500;
         runtimeStatusTimer.Tick += delegate { RefreshRuntimeStatus(); };
@@ -500,22 +539,107 @@ public class LocalAreaInterconnectionDesktop : Form
         button.FlatAppearance.MouseOverBackColor = Color.FromArgb(54, 132, 175);
         button.FlatAppearance.MouseDownBackColor = Color.FromArgb(21, 72, 110);
         button.Click += handler;
+        button.MouseWheel += ScrollActionsWheel;
         buttonControls[key] = button;
         panel.Controls.Add(button);
     }
 
     void AdjustActionLayout()
     {
-        if (actionsPanel == null || rootLayout == null) return;
-        int available = Math.Max(300, actionsPanel.ClientSize.Width - 22);
-        int columns = Math.Max(3, Math.Min(6, available / 138));
+        if (actionsPanel == null || actionsViewport == null || rootLayout == null) return;
+        int available = Math.Max(220, actionsViewport.ClientSize.Width - 2);
+        int columns = Math.Max(2, Math.Min(3, available / 136));
         int width = Math.Max(112, (available / columns) - 8);
         foreach (Control control in actionsPanel.Controls)
         {
             control.Width = width;
             control.Height = 30;
         }
-        rootLayout.RowStyles[ActionRow].Height = Math.Max(116, Math.Min(148, ClientSize.Height / 5));
+
+        int rows = (int)Math.Ceiling(actionsPanel.Controls.Count / (double)columns);
+        int contentHeight = Math.Max(actionsViewport.ClientSize.Height, rows * 38);
+        actionsPanel.SetBounds(0, -actionScrollOffset, available, contentHeight);
+        ClampActionScroll();
+        UpdateActionScrollBar();
+    }
+
+    void ScrollActionsWheel(object sender, MouseEventArgs e)
+    {
+        int step = e.Delta > 0 ? -42 : 42;
+        SetActionScrollOffset(actionScrollOffset + step);
+    }
+
+    void BeginActionScrollThumbDrag(object sender, MouseEventArgs e)
+    {
+        if (e.Button != MouseButtons.Left) return;
+        draggingActionScrollThumb = true;
+        actionScrollDragStartY = actionScrollBar.PointToClient(actionScrollThumb.PointToScreen(e.Location)).Y;
+        actionScrollStartOffset = actionScrollOffset;
+    }
+
+    void DragActionScrollThumb(object sender, MouseEventArgs e)
+    {
+        if (!draggingActionScrollThumb) return;
+        int currentY = actionScrollBar.PointToClient(actionScrollThumb.PointToScreen(e.Location)).Y;
+        int track = Math.Max(1, actionScrollBar.ClientSize.Height - actionScrollThumb.Height - 4);
+        int maxOffset = MaxActionScrollOffset();
+        int deltaOffset = (currentY - actionScrollDragStartY) * maxOffset / track;
+        SetActionScrollOffset(actionScrollStartOffset + deltaOffset);
+    }
+
+    void EndActionScrollThumbDrag(object sender, MouseEventArgs e)
+    {
+        draggingActionScrollThumb = false;
+    }
+
+    void SetActionScrollOffset(int value)
+    {
+        actionScrollOffset = Math.Max(0, Math.Min(MaxActionScrollOffset(), value));
+        if (actionsPanel != null)
+        {
+            actionsPanel.Top = -actionScrollOffset;
+        }
+        UpdateActionScrollBar();
+    }
+
+    void ClampActionScroll()
+    {
+        actionScrollOffset = Math.Max(0, Math.Min(MaxActionScrollOffset(), actionScrollOffset));
+        if (actionsPanel != null)
+        {
+            actionsPanel.Top = -actionScrollOffset;
+        }
+    }
+
+    int MaxActionScrollOffset()
+    {
+        if (actionsPanel == null || actionsViewport == null) return 0;
+        return Math.Max(0, actionsPanel.Height - actionsViewport.ClientSize.Height);
+    }
+
+    void UpdateActionScrollBar()
+    {
+        if (actionScrollBar == null || actionScrollThumb == null || actionsPanel == null || actionsViewport == null) return;
+        int maxOffset = MaxActionScrollOffset();
+        bool visible = maxOffset > 0;
+        actionScrollBar.Visible = visible;
+        if (!visible) return;
+
+        int trackHeight = Math.Max(1, actionScrollBar.ClientSize.Height - 4);
+        int thumbHeight = Math.Max(28, actionsViewport.ClientSize.Height * trackHeight / Math.Max(actionsPanel.Height, 1));
+        int travel = Math.Max(1, trackHeight - thumbHeight);
+        int thumbTop = 2 + (actionScrollOffset * travel / maxOffset);
+        actionScrollThumb.SetBounds(2, thumbTop, Math.Max(4, actionScrollBar.Width - 4), thumbHeight);
+        actionScrollBar.Invalidate();
+    }
+
+    void PaintActionScrollBar(object sender, PaintEventArgs e)
+    {
+        e.Graphics.Clear(actionScrollBar.BackColor);
+        using (Pen pen = new Pen(Color.FromArgb(26, 78, 108)))
+        {
+            e.Graphics.DrawLine(pen, actionScrollBar.Width / 2, 4, actionScrollBar.Width / 2, actionScrollBar.Height - 4);
+        }
     }
 
     void StyleTextBox(TextBox box)
