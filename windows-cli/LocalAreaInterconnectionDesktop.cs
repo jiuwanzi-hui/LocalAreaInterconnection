@@ -7,6 +7,7 @@ using System.Drawing.Drawing2D;
 using System.IO;
 using System.Runtime.InteropServices;
 using System.Text;
+using System.Threading.Tasks;
 using System.Windows.Forms;
 
 public class LocalAreaInterconnectionDesktop : Form
@@ -60,6 +61,7 @@ public class LocalAreaInterconnectionDesktop : Form
     bool draggingActionScrollThumb = false;
     int actionScrollDragStartY = 0;
     int actionScrollStartOffset = 0;
+    bool userActionRunning = false;
     List<Button> advancedActionButtons = new List<Button>();
     Dictionary<string, Label> labelControls = new Dictionary<string, Label>();
     Dictionary<string, Button> buttonControls = new Dictionary<string, Button>();
@@ -792,6 +794,15 @@ public class LocalAreaInterconnectionDesktop : Form
         return T("tryMainFlowAgain");
     }
 
+    void SetActionButtonsEnabled(bool enabled)
+    {
+        if (actionsPanel == null) return;
+        foreach (Control control in actionsPanel.Controls)
+        {
+            control.Enabled = enabled;
+        }
+    }
+
     void UpdateAdvancedActions()
     {
         foreach (Button button in advancedActionButtons)
@@ -1128,10 +1139,10 @@ public class LocalAreaInterconnectionDesktop : Form
             output.Text = T("startNeedsRoom");
             return;
         }
+        output.Text = T("quickLanStarting");
+        Application.DoEvents();
         StartLocalCoordinationServer();
-        RunNativeOffer();
-        StartNativeRuntime();
-        RunNetworkDiagnose();
+        StartNativeRuntime(false);
         output.Text += Environment.NewLine
             + Environment.NewLine
             + T("quickLanStarted");
@@ -1214,31 +1225,72 @@ public class LocalAreaInterconnectionDesktop : Form
 
     void RunNetworkDiagnose()
     {
-        string network = RunNetworkDiagnoseAndReturn();
-        string readiness = RunGameReadinessFromNetworkReport(network);
-        if (readiness.Length > 0)
+        if (userActionRunning)
         {
-            output.Text = network
-                + Environment.NewLine
-                + Environment.NewLine
-                + T("gameReadiness")
-                + Environment.NewLine
-                + readiness;
+            output.Text = T("actionAlreadyRunning");
+            return;
         }
+        userActionRunning = true;
+        SetActionButtonsEnabled(false);
+        output.Text = T("networkDiagnoseRunning");
+        string arguments = NetworkDiagnoseArgs();
+        Task.Factory.StartNew(delegate
+        {
+            string network = "";
+            Exception error = null;
+            try
+            {
+                network = RunNativeCliCapture(arguments);
+            }
+            catch (Exception ex)
+            {
+                error = ex;
+            }
+            if (IsDisposed || !IsHandleCreated)
+            {
+                return;
+            }
+            BeginInvoke((MethodInvoker)delegate
+            {
+                userActionRunning = false;
+                SetActionButtonsEnabled(true);
+                if (error != null)
+                {
+                    ShowActionError("checkConnection", error);
+                    return;
+                }
+                UpdateRoomDetailsFromNetworkReport(network);
+                output.Text = CustomerNetworkSummary(network, "");
+            });
+        });
     }
 
     string RunNetworkDiagnoseAndReturn()
     {
-        string text = RunNativeCli("network-observe --adapter-name LocalAreaInterconnection --expected-ip " + ip.Text
+        return RunNetworkDiagnoseAndReturn(true);
+    }
+
+    string RunNetworkDiagnoseAndReturn(bool updateOutput)
+    {
+        string arguments = NetworkDiagnoseArgs();
+        string text = updateOutput ? RunNativeCli(arguments) : RunNativeCliCapture(arguments);
+        if (updateOutput)
+        {
+            UpdateRoomDetailsFromNetworkReport(text);
+        }
+        return text;
+    }
+
+    string NetworkDiagnoseArgs()
+    {
+        return "network-observe --adapter-name LocalAreaInterconnection --expected-ip " + ip.Text
             + " --subnet " + subnet.Text
             + " --adapter-scan true"
             + " --route-scan true"
             + PingArgs()
             + PacketObservationArgs()
             + " --broadcast-ports " + ports.Text
-            + " --game-ports " + ports.Text);
-        UpdateRoomDetailsFromNetworkReport(text);
-        return text;
+            + " --game-ports " + ports.Text;
     }
 
     void ExportDiagnostics()
@@ -1434,6 +1486,11 @@ public class LocalAreaInterconnectionDesktop : Form
 
     void StartNativeRuntime()
     {
+        StartNativeRuntime(true);
+    }
+
+    void StartNativeRuntime(bool showDetails)
+    {
         if (runtimeProcess != null && !runtimeProcess.HasExited)
         {
             output.Text = T("runtimeAlreadyRunning") + Environment.NewLine + RuntimeStatusText();
@@ -1451,7 +1508,7 @@ public class LocalAreaInterconnectionDesktop : Form
         runtimeStopFile = Path.Combine(AppDataDirectory(), "runtime.stop");
         if (File.Exists(runtimeStopFile)) File.Delete(runtimeStopFile);
         string peer = SafePeerId(hostName.Text);
-        string publishOutput = PublishNativeOfferIfConfigured(peer, true);
+        string publishOutput = PublishNativeOfferIfConfigured(peer, showDetails);
         string args = "room-runtime-run"
             + " --room-id desktop_runtime"
             + " --peer-id " + Quote(peer)
@@ -1492,7 +1549,7 @@ public class LocalAreaInterconnectionDesktop : Form
         {
             output.Text += Environment.NewLine + T("nativeOfferPath") + latestNativeOfferFile;
         }
-        if (publishOutput.Length > 0)
+        if (showDetails && publishOutput.Length > 0)
         {
             output.Text += Environment.NewLine + Environment.NewLine + publishOutput;
         }
@@ -2330,6 +2387,48 @@ public class LocalAreaInterconnectionDesktop : Form
         return T("nextHealthy");
     }
 
+    string CustomerNetworkSummary(string network, string readiness)
+    {
+        string adapter = JsonStringValue(network, "virtual_adapter");
+        string tunnel = JsonStringValue(network, "tunnel");
+        string p2p = JsonStringValue(network, "p2p");
+        string broadcast = JsonStringValue(network, "broadcast");
+        string gameTraffic = JsonStringValue(network, "game_traffic");
+        string readinessStatus = JsonStringValue(readiness, "status");
+        string readinessNext = JsonFirstStringInArray(JsonArrayValue(JsonObjectValue(readiness, "report"), "next_actions"));
+        if (adapter.Length == 0) adapter = T("stateUnknown");
+        if (tunnel.Length == 0) tunnel = T("stateUnknown");
+        if (p2p.Length == 0) p2p = T("stateUnknown");
+        if (broadcast.Length == 0) broadcast = T("stateUnknown");
+        if (gameTraffic.Length == 0) gameTraffic = T("stateUnknown");
+        if (readinessStatus.Length == 0) readinessStatus = T("stateUnknown");
+
+        string next = DiagnosticNextAction(adapter, tunnel, p2p, broadcast, gameTraffic);
+        if (readinessNext.Length > 0)
+        {
+            next = readinessNext;
+        }
+
+        return T("networkDiagnoseDone")
+            + Environment.NewLine + T("summaryAdapter") + " " + FriendlyStatus(adapter)
+            + Environment.NewLine + T("summaryTunnel") + " " + FriendlyStatus(tunnel)
+            + Environment.NewLine + "P2P: " + FriendlyStatus(p2p)
+            + Environment.NewLine + T("summaryBroadcast") + " " + FriendlyStatus(broadcast)
+            + Environment.NewLine + T("summaryGame") + " " + FriendlyStatus(gameTraffic)
+            + Environment.NewLine + T("summaryReadiness") + " " + FriendlyStatus(readinessStatus)
+            + Environment.NewLine
+            + Environment.NewLine + T("detailNext") + " " + next;
+    }
+
+    string FriendlyStatus(string status)
+    {
+        if (status == "ok" || status == "seen" || status == "ready") return T("stateOk");
+        if (status == "missing" || status == "missing-peers" || status == "needs-attention") return T("stateNeedsAttention");
+        if (status == "skipped") return T("stateSkipped");
+        if (status == "failed") return T("stateFailed");
+        return status;
+    }
+
     string SafeText(string value)
     {
         string text = value == null ? "" : value.Trim();
@@ -2782,6 +2881,8 @@ public class LocalAreaInterconnectionDesktop : Form
         start.UseShellExecute = false;
         start.RedirectStandardOutput = true;
         start.RedirectStandardError = true;
+        start.StandardOutputEncoding = Encoding.UTF8;
+        start.StandardErrorEncoding = Encoding.UTF8;
         start.CreateNoWindow = true;
 
         Process process = new Process();
@@ -2888,23 +2989,53 @@ public class LocalAreaInterconnectionDesktop : Form
 
     string RunExecutableCapture(string exe, string arguments)
     {
+        return RunExecutableCapture(exe, arguments, 5000);
+    }
+
+    string RunExecutableCapture(string exe, string arguments, int timeoutMs)
+    {
         ProcessStartInfo start = new ProcessStartInfo();
         start.FileName = exe;
         start.Arguments = arguments;
         start.UseShellExecute = false;
         start.RedirectStandardOutput = true;
         start.RedirectStandardError = true;
+        start.StandardOutputEncoding = Encoding.UTF8;
+        start.StandardErrorEncoding = Encoding.UTF8;
         start.CreateNoWindow = true;
 
-        using (Process process = Process.Start(start))
+        using (Process process = new Process())
         {
-            string stdout = process.StandardOutput.ReadToEnd();
-            string stderr = process.StandardError.ReadToEnd();
+            StringBuilder stdout = new StringBuilder();
+            StringBuilder stderr = new StringBuilder();
+            process.StartInfo = start;
+            process.OutputDataReceived += delegate(object sender, DataReceivedEventArgs e)
+            {
+                if (e.Data != null) stdout.AppendLine(e.Data);
+            };
+            process.ErrorDataReceived += delegate(object sender, DataReceivedEventArgs e)
+            {
+                if (e.Data != null) stderr.AppendLine(e.Data);
+            };
+            process.Start();
+            process.BeginOutputReadLine();
+            process.BeginErrorReadLine();
+            if (!process.WaitForExit(timeoutMs))
+            {
+                try
+                {
+                    process.Kill();
+                }
+                catch
+                {
+                }
+                return T("commandTimedOut");
+            }
             process.WaitForExit();
-            string text = stdout;
+            string text = stdout.ToString();
             if (stderr.Length > 0)
             {
-                text += Environment.NewLine + stderr;
+                text += Environment.NewLine + stderr.ToString();
             }
             return text;
         }
@@ -3518,7 +3649,21 @@ public class LocalAreaInterconnectionDesktop : Form
             if (key == "quickInviteCopyFailed") return "房间已创建，但自动复制失败。请从“邀请码”输入框手动复制给朋友。";
             if (key == "quickNextHost") return "下一步：点击“启动联机”，然后进游戏创建 LAN 房间。";
             if (key == "quickJoinedNext") return "已读取邀请并加入房间。下一步：点击“启动联机”，然后进游戏找 LAN 房间。";
-            if (key == "quickLanStarted") return "联机组件已启动。进游戏试试 LAN 房间；如果看不到，再点“检查连接”。";
+            if (key == "quickLanStarting") return "正在启动联机组件，请稍等。";
+            if (key == "quickLanStarted") return "联机组件已启动。另一端也需要加入房间并点击“启动联机”；两边都启动后，进游戏试试 LAN 房间。";
+            if (key == "actionAlreadyRunning") return "正在处理上一步，请稍等完成后再点。";
+            if (key == "networkDiagnoseRunning") return "正在检查连接，请稍等。另一端未启动或网络不通时，检查可能需要几秒。";
+            if (key == "networkDiagnoseDone") return "连接检查完成:";
+            if (key == "commandTimedOut") return "操作超时。请确认另一端也已加入并启动联机，或稍后再点“检查连接”。";
+            if (key == "summaryAdapter") return "虚拟网卡:";
+            if (key == "summaryTunnel") return "隧道:";
+            if (key == "summaryBroadcast") return "广播发现:";
+            if (key == "summaryGame") return "游戏流量:";
+            if (key == "summaryReadiness") return "游戏就绪:";
+            if (key == "stateOk") return "正常";
+            if (key == "stateNeedsAttention") return "需要处理";
+            if (key == "stateSkipped") return "已跳过";
+            if (key == "stateFailed") return "失败";
             if (key == "actionCouldNotFinish") return "这一步没有完成。";
             if (key == "technicalSummary") return "简要原因:";
             if (key == "hostNeedsName") return "请先确认“房间名称”和“主机名”已填写，然后再点“一键开房”。";
@@ -3706,7 +3851,21 @@ public class LocalAreaInterconnectionDesktop : Form
             if (key == "quickInviteCopyFailed") return "Room created, but automatic copy failed. Copy the Invite field manually and send it to your friend.";
             if (key == "quickNextHost") return "Next: click Start LAN, then create a LAN room in the game.";
             if (key == "quickJoinedNext") return "Invite decoded and room joined. Next: click Start LAN, then find the LAN room in the game.";
-            if (key == "quickLanStarted") return "LAN components started. Try the game LAN room; click Check connection if it does not appear.";
+            if (key == "quickLanStarting") return "Starting LAN components. Please wait.";
+            if (key == "quickLanStarted") return "LAN components started. The other side also needs to join and click Start LAN; when both sides are ready, try the game LAN room.";
+            if (key == "actionAlreadyRunning") return "The previous step is still running. Please wait.";
+            if (key == "networkDiagnoseRunning") return "Checking connection. This may take a few seconds when the other side is offline or unreachable.";
+            if (key == "networkDiagnoseDone") return "Connection check complete:";
+            if (key == "commandTimedOut") return "Operation timed out. Make sure the other side has joined and started LAN, or try Check connection again later.";
+            if (key == "summaryAdapter") return "Virtual adapter:";
+            if (key == "summaryTunnel") return "Tunnel:";
+            if (key == "summaryBroadcast") return "Broadcast discovery:";
+            if (key == "summaryGame") return "Game traffic:";
+            if (key == "summaryReadiness") return "Game readiness:";
+            if (key == "stateOk") return "OK";
+            if (key == "stateNeedsAttention") return "Needs attention";
+            if (key == "stateSkipped") return "Skipped";
+            if (key == "stateFailed") return "Failed";
             if (key == "actionCouldNotFinish") return "This step did not finish.";
             if (key == "technicalSummary") return "Short reason:";
             if (key == "hostNeedsName") return "Fill Room name and Host first, then click Host room.";
