@@ -18,6 +18,8 @@ public class LocalAreaInterconnectionDesktop : Form
         Close
     }
 
+    static LocalAreaInterconnectionDesktop activeWindow;
+
     TextBox roomName;
     TextBox hostName;
     TextBox subnet;
@@ -141,14 +143,49 @@ public class LocalAreaInterconnectionDesktop : Form
         return (short)(((long)value >> 16) & 0xFFFF);
     }
 
+    [STAThread]
     public static void Main()
     {
         Application.EnableVisualStyles();
+        Application.SetUnhandledExceptionMode(UnhandledExceptionMode.CatchException);
+        Application.ThreadException += delegate(object sender, System.Threading.ThreadExceptionEventArgs e)
+        {
+            HandleUnhandledException(e.Exception);
+        };
+        AppDomain.CurrentDomain.UnhandledException += delegate(object sender, UnhandledExceptionEventArgs e)
+        {
+            Exception exception = e.ExceptionObject as Exception;
+            if (exception != null)
+            {
+                HandleUnhandledException(exception);
+            }
+        };
         Application.Run(new LocalAreaInterconnectionDesktop());
+    }
+
+    static void HandleUnhandledException(Exception exception)
+    {
+        LocalAreaInterconnectionDesktop window = activeWindow;
+        if (window == null || window.IsDisposed) return;
+        try
+        {
+            if (window.InvokeRequired)
+            {
+                window.BeginInvoke((MethodInvoker)delegate { window.ShowActionError("appTitle", exception); });
+            }
+            else
+            {
+                window.ShowActionError("appTitle", exception);
+            }
+        }
+        catch
+        {
+        }
     }
 
     public LocalAreaInterconnectionDesktop()
     {
+        activeWindow = this;
         Text = "LocalAreaInterconnection";
         Width = 980;
         Height = 680;
@@ -343,6 +380,10 @@ public class LocalAreaInterconnectionDesktop : Form
             StopRuntimeProcess(1500);
             StopCoordinationProcess(1500);
         };
+        FormClosed += delegate
+        {
+            if (activeWindow == this) activeWindow = null;
+        };
     }
 
     void AddResizeGripOverlays()
@@ -516,7 +557,10 @@ public class LocalAreaInterconnectionDesktop : Form
         button.UseVisualStyleBackColor = false;
         button.FlatAppearance.MouseOverBackColor = Color.FromArgb(5, 18, 32);
         button.FlatAppearance.MouseDownBackColor = Color.FromArgb(5, 18, 32);
-        button.Click += handler;
+        button.Click += delegate(object sender, EventArgs e)
+        {
+            RunUserAction(tipKey, handler, sender, e);
+        };
         button.Paint += delegate(object sender, PaintEventArgs e)
         {
             PaintChromeGlyph((Button)sender, e, glyph);
@@ -679,7 +723,10 @@ public class LocalAreaInterconnectionDesktop : Form
         button.FlatAppearance.BorderColor = advanced ? Color.FromArgb(76, 151, 191) : Color.FromArgb(127, 218, 255);
         button.FlatAppearance.MouseOverBackColor = advanced ? Color.FromArgb(41, 103, 140) : Color.FromArgb(54, 137, 180);
         button.FlatAppearance.MouseDownBackColor = Color.FromArgb(21, 72, 110);
-        button.Click += handler;
+        button.Click += delegate(object sender, EventArgs e)
+        {
+            RunUserAction(key, handler, sender, e);
+        };
         button.MouseWheel += ScrollActionsWheel;
         button.Resize += delegate { ApplyRoundedRegion(button, 8); };
         ApplyRoundedRegion(button, 8);
@@ -697,6 +744,52 @@ public class LocalAreaInterconnectionDesktop : Form
     {
         advancedActionsVisible = !advancedActionsVisible;
         UpdateAdvancedActions();
+    }
+
+    void RunUserAction(string key, EventHandler handler, object sender, EventArgs e)
+    {
+        try
+        {
+            handler(sender, e);
+        }
+        catch (Exception ex)
+        {
+            ShowActionError(key, ex);
+        }
+    }
+
+    void ShowActionError(string key, Exception ex)
+    {
+        if (output == null) return;
+        output.Text = T("actionCouldNotFinish")
+            + Environment.NewLine
+            + ActionNextHint(key)
+            + Environment.NewLine
+            + Environment.NewLine
+            + T("technicalSummary")
+            + Environment.NewLine
+            + ex.Message;
+    }
+
+    string ActionNextHint(string key)
+    {
+        if (key == "quickJoinRoom" || key == "decodeInvite" || key == "joinRoom")
+        {
+            return T("joinNeedsInvite");
+        }
+        if (key == "startLanSession" || key == "startRuntime" || key == "nativeOffer")
+        {
+            return T("startNeedsRoom");
+        }
+        if (key == "copyInvite")
+        {
+            return T("copyInviteNeedsRoom");
+        }
+        if (key == "quickHostRoom" || key == "createRoom")
+        {
+            return T("hostNeedsName");
+        }
+        return T("tryMainFlowAgain");
     }
 
     void UpdateAdvancedActions()
@@ -997,13 +1090,18 @@ public class LocalAreaInterconnectionDesktop : Form
 
     void QuickHostRoom()
     {
+        if (roomName.Text.Trim().Length == 0 || hostName.Text.Trim().Length == 0)
+        {
+            output.Text = T("hostNeedsName");
+            return;
+        }
         CreateRoom();
         if (invite.Text.Trim().Length > 0)
         {
-            Clipboard.SetText(invite.Text.Trim());
+            bool copied = TryCopyToClipboard(invite.Text.Trim());
             output.Text += Environment.NewLine
                 + Environment.NewLine
-                + T("quickInviteCopied")
+                + T(copied ? "quickInviteCopied" : "quickInviteCopyFailed")
                 + Environment.NewLine
                 + T("quickNextHost");
         }
@@ -1011,6 +1109,11 @@ public class LocalAreaInterconnectionDesktop : Form
 
     void QuickJoinRoom()
     {
+        if (invite.Text.Trim().Length == 0)
+        {
+            output.Text = T("joinNeedsInvite");
+            return;
+        }
         DecodeInvite();
         JoinRoom();
         output.Text += Environment.NewLine
@@ -1020,6 +1123,11 @@ public class LocalAreaInterconnectionDesktop : Form
 
     void StartLanSession()
     {
+        if (invite.Text.Trim().Length == 0)
+        {
+            output.Text = T("startNeedsRoom");
+            return;
+        }
         StartLocalCoordinationServer();
         RunNativeOffer();
         StartNativeRuntime();
@@ -1031,6 +1139,11 @@ public class LocalAreaInterconnectionDesktop : Form
 
     void DecodeInvite()
     {
+        if (invite.Text.Trim().Length == 0)
+        {
+            output.Text = T("joinNeedsInvite");
+            return;
+        }
         string text = RunCli("decode --invite " + Quote(invite.Text));
         string decodedSubnet = JsonStringValue(text, "virtual_subnet");
         if (decodedSubnet.Length > 0) subnet.Text = decodedSubnet;
@@ -1044,6 +1157,11 @@ public class LocalAreaInterconnectionDesktop : Form
 
     void JoinRoom()
     {
+        if (invite.Text.Trim().Length == 0)
+        {
+            output.Text = T("joinNeedsInvite");
+            return;
+        }
         string text = RunCli("join --invite " + Quote(invite.Text) + " --peer " + Quote(hostName.Text));
         string joinedSubnet = JsonStringValue(text, "virtualSubnet");
         string suggestedIp = JsonStringValue(text, "suggestedLocalIp");
@@ -1068,11 +1186,30 @@ public class LocalAreaInterconnectionDesktop : Form
     {
         if (value.Trim().Length == 0)
         {
-            output.Text = T("nothingToCopy");
+            output.Text = messageKey == "inviteCopied" ? T("copyInviteNeedsRoom") : T("nothingToCopy");
             return;
         }
-        Clipboard.SetText(value.Trim());
-        output.Text = T(messageKey) + Environment.NewLine + value.Trim();
+        if (TryCopyToClipboard(value.Trim()))
+        {
+            output.Text = T(messageKey) + Environment.NewLine + value.Trim();
+        }
+        else
+        {
+            output.Text = T("clipboardCopyFailed") + Environment.NewLine + value.Trim();
+        }
+    }
+
+    bool TryCopyToClipboard(string value)
+    {
+        try
+        {
+            Clipboard.SetText(value);
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
     }
 
     void RunNetworkDiagnose()
@@ -3378,9 +3515,18 @@ public class LocalAreaInterconnectionDesktop : Form
             if (key == "moreTools") return "更多工具";
             if (key == "hideTools") return "收起工具";
             if (key == "quickInviteCopied") return "邀请码已复制，直接发给朋友。";
+            if (key == "quickInviteCopyFailed") return "房间已创建，但自动复制失败。请从“邀请码”输入框手动复制给朋友。";
             if (key == "quickNextHost") return "下一步：点击“启动联机”，然后进游戏创建 LAN 房间。";
             if (key == "quickJoinedNext") return "已读取邀请并加入房间。下一步：点击“启动联机”，然后进游戏找 LAN 房间。";
             if (key == "quickLanStarted") return "联机组件已启动。进游戏试试 LAN 房间；如果看不到，再点“检查连接”。";
+            if (key == "actionCouldNotFinish") return "这一步没有完成。";
+            if (key == "technicalSummary") return "简要原因:";
+            if (key == "hostNeedsName") return "请先确认“房间名称”和“主机名”已填写，然后再点“一键开房”。";
+            if (key == "joinNeedsInvite") return "请先把朋友发来的邀请码粘贴到“邀请码”输入框，再点“加入朋友”。";
+            if (key == "startNeedsRoom") return "请先“一键开房”或粘贴邀请码点“加入朋友”，再点“启动联机”。";
+            if (key == "copyInviteNeedsRoom") return "请先点“一键开房”生成邀请码，再复制给朋友。";
+            if (key == "tryMainFlowAgain") return "请按主流程操作：一键开房或加入朋友，然后启动联机，最后检查连接。";
+            if (key == "clipboardCopyFailed") return "复制到剪贴板失败，请手动复制下面的内容:";
             if (key == "createRoom") return "创建房间";
             if (key == "copyInvite") return "复制邀请";
             if (key == "copyIp") return "复制我的 IP";
@@ -3557,9 +3703,18 @@ public class LocalAreaInterconnectionDesktop : Form
             if (key == "moreTools") return "More tools";
             if (key == "hideTools") return "Hide tools";
             if (key == "quickInviteCopied") return "Invite copied. Send it to your friend.";
+            if (key == "quickInviteCopyFailed") return "Room created, but automatic copy failed. Copy the Invite field manually and send it to your friend.";
             if (key == "quickNextHost") return "Next: click Start LAN, then create a LAN room in the game.";
             if (key == "quickJoinedNext") return "Invite decoded and room joined. Next: click Start LAN, then find the LAN room in the game.";
             if (key == "quickLanStarted") return "LAN components started. Try the game LAN room; click Check connection if it does not appear.";
+            if (key == "actionCouldNotFinish") return "This step did not finish.";
+            if (key == "technicalSummary") return "Short reason:";
+            if (key == "hostNeedsName") return "Fill Room name and Host first, then click Host room.";
+            if (key == "joinNeedsInvite") return "Paste your friend's invite into the Invite field first, then click Join friend.";
+            if (key == "startNeedsRoom") return "Host a room or paste an invite and join first, then click Start LAN.";
+            if (key == "copyInviteNeedsRoom") return "Click Host room first to generate an invite, then copy it for your friend.";
+            if (key == "tryMainFlowAgain") return "Use the main flow: Host room or Join friend, then Start LAN, then Check connection.";
+            if (key == "clipboardCopyFailed") return "Copy to clipboard failed. Copy the text below manually:";
             if (key == "createRoom") return "Create room";
             if (key == "copyInvite") return "Copy invite";
             if (key == "copyIp") return "Copy my IP";
