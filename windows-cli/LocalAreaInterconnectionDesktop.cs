@@ -12,6 +12,19 @@ using System.Windows.Forms;
 
 public class LocalAreaInterconnectionDesktop : Form
 {
+    static readonly Color ShellDark = Color.FromArgb(23, 23, 23);
+    static readonly Color TitleDark = Color.FromArgb(21, 21, 21);
+    static readonly Color SidebarDark = Color.FromArgb(26, 74, 85);
+    static readonly Color SidebarDeep = Color.FromArgb(35, 58, 78);
+    static readonly Color CardDark = Color.FromArgb(47, 47, 47);
+    static readonly Color CardBorder = Color.FromArgb(64, 64, 64);
+    static readonly Color FieldDark = Color.FromArgb(42, 42, 42);
+    static readonly Color TextBright = Color.FromArgb(244, 244, 244);
+    static readonly Color TextMuted = Color.FromArgb(176, 184, 186);
+    static readonly Color WeChatGreen = Color.FromArgb(39, 201, 145);
+    static readonly Color WeChatGreenHover = Color.FromArgb(52, 214, 157);
+    static readonly Color WeChatGreenDown = Color.FromArgb(24, 174, 121);
+
     enum ChromeGlyph
     {
         Minimize,
@@ -189,21 +202,21 @@ public class LocalAreaInterconnectionDesktop : Form
     {
         activeWindow = this;
         Text = "LocalAreaInterconnection";
-        Width = 980;
-        Height = 680;
+        Width = 1180;
+        Height = 720;
         StartPosition = FormStartPosition.CenterScreen;
         FormBorderStyle = FormBorderStyle.None;
-        MinimumSize = new Size(900, 620);
+        MinimumSize = new Size(980, 640);
         DoubleBuffered = true;
         SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.UserPaint | ControlStyles.OptimizedDoubleBuffer, true);
-        BackColor = Color.FromArgb(7, 22, 39);
+        BackColor = ShellDark;
         Font = new Font("Segoe UI", 9);
         Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath);
         language = LoadLanguage();
         chromeTips = new ToolTip();
-        chromeTips.BackColor = Color.FromArgb(14, 38, 58);
-        chromeTips.ForeColor = Color.FromArgb(232, 249, 255);
-        Resize += delegate { ApplyRoundedRegion(this, 12); };
+        chromeTips.BackColor = CardDark;
+        chromeTips.ForeColor = TextBright;
+        Resize += delegate { ApplyRoundedRegion(this, 14); };
 
         particles = new Particle[42];
         for (int i = 0; i < particles.Length; i++)
@@ -228,10 +241,10 @@ public class LocalAreaInterconnectionDesktop : Form
         rootLayout.BackColor = Color.Transparent;
         rootLayout.ColumnCount = 3;
         rootLayout.RowCount = 17;
-        rootLayout.Padding = new Padding(12);
-        rootLayout.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 180));
-        rootLayout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 54));
-        rootLayout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 46));
+        rootLayout.Padding = new Padding(20, 18, 20, 18);
+        rootLayout.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 230));
+        rootLayout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 57));
+        rootLayout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 43));
         for (int i = 0; i < 15; i++)
         {
             rootLayout.RowStyles.Add(new RowStyle(SizeType.Absolute, 36));
@@ -258,15 +271,15 @@ public class LocalAreaInterconnectionDesktop : Form
 
         actionsHost = new Panel();
         actionsHost.Dock = DockStyle.Fill;
-        actionsHost.BackColor = Color.FromArgb(13, 42, 64);
-        actionsHost.Padding = new Padding(8);
-        actionsHost.Margin = new Padding(12, 4, 0, 6);
+        actionsHost.BackColor = CardDark;
+        actionsHost.Padding = new Padding(10);
+        actionsHost.Margin = new Padding(14, 8, 0, 8);
         actionsHost.MouseWheel += ScrollActionsWheel;
-        actionsHost.Resize += delegate { ApplyRoundedRegion(actionsHost, 10); };
+        actionsHost.Resize += delegate { ApplyRoundedRegion(actionsHost, 12); };
 
         actionsViewport = new Panel();
         actionsViewport.Dock = DockStyle.Fill;
-        actionsViewport.BackColor = Color.FromArgb(13, 42, 64);
+        actionsViewport.BackColor = CardDark;
         actionsViewport.MouseWheel += ScrollActionsWheel;
         actionsViewport.Resize += delegate { AdjustActionLayout(); };
 
@@ -282,14 +295,14 @@ public class LocalAreaInterconnectionDesktop : Form
         actionScrollBar = new Panel();
         actionScrollBar.Dock = DockStyle.Right;
         actionScrollBar.Width = 10;
-        actionScrollBar.BackColor = Color.FromArgb(8, 28, 45);
+        actionScrollBar.BackColor = CardDark;
         actionScrollBar.MouseWheel += ScrollActionsWheel;
         actionScrollBar.Paint += PaintActionScrollBar;
 
         actionScrollThumb = new Panel();
         actionScrollThumb.Left = 2;
         actionScrollThumb.Width = 6;
-        actionScrollThumb.BackColor = Color.FromArgb(88, 168, 207);
+        actionScrollThumb.BackColor = Color.FromArgb(92, 92, 92);
         actionScrollThumb.Cursor = Cursors.Hand;
         actionScrollThumb.Resize += delegate { ApplyRoundedRegion(actionScrollThumb, 4); };
         actionScrollThumb.MouseDown += BeginActionScrollThumbDrag;
@@ -478,7 +491,7 @@ public class LocalAreaInterconnectionDesktop : Form
     {
         Panel bar = new Panel();
         bar.Dock = DockStyle.Fill;
-        bar.BackColor = Color.FromArgb(5, 18, 32);
+        bar.BackColor = TitleDark;
         bar.MouseDown += BeginDrag;
 
         PictureBox icon = new PictureBox();
@@ -493,7 +506,7 @@ public class LocalAreaInterconnectionDesktop : Form
 
         titleLabel = new Label();
         titleLabel.Text = "LocalAreaInterconnection";
-        titleLabel.ForeColor = Color.FromArgb(226, 248, 255);
+        titleLabel.ForeColor = TextBright;
         titleLabel.BackColor = Color.Transparent;
         titleLabel.AutoSize = true;
         titleLabel.Left = 40;
@@ -507,11 +520,11 @@ public class LocalAreaInterconnectionDesktop : Form
         languageButton.Top = 6;
         languageButton.FlatStyle = FlatStyle.Flat;
         languageButton.FlatAppearance.BorderSize = 1;
-        languageButton.FlatAppearance.BorderColor = Color.FromArgb(77, 150, 188);
-        languageButton.FlatAppearance.MouseOverBackColor = Color.FromArgb(24, 73, 104);
-        languageButton.FlatAppearance.MouseDownBackColor = Color.FromArgb(11, 42, 66);
-        languageButton.BackColor = Color.FromArgb(12, 36, 57);
-        languageButton.ForeColor = Color.FromArgb(232, 249, 255);
+        languageButton.FlatAppearance.BorderColor = Color.FromArgb(86, 86, 86);
+        languageButton.FlatAppearance.MouseOverBackColor = Color.FromArgb(56, 56, 56);
+        languageButton.FlatAppearance.MouseDownBackColor = Color.FromArgb(38, 38, 38);
+        languageButton.BackColor = Color.FromArgb(38, 38, 38);
+        languageButton.ForeColor = TextBright;
         languageButton.TextAlign = ContentAlignment.MiddleCenter;
         languageButton.TabStop = false;
         languageButton.UseVisualStyleBackColor = false;
@@ -553,12 +566,12 @@ public class LocalAreaInterconnectionDesktop : Form
         button.Height = 28;
         button.FlatStyle = FlatStyle.Flat;
         button.FlatAppearance.BorderSize = 0;
-        button.BackColor = Color.FromArgb(5, 18, 32);
-        button.ForeColor = Color.FromArgb(220, 244, 255);
+        button.BackColor = TitleDark;
+        button.ForeColor = Color.FromArgb(218, 218, 218);
         button.TabStop = false;
         button.UseVisualStyleBackColor = false;
-        button.FlatAppearance.MouseOverBackColor = Color.FromArgb(5, 18, 32);
-        button.FlatAppearance.MouseDownBackColor = Color.FromArgb(5, 18, 32);
+        button.FlatAppearance.MouseOverBackColor = TitleDark;
+        button.FlatAppearance.MouseDownBackColor = TitleDark;
         button.Click += delegate(object sender, EventArgs e)
         {
             RunUserAction(tipKey, handler, sender, e);
@@ -588,7 +601,7 @@ public class LocalAreaInterconnectionDesktop : Form
         using (SolidBrush background = new SolidBrush(button.BackColor))
         {
             e.Graphics.FillPath(background, path);
-            using (Pen border = new Pen(Color.FromArgb(77, 150, 188)))
+            using (Pen border = new Pen(Color.FromArgb(86, 86, 86)))
             {
                 e.Graphics.DrawPath(border, path);
             }
@@ -609,7 +622,7 @@ public class LocalAreaInterconnectionDesktop : Form
             new Point(button.Width - 9, button.Height / 2 - 2),
             new Point(button.Width - 13, button.Height / 2 + 3)
         };
-        using (SolidBrush brush = new SolidBrush(Color.FromArgb(167, 224, 255)))
+        using (SolidBrush brush = new SolidBrush(TextMuted))
         {
             e.Graphics.FillPolygon(brush, arrow);
         }
@@ -650,7 +663,7 @@ public class LocalAreaInterconnectionDesktop : Form
         bool hover = button.ClientRectangle.Contains(button.PointToClient(Cursor.Position));
         Color background = glyph == ChromeGlyph.Close && hover
             ? Color.FromArgb(184, 54, 54)
-            : hover ? Color.FromArgb(22, 65, 94) : Color.FromArgb(11, 32, 49);
+            : hover ? Color.FromArgb(48, 48, 48) : TitleDark;
         using (GraphicsPath path = RoundedRectPath(new Rectangle(0, 0, button.Width - 1, button.Height - 1), 8))
         using (SolidBrush brush = new SolidBrush(background))
         {
@@ -659,7 +672,7 @@ public class LocalAreaInterconnectionDesktop : Form
 
         Color glyphColor = glyph == ChromeGlyph.Close && hover
             ? Color.White
-            : Color.FromArgb(218, 242, 252);
+            : Color.FromArgb(218, 218, 218);
         using (Pen pen = new Pen(glyphColor, 1.9f))
         {
             pen.StartCap = LineCap.Round;
@@ -700,8 +713,10 @@ public class LocalAreaInterconnectionDesktop : Form
         label.AutoSize = true;
         label.Dock = DockStyle.Fill;
         label.TextAlign = System.Drawing.ContentAlignment.MiddleLeft;
-        label.ForeColor = Color.FromArgb(210, 238, 255);
+        label.ForeColor = Color.FromArgb(226, 238, 238);
         label.BackColor = Color.Transparent;
+        label.Font = new Font(Font.FontFamily, 9.5f, FontStyle.Regular);
+        label.Padding = new Padding(6, 0, 0, 0);
         labelControls[key] = label;
         return label;
     }
@@ -719,12 +734,12 @@ public class LocalAreaInterconnectionDesktop : Form
         button.Height = advanced ? 28 : 32;
         button.Margin = new Padding(0, 0, 8, 8);
         button.FlatStyle = FlatStyle.Flat;
-        button.BackColor = advanced ? Color.FromArgb(27, 78, 111) : Color.FromArgb(38, 112, 152);
-        button.ForeColor = Color.FromArgb(236, 250, 255);
+        button.BackColor = advanced ? Color.FromArgb(58, 58, 58) : WeChatGreen;
+        button.ForeColor = advanced ? Color.FromArgb(224, 224, 224) : Color.White;
         button.Font = new Font(Font, advanced ? FontStyle.Regular : FontStyle.Bold);
-        button.FlatAppearance.BorderColor = advanced ? Color.FromArgb(76, 151, 191) : Color.FromArgb(127, 218, 255);
-        button.FlatAppearance.MouseOverBackColor = advanced ? Color.FromArgb(41, 103, 140) : Color.FromArgb(54, 137, 180);
-        button.FlatAppearance.MouseDownBackColor = Color.FromArgb(21, 72, 110);
+        button.FlatAppearance.BorderColor = advanced ? Color.FromArgb(86, 86, 86) : WeChatGreen;
+        button.FlatAppearance.MouseOverBackColor = advanced ? Color.FromArgb(70, 70, 70) : WeChatGreenHover;
+        button.FlatAppearance.MouseDownBackColor = advanced ? Color.FromArgb(46, 46, 46) : WeChatGreenDown;
         button.Click += delegate(object sender, EventArgs e)
         {
             RunUserAction(key, handler, sender, e);
@@ -913,7 +928,7 @@ public class LocalAreaInterconnectionDesktop : Form
     void PaintActionScrollBar(object sender, PaintEventArgs e)
     {
         e.Graphics.Clear(actionScrollBar.BackColor);
-        using (Pen pen = new Pen(Color.FromArgb(26, 78, 108)))
+        using (Pen pen = new Pen(Color.FromArgb(76, 76, 76)))
         {
             e.Graphics.DrawLine(pen, actionScrollBar.Width / 2, 4, actionScrollBar.Width / 2, actionScrollBar.Height - 4);
         }
@@ -922,8 +937,8 @@ public class LocalAreaInterconnectionDesktop : Form
     void StyleTextBox(TextBox box)
     {
         box.BorderStyle = BorderStyle.FixedSingle;
-        box.BackColor = Color.FromArgb(14, 38, 58);
-        box.ForeColor = Color.FromArgb(232, 249, 255);
+        box.BackColor = FieldDark;
+        box.ForeColor = TextBright;
         box.BorderStyle = BorderStyle.None;
         box.Margin = new Padding(0);
     }
@@ -932,9 +947,10 @@ public class LocalAreaInterconnectionDesktop : Form
     {
         Panel panel = new Panel();
         panel.Dock = DockStyle.Fill;
-        panel.BackColor = Color.FromArgb(74, 130, 161);
+        panel.BackColor = CardBorder;
         panel.Padding = new Padding(1);
-        panel.Resize += delegate { ApplyRoundedRegion(panel, 8); };
+        panel.Margin = new Padding(0, 3, 10, 3);
+        panel.Resize += delegate { ApplyRoundedRegion(panel, 10); };
         control.Dock = DockStyle.Fill;
         panel.Controls.Add(control);
         return panel;
@@ -944,18 +960,18 @@ public class LocalAreaInterconnectionDesktop : Form
     {
         Panel outer = new Panel();
         outer.Dock = DockStyle.Fill;
-        outer.BackColor = Color.FromArgb(12, 34, 53);
+        outer.BackColor = CardBorder;
         outer.Padding = new Padding(1);
-        outer.Margin = new Padding(12, 0, 0, 8);
-        outer.Resize += delegate { ApplyRoundedRegion(outer, 10); };
+        outer.Margin = new Padding(14, 0, 0, 10);
+        outer.Resize += delegate { ApplyRoundedRegion(outer, 12); };
 
         TableLayoutPanel details = new TableLayoutPanel();
         details.Dock = DockStyle.Fill;
-        details.BackColor = Color.FromArgb(9, 27, 43);
+        details.BackColor = CardDark;
         details.ColumnCount = 1;
         details.RowCount = 6;
-        details.Padding = new Padding(12);
-        details.Resize += delegate { ApplyRoundedRegion(details, 8); };
+        details.Padding = new Padding(18, 14, 18, 14);
+        details.Resize += delegate { ApplyRoundedRegion(details, 12); };
         details.RowStyles.Add(new RowStyle(SizeType.Absolute, 32));
         details.RowStyles.Add(new RowStyle(SizeType.Percent, 16));
         details.RowStyles.Add(new RowStyle(SizeType.Percent, 18));
@@ -969,7 +985,7 @@ public class LocalAreaInterconnectionDesktop : Form
         header.Dock = DockStyle.Fill;
         header.TextAlign = ContentAlignment.MiddleLeft;
         header.Font = new Font(Font.FontFamily, 10, FontStyle.Bold);
-        header.ForeColor = Color.FromArgb(232, 249, 255);
+        header.ForeColor = TextBright;
         header.BackColor = Color.Transparent;
         labelControls["roomDetails"] = header;
         details.Controls.Add(header, 0, 0);
@@ -998,7 +1014,7 @@ public class LocalAreaInterconnectionDesktop : Form
         label.AutoEllipsis = true;
         label.UseMnemonic = false;
         label.TextAlign = ContentAlignment.MiddleLeft;
-        label.ForeColor = Color.FromArgb(210, 238, 255);
+        label.ForeColor = Color.FromArgb(216, 216, 216);
         label.BackColor = Color.Transparent;
         label.Padding = new Padding(0, 2, 0, 2);
         return label;
@@ -1006,23 +1022,17 @@ public class LocalAreaInterconnectionDesktop : Form
 
     protected override void OnPaintBackground(PaintEventArgs e)
     {
-        using (LinearGradientBrush background = new LinearGradientBrush(
-            ClientRectangle,
-            Color.FromArgb(6, 19, 35),
-            Color.FromArgb(21, 72, 103),
-            LinearGradientMode.ForwardDiagonal))
+        e.Graphics.Clear(ShellDark);
+        Rectangle sidebar = new Rectangle(0, 38, 275, Math.Max(0, Height - 38));
+        using (LinearGradientBrush sidebarBrush = new LinearGradientBrush(
+            sidebar,
+            SidebarDark,
+            SidebarDeep,
+            LinearGradientMode.Vertical))
         {
-            e.Graphics.FillRectangle(background, ClientRectangle);
-        }
-
-        using (GraphicsPath mistPath = new GraphicsPath())
-        {
-            mistPath.AddEllipse(-140, -80, Width + 260, Height / 2 + 120);
-            using (PathGradientBrush mist = new PathGradientBrush(mistPath))
+            if (sidebar.Width > 0 && sidebar.Height > 0)
             {
-                mist.CenterColor = Color.FromArgb(65, 126, 218, 255);
-                mist.SurroundColors = new Color[] { Color.FromArgb(0, 126, 218, 255) };
-                e.Graphics.FillPath(mist, mistPath);
+                e.Graphics.FillRectangle(sidebarBrush, sidebar);
             }
         }
     }
@@ -1031,7 +1041,6 @@ public class LocalAreaInterconnectionDesktop : Form
     {
         base.OnPaint(e);
         e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
-        DrawParticles(e.Graphics);
     }
 
     void DrawParticles(Graphics graphics)
