@@ -11,6 +11,13 @@ using System.Windows.Forms;
 
 public class LocalAreaInterconnectionDesktop : Form
 {
+    enum ChromeGlyph
+    {
+        Minimize,
+        Maximize,
+        Close
+    }
+
     TextBox roomName;
     TextBox hostName;
     TextBox subnet;
@@ -38,7 +45,7 @@ public class LocalAreaInterconnectionDesktop : Form
     Label broadcastSummary;
     Label memberSummary;
     Label nextActionSummary;
-    ComboBox languageSelect;
+    Button languageButton;
     ToolTip chromeTips;
     TableLayoutPanel rootLayout;
     FlowLayoutPanel actionsPanel;
@@ -64,6 +71,7 @@ public class LocalAreaInterconnectionDesktop : Form
         get
         {
             CreateParams cp = base.CreateParams;
+            cp.Style |= 0x00040000 | 0x00020000 | 0x00010000;
             cp.ExStyle |= 0x02000000;
             return cp;
         }
@@ -169,7 +177,7 @@ public class LocalAreaInterconnectionDesktop : Form
         {
             rootLayout.RowStyles.Add(new RowStyle(SizeType.Absolute, 36));
         }
-        rootLayout.RowStyles.Add(new RowStyle(SizeType.Absolute, 128));
+        rootLayout.RowStyles.Add(new RowStyle(SizeType.Absolute, 122));
         rootLayout.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
         shell.Controls.Add(rootLayout, 0, 1);
 
@@ -191,11 +199,13 @@ public class LocalAreaInterconnectionDesktop : Form
 
         actionsPanel = new FlowLayoutPanel();
         actionsPanel.Dock = DockStyle.Fill;
-        actionsPanel.BackColor = Color.Transparent;
-        actionsPanel.Padding = new Padding(0, 4, 0, 0);
-        actionsPanel.Margin = new Padding(0);
+        actionsPanel.BackColor = Color.FromArgb(18, 58, 86);
+        actionsPanel.Padding = new Padding(8, 8, 2, 8);
+        actionsPanel.Margin = new Padding(0, 4, 0, 6);
         actionsPanel.WrapContents = true;
-        actionsPanel.AutoScroll = false;
+        actionsPanel.AutoScroll = true;
+        actionsPanel.HorizontalScroll.Enabled = false;
+        actionsPanel.HorizontalScroll.Visible = false;
         rootLayout.Controls.Add(new Label(), 0, ActionRow);
         rootLayout.Controls.Add(actionsPanel, 1, ActionRow);
 
@@ -310,46 +320,47 @@ public class LocalAreaInterconnectionDesktop : Form
         titleLabel.MouseDown += BeginDrag;
         bar.Controls.Add(titleLabel);
 
-        languageSelect = new ComboBox();
-        languageSelect.DropDownStyle = ComboBoxStyle.DropDownList;
-        languageSelect.FlatStyle = FlatStyle.Flat;
-        languageSelect.DrawMode = DrawMode.OwnerDrawFixed;
-        languageSelect.Items.Add("English");
-        languageSelect.Items.Add("中文");
-        languageSelect.Width = 92;
-        languageSelect.Height = 24;
-        languageSelect.Top = 7;
-        languageSelect.BackColor = Color.FromArgb(14, 38, 58);
-        languageSelect.ForeColor = Color.FromArgb(232, 249, 255);
-        languageSelect.DrawItem += DrawLanguageItem;
-        languageSelect.SelectedIndex = language == "zh" ? 1 : 0;
-        languageSelect.SelectedIndexChanged += delegate
+        languageButton = new Button();
+        languageButton.Width = 92;
+        languageButton.Height = 26;
+        languageButton.Top = 6;
+        languageButton.FlatStyle = FlatStyle.Flat;
+        languageButton.FlatAppearance.BorderSize = 1;
+        languageButton.FlatAppearance.BorderColor = Color.FromArgb(77, 150, 188);
+        languageButton.FlatAppearance.MouseOverBackColor = Color.FromArgb(24, 73, 104);
+        languageButton.FlatAppearance.MouseDownBackColor = Color.FromArgb(11, 42, 66);
+        languageButton.BackColor = Color.FromArgb(12, 36, 57);
+        languageButton.ForeColor = Color.FromArgb(232, 249, 255);
+        languageButton.TextAlign = ContentAlignment.MiddleCenter;
+        languageButton.TabStop = false;
+        languageButton.UseVisualStyleBackColor = false;
+        languageButton.Paint += PaintLanguageButton;
+        languageButton.Click += delegate
         {
-            language = languageSelect.SelectedIndex == 1 ? "zh" : "en";
+            language = language == "zh" ? "en" : "zh";
             SaveLanguage();
             ApplyLanguage();
             UpdateRoomDetails("idle");
         };
-        bar.Controls.Add(languageSelect);
+        bar.Controls.Add(languageButton);
 
-        AddChromeButton(bar, "X", "closeTip", Width - 44, delegate { Close(); });
-        AddChromeButton(bar, "[]", "maximizeTip", Width - 88, delegate { WindowState = WindowState == FormWindowState.Maximized ? FormWindowState.Normal : FormWindowState.Maximized; });
-        AddChromeButton(bar, "-", "minimizeTip", Width - 132, delegate { WindowState = FormWindowState.Minimized; });
+        Button closeButton = AddChromeButton(bar, ChromeGlyph.Close, "closeTip", Width - 44, delegate { Close(); });
+        Button maximizeButton = AddChromeButton(bar, ChromeGlyph.Maximize, "maximizeTip", Width - 88, delegate { WindowState = WindowState == FormWindowState.Maximized ? FormWindowState.Normal : FormWindowState.Maximized; });
+        Button minimizeButton = AddChromeButton(bar, ChromeGlyph.Minimize, "minimizeTip", Width - 132, delegate { WindowState = FormWindowState.Minimized; });
         bar.Resize += delegate
         {
-            languageSelect.Left = bar.Width - 236;
-            bar.Controls[3].Left = bar.Width - 44;
-            bar.Controls[4].Left = bar.Width - 88;
-            bar.Controls[5].Left = bar.Width - 132;
+            languageButton.Left = bar.Width - 238;
+            closeButton.Left = bar.Width - 44;
+            maximizeButton.Left = bar.Width - 88;
+            minimizeButton.Left = bar.Width - 132;
         };
-        languageSelect.Left = bar.Width - 236;
+        languageButton.Left = bar.Width - 238;
         return bar;
     }
 
-    void AddChromeButton(Panel bar, string text, string tipKey, int left, EventHandler handler)
+    Button AddChromeButton(Panel bar, ChromeGlyph glyph, string tipKey, int left, EventHandler handler)
     {
         Button button = new Button();
-        button.Text = text;
         button.Left = left;
         button.Top = 0;
         button.Width = 44;
@@ -358,10 +369,19 @@ public class LocalAreaInterconnectionDesktop : Form
         button.FlatAppearance.BorderSize = 0;
         button.BackColor = Color.FromArgb(5, 18, 32);
         button.ForeColor = Color.FromArgb(220, 244, 255);
+        button.TabStop = false;
+        button.UseVisualStyleBackColor = false;
+        button.FlatAppearance.MouseOverBackColor = glyph == ChromeGlyph.Close ? Color.FromArgb(184, 54, 54) : Color.FromArgb(22, 65, 94);
+        button.FlatAppearance.MouseDownBackColor = glyph == ChromeGlyph.Close ? Color.FromArgb(138, 36, 36) : Color.FromArgb(12, 43, 65);
         button.Click += handler;
+        button.Paint += delegate(object sender, PaintEventArgs e)
+        {
+            PaintChromeGlyph((Button)sender, e, glyph);
+        };
         chromeTips.SetToolTip(button, T(tipKey));
         button.Tag = tipKey;
         bar.Controls.Add(button);
+        return button;
     }
 
     void BeginDrag(object sender, MouseEventArgs e)
@@ -371,19 +391,73 @@ public class LocalAreaInterconnectionDesktop : Form
         Native.SendMessage(Handle, 0xA1, new IntPtr(0x2), IntPtr.Zero);
     }
 
-    void DrawLanguageItem(object sender, DrawItemEventArgs e)
+    void PaintLanguageButton(object sender, PaintEventArgs e)
     {
-        e.DrawBackground();
-        bool selected = (e.State & DrawItemState.Selected) == DrawItemState.Selected;
-        using (SolidBrush background = new SolidBrush(selected ? Color.FromArgb(42, 112, 150) : Color.FromArgb(14, 38, 58)))
+        Button button = (Button)sender;
+        e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
+        using (SolidBrush background = new SolidBrush(button.BackColor))
         {
-            e.Graphics.FillRectangle(background, e.Bounds);
+            e.Graphics.FillRectangle(background, button.ClientRectangle);
         }
-        if (e.Index >= 0)
+        using (Pen border = new Pen(Color.FromArgb(77, 150, 188)))
         {
-            using (SolidBrush text = new SolidBrush(Color.FromArgb(232, 249, 255)))
+            e.Graphics.DrawRectangle(border, 0, 0, button.Width - 1, button.Height - 1);
+        }
+
+        string text = language == "zh" ? "中文" : "English";
+        TextRenderer.DrawText(
+            e.Graphics,
+            text,
+            Font,
+            new Rectangle(8, 1, button.Width - 24, button.Height - 2),
+            button.ForeColor,
+            TextFormatFlags.VerticalCenter | TextFormatFlags.Left | TextFormatFlags.EndEllipsis);
+
+        Point[] arrow = new Point[]
+        {
+            new Point(button.Width - 17, button.Height / 2 - 2),
+            new Point(button.Width - 9, button.Height / 2 - 2),
+            new Point(button.Width - 13, button.Height / 2 + 3)
+        };
+        using (SolidBrush brush = new SolidBrush(Color.FromArgb(167, 224, 255)))
+        {
+            e.Graphics.FillPolygon(brush, arrow);
+        }
+    }
+
+    void PaintChromeGlyph(Button button, PaintEventArgs e, ChromeGlyph glyph)
+    {
+        e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
+        bool hover = button.ClientRectangle.Contains(button.PointToClient(Cursor.Position));
+        Color background = glyph == ChromeGlyph.Close && hover
+            ? Color.FromArgb(184, 54, 54)
+            : hover ? Color.FromArgb(22, 65, 94) : Color.FromArgb(5, 18, 32);
+        using (SolidBrush brush = new SolidBrush(background))
+        {
+            e.Graphics.FillRectangle(brush, button.ClientRectangle);
+        }
+
+        Color glyphColor = glyph == ChromeGlyph.Close && hover
+            ? Color.White
+            : Color.FromArgb(218, 242, 252);
+        using (Pen pen = new Pen(glyphColor, 1.7f))
+        {
+            pen.StartCap = LineCap.Round;
+            pen.EndCap = LineCap.Round;
+            int centerX = button.Width / 2;
+            int centerY = button.Height / 2;
+            if (glyph == ChromeGlyph.Minimize)
             {
-                e.Graphics.DrawString(languageSelect.Items[e.Index].ToString(), Font, text, e.Bounds.Left + 6, e.Bounds.Top + 2);
+                e.Graphics.DrawLine(pen, centerX - 6, centerY + 5, centerX + 6, centerY + 5);
+            }
+            else if (glyph == ChromeGlyph.Maximize)
+            {
+                e.Graphics.DrawRectangle(pen, centerX - 6, centerY - 6, 12, 12);
+            }
+            else
+            {
+                e.Graphics.DrawLine(pen, centerX - 6, centerY - 6, centerX + 6, centerY + 6);
+                e.Graphics.DrawLine(pen, centerX + 6, centerY - 6, centerX - 6, centerY + 6);
             }
         }
     }
@@ -433,7 +507,7 @@ public class LocalAreaInterconnectionDesktop : Form
     void AdjustActionLayout()
     {
         if (actionsPanel == null || rootLayout == null) return;
-        int available = Math.Max(300, actionsPanel.ClientSize.Width - 8);
+        int available = Math.Max(300, actionsPanel.ClientSize.Width - 22);
         int columns = Math.Max(3, Math.Min(6, available / 138));
         int width = Math.Max(112, (available / columns) - 8);
         foreach (Control control in actionsPanel.Controls)
@@ -441,8 +515,7 @@ public class LocalAreaInterconnectionDesktop : Form
             control.Width = width;
             control.Height = 30;
         }
-        int rows = (int)Math.Ceiling(actionsPanel.Controls.Count / (double)columns);
-        rootLayout.RowStyles[ActionRow].Height = Math.Max(78, rows * 38 + 12);
+        rootLayout.RowStyles[ActionRow].Height = Math.Max(116, Math.Min(148, ClientSize.Height / 5));
     }
 
     void StyleTextBox(TextBox box)
@@ -2864,6 +2937,7 @@ public class LocalAreaInterconnectionDesktop : Form
     {
         Text = T("appTitle");
         if (titleLabel != null) titleLabel.Text = T("appTitle");
+        if (languageButton != null) languageButton.Invalidate();
         foreach (KeyValuePair<string, Label> item in labelControls)
         {
             item.Value.Text = T(item.Key);
