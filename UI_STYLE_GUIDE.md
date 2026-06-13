@@ -10,6 +10,7 @@ This project currently uses a compact native Windows desktop shell with a dark b
 - Keep dense tool actions grouped on the right side below room details. The left side should remain focused on editable room/network fields.
 - When a section needs scrolling, use an in-theme dark track and cyan thumb, or another custom treatment that matches the existing title bar and input frames.
 - Window chrome should remain custom-painted: dark title bar, compact language switcher, and line-based minimize/maximize/close icons.
+- Use rounded corners throughout the desktop shell: the borderless window, input frames, action buttons, room detail panels, and custom scroll thumbs should all use soft rounded geometry while keeping the compact layout.
 
 ## Current Layout Notes
 

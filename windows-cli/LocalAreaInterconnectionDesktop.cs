@@ -89,7 +89,6 @@ public class LocalAreaInterconnectionDesktop : Form
     {
         const int wmNcCalcSize = 0x83;
         const int wmNcHitTest = 0x84;
-        const int htClient = 1;
         const int htLeft = 10;
         const int htRight = 11;
         const int htTop = 12;
@@ -105,27 +104,27 @@ public class LocalAreaInterconnectionDesktop : Form
             return;
         }
 
-        base.WndProc(ref m);
-        if (m.Msg != wmNcHitTest || (int)m.Result != htClient || WindowState == FormWindowState.Maximized)
+        if (m.Msg == wmNcHitTest && WindowState != FormWindowState.Maximized)
         {
-            return;
+            Point cursor = PointToClient(new Point(SignedLowWord(m.LParam), SignedHighWord(m.LParam)));
+            int grip = 10;
+            bool inside = cursor.X >= 0 && cursor.Y >= 0 && cursor.X <= ClientSize.Width && cursor.Y <= ClientSize.Height;
+            bool left = cursor.X <= grip;
+            bool right = cursor.X >= ClientSize.Width - grip;
+            bool top = cursor.Y <= grip;
+            bool bottom = cursor.Y >= ClientSize.Height - grip;
+
+            if (inside && left && top) { m.Result = new IntPtr(htTopLeft); return; }
+            if (inside && right && top) { m.Result = new IntPtr(htTopRight); return; }
+            if (inside && left && bottom) { m.Result = new IntPtr(htBottomLeft); return; }
+            if (inside && right && bottom) { m.Result = new IntPtr(htBottomRight); return; }
+            if (inside && left) { m.Result = new IntPtr(htLeft); return; }
+            if (inside && right) { m.Result = new IntPtr(htRight); return; }
+            if (inside && top) { m.Result = new IntPtr(htTop); return; }
+            if (inside && bottom) { m.Result = new IntPtr(htBottom); return; }
         }
 
-        Point cursor = PointToClient(new Point(SignedLowWord(m.LParam), SignedHighWord(m.LParam)));
-        int grip = 8;
-        bool left = cursor.X <= grip;
-        bool right = cursor.X >= ClientSize.Width - grip;
-        bool top = cursor.Y <= grip;
-        bool bottom = cursor.Y >= ClientSize.Height - grip;
-
-        if (left && top) m.Result = new IntPtr(htTopLeft);
-        else if (right && top) m.Result = new IntPtr(htTopRight);
-        else if (left && bottom) m.Result = new IntPtr(htBottomLeft);
-        else if (right && bottom) m.Result = new IntPtr(htBottomRight);
-        else if (left) m.Result = new IntPtr(htLeft);
-        else if (right) m.Result = new IntPtr(htRight);
-        else if (top) m.Result = new IntPtr(htTop);
-        else if (bottom) m.Result = new IntPtr(htBottom);
+        base.WndProc(ref m);
     }
 
     static int SignedLowWord(IntPtr value)
@@ -161,6 +160,7 @@ public class LocalAreaInterconnectionDesktop : Form
         chromeTips = new ToolTip();
         chromeTips.BackColor = Color.FromArgb(14, 38, 58);
         chromeTips.ForeColor = Color.FromArgb(232, 249, 255);
+        Resize += delegate { ApplyRoundedRegion(this, 12); };
 
         particles = new Particle[42];
         for (int i = 0; i < particles.Length; i++)
@@ -218,6 +218,7 @@ public class LocalAreaInterconnectionDesktop : Form
         actionsHost.Padding = new Padding(8);
         actionsHost.Margin = new Padding(12, 4, 0, 6);
         actionsHost.MouseWheel += ScrollActionsWheel;
+        actionsHost.Resize += delegate { ApplyRoundedRegion(actionsHost, 10); };
 
         actionsViewport = new Panel();
         actionsViewport.Dock = DockStyle.Fill;
@@ -246,6 +247,7 @@ public class LocalAreaInterconnectionDesktop : Form
         actionScrollThumb.Width = 6;
         actionScrollThumb.BackColor = Color.FromArgb(88, 168, 207);
         actionScrollThumb.Cursor = Cursors.Hand;
+        actionScrollThumb.Resize += delegate { ApplyRoundedRegion(actionScrollThumb, 4); };
         actionScrollThumb.MouseDown += BeginActionScrollThumbDrag;
         actionScrollThumb.MouseMove += DragActionScrollThumb;
         actionScrollThumb.MouseUp += EndActionScrollThumbDrag;
@@ -373,6 +375,7 @@ public class LocalAreaInterconnectionDesktop : Form
         languageButton.TextAlign = ContentAlignment.MiddleCenter;
         languageButton.TabStop = false;
         languageButton.UseVisualStyleBackColor = false;
+        languageButton.Resize += delegate { ApplyRoundedRegion(languageButton, 6); };
         languageButton.Paint += PaintLanguageButton;
         languageButton.Click += delegate
         {
@@ -382,6 +385,7 @@ public class LocalAreaInterconnectionDesktop : Form
             UpdateRoomDetails("idle");
         };
         bar.Controls.Add(languageButton);
+        ApplyRoundedRegion(languageButton, 6);
 
         Button closeButton = AddChromeButton(bar, ChromeGlyph.Close, "closeTip", Width - 44, delegate { Close(); });
         Button maximizeButton = AddChromeButton(bar, ChromeGlyph.Maximize, "maximizeTip", Width - 88, delegate { WindowState = WindowState == FormWindowState.Maximized ? FormWindowState.Normal : FormWindowState.Maximized; });
@@ -410,6 +414,7 @@ public class LocalAreaInterconnectionDesktop : Form
         button.ForeColor = Color.FromArgb(220, 244, 255);
         button.TabStop = false;
         button.UseVisualStyleBackColor = false;
+        button.Resize += delegate { ApplyRoundedRegion(button, 6); };
         button.FlatAppearance.MouseOverBackColor = glyph == ChromeGlyph.Close ? Color.FromArgb(184, 54, 54) : Color.FromArgb(22, 65, 94);
         button.FlatAppearance.MouseDownBackColor = glyph == ChromeGlyph.Close ? Color.FromArgb(138, 36, 36) : Color.FromArgb(12, 43, 65);
         button.Click += handler;
@@ -420,6 +425,7 @@ public class LocalAreaInterconnectionDesktop : Form
         chromeTips.SetToolTip(button, T(tipKey));
         button.Tag = tipKey;
         bar.Controls.Add(button);
+        ApplyRoundedRegion(button, 6);
         return button;
     }
 
@@ -434,13 +440,14 @@ public class LocalAreaInterconnectionDesktop : Form
     {
         Button button = (Button)sender;
         e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
+        using (GraphicsPath path = RoundedRectPath(new Rectangle(0, 0, button.Width - 1, button.Height - 1), 6))
         using (SolidBrush background = new SolidBrush(button.BackColor))
         {
-            e.Graphics.FillRectangle(background, button.ClientRectangle);
-        }
-        using (Pen border = new Pen(Color.FromArgb(77, 150, 188)))
-        {
-            e.Graphics.DrawRectangle(border, 0, 0, button.Width - 1, button.Height - 1);
+            e.Graphics.FillPath(background, path);
+            using (Pen border = new Pen(Color.FromArgb(77, 150, 188)))
+            {
+                e.Graphics.DrawPath(border, path);
+            }
         }
 
         string text = language == "zh" ? "中文" : "English";
@@ -462,6 +469,35 @@ public class LocalAreaInterconnectionDesktop : Form
         {
             e.Graphics.FillPolygon(brush, arrow);
         }
+    }
+
+    void ApplyRoundedRegion(Control control, int radius)
+    {
+        if (control == null || control.Width <= 0 || control.Height <= 0) return;
+        if (control.Region != null)
+        {
+            control.Region.Dispose();
+        }
+        using (GraphicsPath path = RoundedRectPath(new Rectangle(0, 0, control.Width, control.Height), radius))
+        {
+            control.Region = new Region(path);
+        }
+    }
+
+    GraphicsPath RoundedRectPath(Rectangle bounds, int radius)
+    {
+        int diameter = Math.Max(1, radius * 2);
+        GraphicsPath path = new GraphicsPath();
+        Rectangle arc = new Rectangle(bounds.Left, bounds.Top, diameter, diameter);
+        path.AddArc(arc, 180, 90);
+        arc.X = bounds.Right - diameter;
+        path.AddArc(arc, 270, 90);
+        arc.Y = bounds.Bottom - diameter;
+        path.AddArc(arc, 0, 90);
+        arc.X = bounds.Left;
+        path.AddArc(arc, 90, 90);
+        path.CloseFigure();
+        return path;
     }
 
     void PaintChromeGlyph(Button button, PaintEventArgs e, ChromeGlyph glyph)
@@ -540,6 +576,8 @@ public class LocalAreaInterconnectionDesktop : Form
         button.FlatAppearance.MouseDownBackColor = Color.FromArgb(21, 72, 110);
         button.Click += handler;
         button.MouseWheel += ScrollActionsWheel;
+        button.Resize += delegate { ApplyRoundedRegion(button, 8); };
+        ApplyRoundedRegion(button, 8);
         buttonControls[key] = button;
         panel.Controls.Add(button);
     }
@@ -630,6 +668,7 @@ public class LocalAreaInterconnectionDesktop : Form
         int travel = Math.Max(1, trackHeight - thumbHeight);
         int thumbTop = 2 + (actionScrollOffset * travel / maxOffset);
         actionScrollThumb.SetBounds(2, thumbTop, Math.Max(4, actionScrollBar.Width - 4), thumbHeight);
+        ApplyRoundedRegion(actionScrollThumb, 4);
         actionScrollBar.Invalidate();
     }
 
@@ -657,6 +696,7 @@ public class LocalAreaInterconnectionDesktop : Form
         panel.Dock = DockStyle.Fill;
         panel.BackColor = Color.FromArgb(74, 130, 161);
         panel.Padding = new Padding(1);
+        panel.Resize += delegate { ApplyRoundedRegion(panel, 8); };
         control.Dock = DockStyle.Fill;
         panel.Controls.Add(control);
         return panel;
@@ -669,6 +709,7 @@ public class LocalAreaInterconnectionDesktop : Form
         outer.BackColor = Color.FromArgb(12, 34, 53);
         outer.Padding = new Padding(1);
         outer.Margin = new Padding(12, 0, 0, 8);
+        outer.Resize += delegate { ApplyRoundedRegion(outer, 10); };
 
         TableLayoutPanel details = new TableLayoutPanel();
         details.Dock = DockStyle.Fill;
@@ -676,6 +717,7 @@ public class LocalAreaInterconnectionDesktop : Form
         details.ColumnCount = 1;
         details.RowCount = 6;
         details.Padding = new Padding(12);
+        details.Resize += delegate { ApplyRoundedRegion(details, 8); };
         details.RowStyles.Add(new RowStyle(SizeType.Absolute, 32));
         details.RowStyles.Add(new RowStyle(SizeType.Percent, 16));
         details.RowStyles.Add(new RowStyle(SizeType.Percent, 18));
