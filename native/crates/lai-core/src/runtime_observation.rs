@@ -1,5 +1,6 @@
 use crate::network_observation::{
-    AdapterObservation, NetworkObservationSnapshot, PacketObservation, TunnelObservation,
+    AdapterObservation, NetworkObservationSnapshot, PacketObservation, RuntimePeerObservation,
+    TunnelObservation,
 };
 use serde::{Deserialize, Serialize};
 use std::net::Ipv4Addr;
@@ -80,6 +81,32 @@ pub fn network_snapshot_from_runtime(
         expected_peer_count,
         expected_broadcast_ports,
         expected_game_ports,
+        route_observations: Vec::new(),
+        runtime_peers: Vec::new(),
+    }
+}
+
+pub fn network_snapshot_from_runtime_with_peers(
+    adapter: Option<AdapterObservation>,
+    tunnel: Option<TunnelServiceSnapshot>,
+    captures: &[PacketCaptureSummary],
+    runtime_peers: Vec<RuntimePeerObservation>,
+    expected_peer_count: u16,
+    expected_broadcast_ports: Vec<u16>,
+    expected_game_ports: Vec<u16>,
+) -> NetworkObservationSnapshot {
+    NetworkObservationSnapshot {
+        adapter,
+        tunnel: tunnel.as_ref().map(tunnel_observation_from_service),
+        packets: captures
+            .iter()
+            .map(packet_observation_from_capture_summary)
+            .collect(),
+        expected_peer_count,
+        expected_broadcast_ports,
+        expected_game_ports,
+        route_observations: Vec::new(),
+        runtime_peers,
     }
 }
 

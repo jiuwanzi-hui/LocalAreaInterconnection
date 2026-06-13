@@ -177,8 +177,8 @@ public class LocalAreaInterconnectionDesktop : Form
         hostName = AddField(rootLayout, 1, "host", "Alice");
         subnet = AddField(rootLayout, 2, "virtualSubnet", "10.77.12.0/24");
         ip = AddField(rootLayout, 3, "myVirtualIp", "10.77.12.2");
-        gameName = AddField(rootLayout, 4, "gameName", "Example Game");
-        gameCatalog = AddField(rootLayout, 5, "gameCatalog", "");
+        gameName = AddField(rootLayout, 4, "gameName", "Generic UDP Broadcast LAN Game");
+        gameCatalog = AddField(rootLayout, 5, "gameCatalog", DefaultGameCatalogPath());
         ports = AddField(rootLayout, 6, "gamePorts", "27015");
         observed = AddField(rootLayout, 7, "observedRules", "udp:27015");
         netshOutput = AddField(rootLayout, 8, "netshOutputFile", "");
@@ -204,28 +204,38 @@ public class LocalAreaInterconnectionDesktop : Form
         AddButton(actionsPanel, "copyIp", delegate { CopyVirtualIp(); });
         AddButton(actionsPanel, "decodeInvite", delegate { DecodeInvite(); });
         AddButton(actionsPanel, "joinRoom", delegate { JoinRoom(); });
-        AddButton(actionsPanel, "adapterPlan", delegate { RunCli("adapter-plan --subnet " + subnet.Text + " --ip " + ip.Text); });
-        AddButton(actionsPanel, "adapterScan", delegate { RunCli("adapter-scan --adapter-name LocalAreaInterconnection --subnet " + subnet.Text + " --ip " + ip.Text); });
+        AddButton(actionsPanel, "adapterPlan", delegate { RunNativeCli("adapter-plan --adapter-name LocalAreaInterconnection --subnet " + subnet.Text + " --ip " + ip.Text); });
+        AddButton(actionsPanel, "adapterScan", delegate { RunNativeAdapterEnsure(); });
         AddButton(actionsPanel, "nativeAdapterEnsure", delegate { RunNativeAdapterEnsure(); });
-        AddButton(actionsPanel, "gamePlan", delegate { RunCli("game-plan --game-name " + Quote(gameName.Text) + " --subnet " + subnet.Text + " --ports " + ports.Text); });
+        AddButton(actionsPanel, "gamePlan", delegate { RunNativeCli("game-plan --game-name " + Quote(gameName.Text) + " --subnet " + subnet.Text + " --ports " + ports.Text); });
+        AddButton(actionsPanel, "gameProfileList", delegate { RunGameProfileList(); });
         AddButton(actionsPanel, "gameProfilePlan", delegate { RunGameProfilePlan(); });
-        AddButton(actionsPanel, "firewallPlan", delegate { RunCli("firewall-plan --game-name " + Quote(gameName.Text) + " --subnet " + subnet.Text + " --ports " + ports.Text); });
-        AddButton(actionsPanel, "firewallDiagnose", delegate { RunCli(FirewallDiagnoseArgs()); });
-        AddButton(actionsPanel, "firewallScan", delegate { RunCli("firewall-scan --game-name " + Quote(gameName.Text) + " --subnet " + subnet.Text + " --ports " + ports.Text); });
-        AddButton(actionsPanel, "generalDiagnose", delegate { RunCli("diagnose --virtual-adapter ok --firewall allowed --p2p ok --broadcast missing --game-traffic missing"); });
+        AddButton(actionsPanel, "gamePortScan", delegate { RunGamePortScan(); });
+        AddButton(actionsPanel, "gameReadinessCheck", delegate { RunGameReadinessCheck(); });
+        AddButton(actionsPanel, "firewallPlan", delegate { RunNativeCli("firewall-plan --game-name " + Quote(gameName.Text) + GameCatalogArgs() + " --subnet " + subnet.Text + " --ports " + ports.Text); });
+        AddButton(actionsPanel, "firewallDiagnose", delegate { RunNativeCli(FirewallDiagnoseArgs()); });
+        AddButton(actionsPanel, "firewallScan", delegate { RunNativeCli(FirewallDiagnoseArgs()); });
+        AddButton(actionsPanel, "generalDiagnose", delegate { RunNativeCli("diagnose --p2p ok --firewall allowed"); });
         AddButton(actionsPanel, "networkDiagnose", delegate { RunNetworkDiagnose(); });
         AddButton(actionsPanel, "exportDiagnostics", delegate { ExportDiagnostics(); });
         AddButton(actionsPanel, "udpTest", delegate { RunUdpTest(); });
         AddButton(actionsPanel, "broadcastTest", delegate { RunBroadcastTest(); });
         AddButton(actionsPanel, "nativeRuntimeSelfTest", delegate { RunNativeRuntimeSelfTest(); });
+        AddButton(actionsPanel, "wintunDetect", delegate { RunWintunDetect(); });
+        AddButton(actionsPanel, "wintunProbe", delegate { RunWintunSessionProbe(); });
         AddButton(actionsPanel, "nativeOffer", delegate { RunNativeOffer(); });
         AddButton(actionsPanel, "startCoordination", delegate { StartLocalCoordinationServer(); });
         AddButton(actionsPanel, "stopCoordination", delegate { StopLocalCoordinationServer(); });
         AddButton(actionsPanel, "startRuntime", delegate { StartNativeRuntime(); });
         AddButton(actionsPanel, "stopRuntime", delegate { StopNativeRuntime(); });
+        AddButton(actionsPanel, "runtimeCleanupPlan", delegate { RunRuntimeCleanupPlan(); });
+        AddButton(actionsPanel, "runtimeCleanupApply", delegate { RunRuntimeCleanupApply(); });
+        AddButton(actionsPanel, "routeScan", delegate { RunRouteScan(); });
         AddButton(actionsPanel, "closeRoom", delegate { CloseCoordinationRoom(); });
         AddButton(actionsPanel, "kickPeer", delegate { KickCoordinationPeer(); });
         AddButton(actionsPanel, "nativeNatSelfTest", delegate { RunNativeNatSelfTest(); });
+        AddButton(actionsPanel, "relayFallbackPlan", delegate { RunRelayFallbackPlan(); });
+        AddButton(actionsPanel, "connectionPathPlan", delegate { RunConnectionPathPlan(); });
         AddButton(actionsPanel, "tcpTest", delegate { RunTcpTest(); });
         AddButton(actionsPanel, "browseGameCatalog", delegate { BrowseGameCatalog(); });
         AddButton(actionsPanel, "browseNetsh", delegate { BrowseNetshOutput(); });
@@ -470,10 +480,11 @@ public class LocalAreaInterconnectionDesktop : Form
         details.RowCount = 6;
         details.Padding = new Padding(12);
         details.RowStyles.Add(new RowStyle(SizeType.Absolute, 32));
-        for (int i = 1; i < 6; i++)
-        {
-            details.RowStyles.Add(new RowStyle(SizeType.Percent, 20));
-        }
+        details.RowStyles.Add(new RowStyle(SizeType.Percent, 16));
+        details.RowStyles.Add(new RowStyle(SizeType.Percent, 18));
+        details.RowStyles.Add(new RowStyle(SizeType.Percent, 14));
+        details.RowStyles.Add(new RowStyle(SizeType.Percent, 34));
+        details.RowStyles.Add(new RowStyle(SizeType.Percent, 18));
 
         Label header = new Label();
         header.Name = "roomDetailsHeader";
@@ -491,6 +502,8 @@ public class LocalAreaInterconnectionDesktop : Form
         broadcastSummary = DetailLabel();
         memberSummary = DetailLabel();
         nextActionSummary = DetailLabel();
+        memberSummary.AutoEllipsis = false;
+        memberSummary.TextAlign = ContentAlignment.TopLeft;
         details.Controls.Add(roomSummary, 0, 1);
         details.Controls.Add(connectionSummary, 0, 2);
         details.Controls.Add(broadcastSummary, 0, 3);
@@ -506,6 +519,7 @@ public class LocalAreaInterconnectionDesktop : Form
         Label label = new Label();
         label.Dock = DockStyle.Fill;
         label.AutoEllipsis = true;
+        label.UseMnemonic = false;
         label.TextAlign = ContentAlignment.MiddleLeft;
         label.ForeColor = Color.FromArgb(210, 238, 255);
         label.BackColor = Color.Transparent;
@@ -656,14 +670,25 @@ public class LocalAreaInterconnectionDesktop : Form
 
     void RunNetworkDiagnose()
     {
-        RunNetworkDiagnoseAndReturn();
+        string network = RunNetworkDiagnoseAndReturn();
+        string readiness = RunGameReadinessFromNetworkReport(network);
+        if (readiness.Length > 0)
+        {
+            output.Text = network
+                + Environment.NewLine
+                + Environment.NewLine
+                + T("gameReadiness")
+                + Environment.NewLine
+                + readiness;
+        }
     }
 
     string RunNetworkDiagnoseAndReturn()
     {
-        string text = RunCli("network-observe --adapter-name LocalAreaInterconnection --expected-ip " + ip.Text
+        string text = RunNativeCli("network-observe --adapter-name LocalAreaInterconnection --expected-ip " + ip.Text
             + " --subnet " + subnet.Text
             + " --adapter-scan true"
+            + " --route-scan true"
             + PingArgs()
             + PacketObservationArgs()
             + " --broadcast-ports " + ports.Text
@@ -694,10 +719,14 @@ public class LocalAreaInterconnectionDesktop : Form
                 + " --broadcast-ports " + ports.Text
                 + " --game-ports " + ports.Text
                 + " --game-name " + Quote(gameName.Text)
+                + GameCatalogArgs()
                 + " --ports " + ports.Text
                 + " --packet-io-backend wintun"
+                + " --route-scan true"
+                + " --netstat-scan true"
+                + RelayExportArgs()
                 + NetshExportArgs());
-            UpdateRoomDetails("exported");
+            UpdateRoomDetailsFromDiagnosticBundle(dialog.FileName);
         }
     }
 
@@ -726,6 +755,71 @@ public class LocalAreaInterconnectionDesktop : Form
         }
         string text = RunNativeCli(args);
         UpdateFromGameProfilePlan(text);
+    }
+
+    void RunGameProfileList()
+    {
+        string catalog = gameCatalog.Text.Trim();
+        if (catalog.Length == 0)
+        {
+            output.Text = T("missingGameCatalog");
+            return;
+        }
+        string query = gameName.Text.Trim();
+        string args = "game-profile-list"
+            + " --catalog " + Quote(catalog);
+        if (query.Length > 0)
+        {
+            args += " --query " + Quote(query);
+        }
+        string text = RunNativeCli(args);
+        UpdateFromGameProfileList(text);
+    }
+
+    void RunGamePortScan()
+    {
+        string text = RunNativeCli("game-port-scan"
+            + " --netstat-scan true"
+            + " --game-name " + Quote(gameName.Text)
+            + GameCatalogArgs()
+            + " --ports " + ports.Text);
+        UpdateRoomDetailsFromGamePortScan(text);
+    }
+
+    void RunGameReadinessCheck()
+    {
+        string network = RunNetworkDiagnoseAndReturn();
+        string text = RunGameReadinessFromNetworkReport(network);
+        if (text.Length > 0)
+        {
+            output.Text = text;
+        }
+    }
+
+    string RunGameReadinessFromNetworkReport(string network)
+    {
+        if (network.Trim().Length == 0)
+        {
+            return "";
+        }
+        string networkPath = Path.Combine(AppDataDirectory(), "game-readiness-network.json");
+        File.WriteAllText(networkPath, network, Encoding.UTF8);
+        string text = RunNativeCliCapture("game-readiness"
+            + " --network-report " + Quote(networkPath)
+            + " --game-name " + Quote(gameName.Text)
+            + GameCatalogArgs()
+            + " --subnet " + subnet.Text
+            + " --discovery manual_ports"
+            + " --ports " + ports.Text
+            + FirewallReadinessArgs()
+            + " --netstat-scan true"
+            + " --local-ip " + ip.Text
+            + RelayExportArgs());
+        if (JsonStringValue(text, "status").Length > 0)
+        {
+            UpdateRoomDetailsFromGameReadiness(text);
+        }
+        return text;
     }
 
     void RunUdpTest()
@@ -782,6 +876,18 @@ public class LocalAreaInterconnectionDesktop : Form
         output.Text = nativeOutput + Environment.NewLine + Environment.NewLine + T("autoNetworkDiagnose") + Environment.NewLine + diagnosticOutput;
     }
 
+    void RunWintunDetect()
+    {
+        string text = RunNativeCli("wintun-detect");
+        UpdateRoomDetailsFromWintunReport(text);
+    }
+
+    void RunWintunSessionProbe()
+    {
+        string text = RunNativeCli("wintun-session-probe --adapter-name LocalAreaInterconnection --tunnel-type LocalAreaInterconnection");
+        UpdateRoomDetailsFromWintunReport(text);
+    }
+
     void StartNativeRuntime()
     {
         if (runtimeProcess != null && !runtimeProcess.HasExited)
@@ -824,7 +930,8 @@ public class LocalAreaInterconnectionDesktop : Form
             + " --snapshot-out " + Quote(latestRuntimeSnapshot)
             + " --snapshot-interval-ms 1000"
             + " --stop-file " + Quote(runtimeStopFile)
-            + RuntimeCoordinationArgs();
+            + RuntimeCoordinationArgs()
+            + RuntimeCoordinationMonitorArgs();
 
         runtimeOutput.Length = 0;
         lastRuntimeLogLength = 0;
@@ -881,6 +988,81 @@ public class LocalAreaInterconnectionDesktop : Form
         }
     }
 
+    void RunRuntimeCleanupPlan()
+    {
+        string text;
+        if (latestRuntimeSnapshot.Length > 0 && File.Exists(latestRuntimeSnapshot))
+        {
+            text = RunNativeCli("runtime-cleanup-report"
+                + " --runtime-snapshot " + Quote(latestRuntimeSnapshot)
+                + " --adapter-name LocalAreaInterconnection"
+                + " --adapter-scan true"
+                + " --route-scan true");
+            UpdateRoomDetailsFromRuntimeCleanupReport(text);
+            return;
+        }
+
+        text = RunNativeCli("runtime-cleanup-plan"
+                + " --room-id desktop_runtime"
+                + " --peer-id " + Quote(SafePeerId(hostName.Text))
+                + " --virtual-ip " + ip.Text
+                + " --subnet " + subnet.Text
+                + " --adapter-name LocalAreaInterconnection"
+                + " --packet-io-backend wintun"
+                + " --restore-adapter true"
+                + " --cleanup-routes true");
+        UpdateRoomDetailsFromRuntimeCleanupPlan(text);
+    }
+
+    void RunRuntimeCleanupApply()
+    {
+        bool confirmed = MessageBox.Show(
+            this,
+            T("runtimeCleanupApplyConfirm"),
+            T("runtimeCleanupApply"),
+            MessageBoxButtons.YesNo,
+            MessageBoxIcon.Warning) == DialogResult.Yes;
+        string args = "runtime-cleanup-apply";
+        if (latestRuntimeSnapshot.Length > 0 && File.Exists(latestRuntimeSnapshot))
+        {
+            args += " --runtime-snapshot " + Quote(latestRuntimeSnapshot);
+        }
+        else
+        {
+            string planText = RunNativeCliCapture("runtime-cleanup-plan"
+                + " --room-id desktop_runtime"
+                + " --peer-id " + Quote(SafePeerId(hostName.Text))
+                + " --virtual-ip " + ip.Text
+                + " --subnet " + subnet.Text
+                + " --adapter-name LocalAreaInterconnection"
+                + " --packet-io-backend wintun"
+                + " --restore-adapter true"
+                + " --cleanup-routes true");
+            string planPath = Path.Combine(AppDataDirectory(), "runtime-cleanup-plan-apply.json");
+            File.WriteAllText(planPath, planText, Encoding.UTF8);
+            args += " --cleanup-plan " + Quote(planPath);
+        }
+        args += " --adapter-name LocalAreaInterconnection"
+            + " --adapter-scan true"
+            + " --route-scan true";
+        if (confirmed)
+        {
+            args += " --yes true";
+        }
+
+        string text = RunNativeCli(args);
+        UpdateRoomDetailsFromRuntimeCleanupApply(text);
+    }
+
+    void RunRouteScan()
+    {
+        string text = RunNativeCli("route-scan"
+            + " --route-scan true"
+            + " --virtual-ip " + ip.Text
+            + " --subnet " + subnet.Text);
+        UpdateRoomDetailsFromRouteScan(text);
+    }
+
     void CloseCoordinationRoom()
     {
         if (coordinationServer.Text.Trim().Length == 0)
@@ -924,6 +1106,48 @@ public class LocalAreaInterconnectionDesktop : Form
             + " --attempts 3"
             + " --interval-ms 0"
             + " --message desktop-nat");
+    }
+
+    void RunRelayFallbackPlan()
+    {
+        string peer = SafePeerId(hostName.Text);
+        if (CreateNativeOffer(peer, false).Length == 0)
+        {
+            return;
+        }
+        string remoteOffer = RemoteOfferForRelayPlan(peer);
+        if (remoteOffer.Length == 0)
+        {
+            output.Text = T("remoteOfferRequired");
+            return;
+        }
+
+        string text = RunNativeCli("relay-fallback-plan"
+            + " --local-offer " + Quote(latestNativeOfferFile)
+            + " --remote-offer " + Quote(remoteOffer)
+            + " --p2p-status failed");
+        UpdateRoomDetailsFromRelayPlan(text);
+    }
+
+    void RunConnectionPathPlan()
+    {
+        string peer = SafePeerId(hostName.Text);
+        if (CreateNativeOffer(peer, false).Length == 0)
+        {
+            return;
+        }
+        string remoteOffer = RemoteOfferForRelayPlan(peer);
+        if (remoteOffer.Length == 0)
+        {
+            output.Text = T("remoteOfferRequired");
+            return;
+        }
+
+        string text = RunNativeCli("connection-path-plan"
+            + " --local-offer " + Quote(latestNativeOfferFile)
+            + " --remote-offer " + Quote(remoteOffer)
+            + " --p2p-status failed");
+        UpdateRoomDetailsFromConnectionPathPlan(text);
     }
 
     void RunNativeOffer()
@@ -1014,7 +1238,7 @@ public class LocalAreaInterconnectionDesktop : Form
 
     void RunPacketTestAndRefresh(string command)
     {
-        string testOutput = RunCli(command + ObserveFileArgs());
+        string testOutput = RunNativeCli(command + ObserveFileArgs());
         string path = packetObservations.Text.Trim();
         if (path.Length == 0 || !File.Exists(path))
         {
@@ -1041,16 +1265,21 @@ public class LocalAreaInterconnectionDesktop : Form
         string adapter = JsonStringValue(json, "virtual_adapter");
         string tunnel = JsonStringValue(json, "tunnel");
         string p2p = JsonStringValue(json, "p2p");
+        string path = JsonCheckStatus(json, "connection-path");
         string broadcast = JsonStringValue(json, "broadcast");
         string gameTraffic = JsonStringValue(json, "game_traffic");
         if (adapter.Length == 0) adapter = T("stateUnknown");
         if (tunnel.Length == 0) tunnel = T("stateUnknown");
         if (p2p.Length == 0) p2p = T("stateUnknown");
+        if (path.Length == 0 || path == "skipped") path = T("stateUnknown");
         if (broadcast.Length == 0) broadcast = T("stateUnknown");
         if (gameTraffic.Length == 0) gameTraffic = T("stateUnknown");
 
         roomSummary.Text = T("detailRoom") + " " + SafeText(roomName.Text) + " | " + T("detailSubnet") + " " + SafeText(subnet.Text);
-        connectionSummary.Text = T("detailConnection") + " " + T("detailAdapter") + "=" + adapter + ", " + T("detailTunnel") + "=" + tunnel + ", P2P=" + p2p;
+        connectionSummary.Text = T("detailConnection") + " " + T("detailAdapter") + "=" + adapter
+            + ", " + T("detailTunnel") + "=" + tunnel
+            + ", P2P=" + p2p
+            + ", " + T("detailPath") + "=" + path;
         broadcastSummary.Text = T("detailBroadcast") + " " + broadcast + " | " + T("detailGameTraffic") + " " + gameTraffic;
         memberSummary.Text = T("detailMembers") + " " + SafeText(hostName.Text) + " @ " + SafeText(ip.Text);
         nextActionSummary.Text = T("detailNext") + " " + DiagnosticNextAction(adapter, tunnel, p2p, broadcast, gameTraffic);
@@ -1087,14 +1316,19 @@ public class LocalAreaInterconnectionDesktop : Form
         string adapter = JsonStringValue(json, "virtual_adapter");
         string tunnel = JsonStringValue(json, "tunnel");
         string p2p = JsonStringValue(json, "p2p");
+        string path = JsonCheckStatus(json, "connection-path");
+        if (path.Length == 0) path = JsonStringValue(JsonObjectValue(json, "tunnelServiceSnapshot"), "connection_path");
         string broadcast = JsonStringValue(json, "broadcast");
         string gameTraffic = JsonStringValue(json, "game_traffic");
         string connectedPeers = JsonNumberValue(json, "connected_peer_count");
         string heartbeatPackets = JsonNumberValue(json, "heartbeatPacketsSent");
         string snapshotWrites = JsonNumberValue(json, "snapshotWriteCount");
+        string runtimePeers = RuntimePeersText(json);
+        string relayFallback = RuntimeRelayFallbackText(json);
         if (adapter.Length == 0) adapter = T("stateUnknown");
         if (tunnel.Length == 0) tunnel = T("stateUnknown");
         if (p2p.Length == 0) p2p = T("stateUnknown");
+        if (path.Length == 0 || path == "skipped") path = T("stateUnknown");
         if (broadcast.Length == 0) broadcast = T("stateUnknown");
         if (gameTraffic.Length == 0) gameTraffic = T("stateUnknown");
         if (connectedPeers.Length == 0) connectedPeers = "0";
@@ -1102,13 +1336,132 @@ public class LocalAreaInterconnectionDesktop : Form
         if (snapshotWrites.Length == 0) snapshotWrites = "0";
 
         roomSummary.Text = T("detailRoom") + " " + SafeText(roomName.Text) + " | " + T("detailSubnet") + " " + SafeText(subnet.Text);
-        connectionSummary.Text = T("detailConnection") + " " + RuntimeStatusText() + ", " + T("detailTunnel") + "=" + tunnel + ", P2P=" + p2p;
+        connectionSummary.Text = T("detailConnection") + " " + RuntimeStatusText()
+            + ", " + T("detailTunnel") + "=" + tunnel
+            + ", P2P=" + p2p
+            + ", " + T("detailPath") + "=" + path;
         broadcastSummary.Text = T("detailBroadcast") + " " + broadcast + " | " + T("detailGameTraffic") + " " + gameTraffic;
-        memberSummary.Text = T("detailMembers") + " " + SafeText(hostName.Text) + " @ " + SafeText(ip.Text)
-            + ", " + T("runtimePeers") + "=" + connectedPeers
+        memberSummary.Text = T("detailMembers") + Environment.NewLine
+            + (runtimePeers.Length > 0 ? runtimePeers : SafeText(hostName.Text) + " @ " + SafeText(ip.Text))
+            + Environment.NewLine
+            + T("runtimePeers") + "=" + connectedPeers
             + ", " + T("runtimeHeartbeats") + "=" + heartbeatPackets
             + ", " + T("runtimeSnapshots") + "=" + snapshotWrites;
+        if (relayFallback.Length > 0)
+        {
+            memberSummary.Text += Environment.NewLine + T("detailRelay") + Environment.NewLine + relayFallback;
+        }
         nextActionSummary.Text = T("detailNext") + " " + DiagnosticNextAction(adapter, tunnel, p2p, broadcast, gameTraffic);
+    }
+
+    void UpdateRoomDetailsFromRuntimeCleanupPlan(string json)
+    {
+        if (roomSummary == null || json.Trim().Length == 0) return;
+        string backend = JsonStringValue(json, "packet_io_backend");
+        bool restoreAdapter = JsonBoolValue(json, "restore_adapter");
+        bool requiresElevation = JsonBoolValue(json, "requires_elevation");
+        int commandCount = JsonObjectCount(JsonArrayValue(json, "commands"));
+        int stepCount = JsonObjectCount(JsonArrayValue(json, "process_cleanup_steps"));
+        if (backend.Length == 0) backend = T("stateUnknown");
+
+        roomSummary.Text = T("detailRoom") + " desktop_runtime | " + T("detailSubnet") + " " + SafeText(subnet.Text);
+        connectionSummary.Text = T("detailConnection") + " " + T("runtimeCleanup") + ": " + backend
+            + ", " + T("runtimeCleanupSteps") + "=" + stepCount.ToString();
+        broadcastSummary.Text = T("runtimeCleanupRestore") + " " + (restoreAdapter ? T("stateYes") : T("stateNo"))
+            + ", " + T("runtimeCleanupCommands") + "=" + commandCount.ToString();
+        memberSummary.Text = T("detailMembers") + " " + SafeText(hostName.Text) + " @ " + SafeText(ip.Text);
+        nextActionSummary.Text = T("detailNext") + " "
+            + (requiresElevation ? T("runtimeCleanupNeedsAdmin") : T("runtimeCleanupNoAdmin"));
+    }
+
+    void UpdateRoomDetailsFromRuntimeCleanupReport(string json)
+    {
+        if (roomSummary == null || json.Trim().Length == 0) return;
+        string status = JsonStringValue(json, "status");
+        string backend = JsonStringValue(json, "packet_io_backend");
+        int checkCount = JsonObjectCount(JsonArrayValue(json, "checks"));
+        int actionCount = JsonStringArrayCount(JsonArrayValue(json, "next_actions"));
+        bool requiresElevation = JsonBoolValue(json, "requires_elevation");
+        if (status.Length == 0) status = T("stateUnknown");
+        if (backend.Length == 0) backend = T("stateUnknown");
+
+        roomSummary.Text = T("detailRoom") + " desktop_runtime | " + T("detailSubnet") + " " + SafeText(subnet.Text);
+        connectionSummary.Text = T("detailConnection") + " " + T("runtimeCleanup") + ": " + status
+            + ", backend=" + backend;
+        broadcastSummary.Text = T("runtimeCleanupChecks") + "=" + checkCount.ToString()
+            + ", " + T("runtimeCleanupActions") + "=" + actionCount.ToString();
+        memberSummary.Text = T("detailMembers") + " " + SafeText(hostName.Text) + " @ " + SafeText(ip.Text);
+        nextActionSummary.Text = T("detailNext") + " "
+            + (requiresElevation ? T("runtimeCleanupNeedsAdmin") : T("runtimeCleanupNoAdmin"));
+    }
+
+    void UpdateRoomDetailsFromRuntimeCleanupApply(string json)
+    {
+        if (roomSummary == null || json.Trim().Length == 0) return;
+        string status = JsonStringValue(json, "status");
+        string nextAction = JsonStringValue(json, "nextAction");
+        int commandCount = JsonObjectCount(JsonArrayValue(json, "commandResults"));
+        int unsafeCount = JsonStringArrayCount(JsonArrayValue(json, "unsafeCommands"));
+        bool confirmed = JsonBoolValue(json, "confirmed");
+        bool requiresElevation = JsonBoolValue(json, "requires_elevation");
+        if (status.Length == 0) status = T("stateUnknown");
+        if (nextAction.Length == 0)
+        {
+            nextAction = requiresElevation ? T("runtimeCleanupNeedsAdmin") : T("runtimeCleanupNoAdmin");
+        }
+
+        roomSummary.Text = T("detailRoom") + " desktop_runtime | " + T("detailSubnet") + " " + SafeText(subnet.Text);
+        connectionSummary.Text = T("detailConnection") + " " + T("runtimeCleanupApply") + ": " + status
+            + ", " + T("runtimeCleanupConfirmed") + "=" + (confirmed ? T("stateYes") : T("stateNo"));
+        broadcastSummary.Text = T("runtimeCleanupCommands") + "=" + commandCount.ToString()
+            + ", " + T("runtimeCleanupUnsafe") + "=" + unsafeCount.ToString();
+        memberSummary.Text = T("detailMembers") + " " + SafeText(hostName.Text) + " @ " + SafeText(ip.Text);
+        nextActionSummary.Text = T("detailNext") + " " + nextAction;
+    }
+
+    void UpdateRoomDetailsFromRouteScan(string json)
+    {
+        if (roomSummary == null || json.Trim().Length == 0) return;
+        string status = JsonStringValue(json, "status");
+        string routeCount = JsonNumberValue(json, "routeCount");
+        string roomRouteCount = JsonNumberValue(json, "roomRouteCount");
+        string nextAction = JsonStringValue(json, "nextAction");
+        if (status.Length == 0) status = T("stateUnknown");
+        if (routeCount.Length == 0) routeCount = "0";
+        if (roomRouteCount.Length == 0) roomRouteCount = "0";
+        if (nextAction.Length == 0) nextAction = T("runtimeRouteNoAction");
+
+        roomSummary.Text = T("detailRoom") + " desktop_runtime | " + T("detailSubnet") + " " + SafeText(subnet.Text);
+        connectionSummary.Text = T("detailConnection") + " " + T("runtimeRouteScan") + ": " + status;
+        broadcastSummary.Text = T("runtimeRouteCount") + "=" + routeCount
+            + ", " + T("runtimeRoomRouteCount") + "=" + roomRouteCount;
+        memberSummary.Text = T("detailMembers") + " " + SafeText(hostName.Text) + " @ " + SafeText(ip.Text);
+        nextActionSummary.Text = T("detailNext") + " " + nextAction;
+    }
+
+    void UpdateRoomDetailsFromWintunReport(string json)
+    {
+        if (roomSummary == null || json.Trim().Length == 0) return;
+        string status = JsonStringValue(json, "status");
+        string dllPath = JsonStringValue(json, "dll_path");
+        string adapterName = JsonStringValue(json, "adapter_name");
+        string error = JsonStringValue(json, "error");
+        string nextAction = JsonFirstStringInArray(JsonArrayValue(json, "next_actions"));
+        if (nextAction.Length == 0) nextAction = JsonStringValue(json, "next_action");
+        if (status.Length == 0) status = T("stateUnknown");
+        if (dllPath.Length == 0) dllPath = T("stateUnknown");
+        if (adapterName.Length == 0) adapterName = "LocalAreaInterconnection";
+        if (nextAction.Length == 0)
+        {
+            nextAction = error.Length > 0 ? error : T("wintunReadyNext");
+        }
+
+        roomSummary.Text = T("detailRoom") + " desktop_runtime | " + T("detailSubnet") + " " + SafeText(subnet.Text);
+        connectionSummary.Text = T("detailConnection") + " " + T("wintunStatus") + "=" + status
+            + ", " + T("detailAdapter") + "=" + adapterName;
+        broadcastSummary.Text = "wintun.dll " + dllPath;
+        memberSummary.Text = error.Length > 0 ? error : SafeText(hostName.Text) + " @ " + SafeText(ip.Text);
+        nextActionSummary.Text = T("detailNext") + " " + nextAction;
     }
 
     void UpdateRoomDetailsFromCoordinationView(string json)
@@ -1131,7 +1484,58 @@ public class LocalAreaInterconnectionDesktop : Form
         connectionSummary.Text = T("detailConnection") + " " + T("coordinationRoomStatus") + "=" + status
             + ", " + T("coordinationOnline") + "=" + onlineCount + "/" + memberCount
             + ", " + T("coordinationExpired") + "=" + expiredCount;
-        memberSummary.Text = T("detailMembers") + " " + members;
+        memberSummary.Text = T("detailMembers") + Environment.NewLine + members;
+        nextActionSummary.Text = T("detailNext") + " " + nextAction;
+    }
+
+    void UpdateRoomDetailsFromRelayPlan(string json)
+    {
+        if (roomSummary == null || json.Trim().Length == 0) return;
+        string status = JsonStringValue(json, "status");
+        string localPeer = JsonStringValue(json, "local_peer_id");
+        string remote = JsonStringValue(json, "remote_peer_id");
+        string p2pCount = JsonNumberValue(json, "p2p_candidate_count");
+        string relayCount = JsonNumberValue(json, "relay_candidate_count");
+        string relayEndpoint = JsonFirstStringInArray(JsonArrayValue(json, "selected_relay_endpoints"));
+        string nextAction = JsonFirstStringInArray(JsonArrayValue(json, "recommended_actions"));
+        if (status.Length == 0) status = T("stateUnknown");
+        if (localPeer.Length == 0) localPeer = SafePeerId(hostName.Text);
+        if (remote.Length == 0) remote = RemotePeerIdForKick();
+        if (p2pCount.Length == 0) p2pCount = "0";
+        if (relayCount.Length == 0) relayCount = "0";
+        if (relayEndpoint.Length == 0) relayEndpoint = T("stateUnknown");
+        if (nextAction.Length == 0) nextAction = T("nextFixTunnel");
+
+        roomSummary.Text = T("detailRoom") + " desktop_runtime | " + T("detailSubnet") + " " + SafeText(subnet.Text);
+        connectionSummary.Text = T("detailConnection") + " " + T("detailPath") + "=" + status
+            + ", P2P=" + p2pCount
+            + ", " + T("detailRelay") + "=" + relayCount;
+        broadcastSummary.Text = T("relaySelected") + " " + relayEndpoint;
+        memberSummary.Text = T("detailMembers") + " " + localPeer + " -> " + SafeText(remote);
+        nextActionSummary.Text = T("detailNext") + " " + nextAction;
+    }
+
+    void UpdateRoomDetailsFromConnectionPathPlan(string json)
+    {
+        if (roomSummary == null || json.Trim().Length == 0) return;
+        string status = JsonStringValue(json, "status");
+        string selectedPath = JsonStringValue(json, "selected_path");
+        string localNat = JsonStringValue(json, "local_nat_assessment");
+        string remoteNat = JsonStringValue(json, "remote_nat_assessment");
+        string endpoint = JsonFirstStringInArray(JsonArrayValue(json, "selected_endpoints"));
+        string nextAction = JsonFirstStringInArray(JsonArrayValue(json, "recommended_actions"));
+        if (status.Length == 0) status = T("stateUnknown");
+        if (selectedPath.Length == 0) selectedPath = T("stateUnknown");
+        if (localNat.Length == 0) localNat = T("stateUnknown");
+        if (remoteNat.Length == 0) remoteNat = T("stateUnknown");
+        if (endpoint.Length == 0) endpoint = T("stateUnknown");
+        if (nextAction.Length == 0) nextAction = T("nextFixTunnel");
+
+        roomSummary.Text = T("detailRoom") + " desktop_runtime | " + T("detailSubnet") + " " + SafeText(subnet.Text);
+        connectionSummary.Text = T("detailConnection") + " " + T("connectionPathPlan") + "=" + status
+            + ", " + T("detailPath") + "=" + selectedPath;
+        broadcastSummary.Text = "NAT local=" + localNat + ", remote=" + remoteNat;
+        memberSummary.Text = T("relaySelected") + " " + endpoint;
         nextActionSummary.Text = T("detailNext") + " " + nextAction;
     }
 
@@ -1176,6 +1580,53 @@ public class LocalAreaInterconnectionDesktop : Form
         UpdateRoomDetailsFromGameProfilePlan(profileName, discovery, compatibility, profilePorts, broadcastExpectation, joinInstruction);
     }
 
+    void UpdateFromGameProfileList(string json)
+    {
+        if (json.Trim().Length == 0) return;
+        string profiles = JsonArrayValue(json, "profiles");
+        string totalCount = JsonNumberValue(json, "total_count");
+        string matchedCount = JsonNumberValue(json, "matched_count");
+        if (profiles.Length == 0 && totalCount.Length == 0 && matchedCount.Length == 0)
+        {
+            return;
+        }
+        string firstProfile = FirstJsonObject(profiles);
+        string profileName = JsonStringValue(firstProfile, "game_name");
+        string discovery = JsonStringValue(firstProfile, "discovery");
+        string compatibility = JsonStringValue(firstProfile, "compatibility");
+        string profilePorts = JsonPortArrayCsv(JsonArrayValue(firstProfile, "ports"));
+        string steamAppId = JsonStringValue(firstProfile, "steam_app_id");
+        if (profileName.Length > 0)
+        {
+            gameName.Text = profileName;
+        }
+        if (profilePorts.Length > 0)
+        {
+            ports.Text = profilePorts;
+        }
+        UpdateRoomDetailsFromGameProfileList(profileName, steamAppId, discovery, compatibility, profilePorts, totalCount, matchedCount);
+    }
+
+    void UpdateRoomDetailsFromGameProfileList(string profileName, string steamAppId, string discovery, string compatibility, string profilePorts, string totalCount, string matchedCount)
+    {
+        if (roomSummary == null) return;
+        if (profileName.Length == 0) profileName = SafeText(gameName.Text);
+        if (profilePorts.Length == 0) profilePorts = SafeText(ports.Text);
+        if (totalCount.Length == 0) totalCount = "0";
+        if (matchedCount.Length == 0) matchedCount = "0";
+        if (discovery.Length == 0) discovery = T("stateUnknown");
+        if (compatibility.Length == 0) compatibility = T("stateUnknown");
+
+        roomSummary.Text = T("detailRoom") + " " + SafeText(roomName.Text) + " | " + T("detailSubnet") + " " + SafeText(subnet.Text);
+        connectionSummary.Text = T("detailConnection") + " " + T("detailGameProfile") + "=" + profileName
+            + ", " + T("gameProfileMatches") + "=" + matchedCount + "/" + totalCount;
+        broadcastSummary.Text = T("detailBroadcast") + " " + discovery
+            + " | " + T("detailCompatibility") + "=" + compatibility;
+        memberSummary.Text = T("detailGamePorts") + " " + profilePorts
+            + (steamAppId.Length > 0 ? Environment.NewLine + "Steam App ID " + steamAppId : "");
+        nextActionSummary.Text = T("detailNext") + " " + (matchedCount == "0" ? T("gameProfileNoMatch") : T("gameProfileSelected"));
+    }
+
     void UpdateRoomDetailsFromGameProfilePlan(string profileName, string discovery, string compatibility, string profilePorts, string broadcastExpectation, string joinInstruction)
     {
         if (roomSummary == null) return;
@@ -1187,6 +1638,98 @@ public class LocalAreaInterconnectionDesktop : Form
         broadcastSummary.Text = T("detailBroadcast") + " " + discovery + " | " + T("detailGamePorts") + " " + profilePorts;
         memberSummary.Text = T("detailMembers") + " " + SafeText(hostName.Text) + " @ " + SafeText(ip.Text);
         nextActionSummary.Text = T("detailNext") + " " + joinInstruction + " " + broadcastExpectation;
+    }
+
+    void UpdateRoomDetailsFromGamePortScan(string json)
+    {
+        if (roomSummary == null || json.Trim().Length == 0) return;
+        string status = JsonStringValue(json, "status");
+        string endpointCount = JsonNumberValue(json, "endpointCount");
+        string matchCount = JsonNumberValue(json, "matchCount");
+        string nextAction = JsonStringValue(json, "nextAction");
+        if (status.Length == 0) status = T("stateUnknown");
+        if (endpointCount.Length == 0) endpointCount = "0";
+        if (matchCount.Length == 0) matchCount = "0";
+        if (nextAction.Length == 0) nextAction = T("nextStartGame");
+
+        roomSummary.Text = T("detailRoom") + " " + SafeText(roomName.Text) + " | " + T("detailSubnet") + " " + SafeText(subnet.Text);
+        connectionSummary.Text = T("detailConnection") + " " + T("gamePortScan") + ": " + status;
+        broadcastSummary.Text = T("gamePortEndpoints") + "=" + endpointCount
+            + ", " + T("gamePortMatches") + "=" + matchCount;
+        memberSummary.Text = T("detailGamePorts") + " " + SafeText(ports.Text);
+        nextActionSummary.Text = T("detailNext") + " " + nextAction;
+    }
+
+    void UpdateRoomDetailsFromGameReadiness(string json)
+    {
+        if (roomSummary == null || json.Trim().Length == 0) return;
+        string status = JsonStringValue(json, "status");
+        string matchCount = JsonNumberValue(json, "matchCount");
+        string networkStatus = JsonStringValue(json, "networkStatus");
+        string report = JsonObjectValue(json, "report");
+        string connectionPath = JsonStringValue(JsonObjectValue(json, "connectionPathReport"), "selected_path");
+        string nextAction = JsonFirstStringInArray(JsonArrayValue(report, "next_actions"));
+        if (status.Length == 0) status = T("stateUnknown");
+        if (matchCount.Length == 0) matchCount = "0";
+        if (networkStatus.Length == 0) networkStatus = T("stateUnknown");
+        if (connectionPath.Length == 0) connectionPath = T("stateUnknown");
+        if (nextAction.Length == 0) nextAction = T("nextHealthy");
+
+        roomSummary.Text = T("detailRoom") + " " + SafeText(roomName.Text) + " | " + T("detailSubnet") + " " + SafeText(subnet.Text);
+        connectionSummary.Text = T("detailConnection") + " " + T("gameReadiness") + "=" + status
+            + ", " + T("detailPath") + "=" + connectionPath;
+        broadcastSummary.Text = T("gamePortMatches") + "=" + matchCount
+            + " | " + T("networkDiagnose") + "=" + networkStatus;
+        memberSummary.Text = T("detailGamePorts") + " " + SafeText(ports.Text);
+        nextActionSummary.Text = T("detailNext") + " " + nextAction;
+    }
+
+    void UpdateRoomDetailsFromDiagnosticBundle(string path)
+    {
+        if (roomSummary == null) return;
+        string json;
+        try
+        {
+            json = File.ReadAllText(path);
+        }
+        catch
+        {
+            UpdateRoomDetails("exported");
+            return;
+        }
+
+        string status = JsonStringValue(json, "status");
+        string readiness = JsonStringValue(JsonObjectValue(json, "game_readiness"), "status");
+        string broadcastForward = JsonStringValue(JsonObjectValue(json, "broadcast_forward"), "status");
+        string connectionSection = JsonObjectValue(json, "connection_path");
+        string connectionPath = JsonStringValue(JsonObjectValue(connectionSection, "report"), "selected_path");
+        if (connectionPath.Length == 0) connectionPath = JsonStringValue(connectionSection, "runtime_path");
+        string runtimePeerSection = JsonObjectValue(json, "runtime_peers");
+        string runtimePeerCount = JsonNumberValue(runtimePeerSection, "peer_count");
+        string runtimePeers = RuntimePeersText(runtimePeerSection);
+        string relayFallback = RuntimeRelayFallbackText(json);
+        string nextAction = JsonFirstStringInArray(JsonArrayValue(JsonObjectValue(json, "game_readiness"), "next_actions"));
+        if (status.Length == 0) status = T("stateUnknown");
+        if (readiness.Length == 0) readiness = T("stateUnknown");
+        if (broadcastForward.Length == 0) broadcastForward = T("stateUnknown");
+        if (connectionPath.Length == 0) connectionPath = T("stateUnknown");
+        if (runtimePeerCount.Length == 0) runtimePeerCount = "0";
+        if (nextAction.Length == 0) nextAction = T("nextShareBundle");
+
+        roomSummary.Text = T("detailRoom") + " " + SafeText(roomName.Text) + " | " + T("detailSubnet") + " " + SafeText(subnet.Text);
+        connectionSummary.Text = T("connectionExported") + " | " + T("gameReadiness") + "=" + readiness
+            + ", " + T("detailPath") + "=" + connectionPath;
+        broadcastSummary.Text = T("detailBroadcast") + " forward=" + broadcastForward
+            + " | " + T("detailGameTraffic") + " " + status;
+        memberSummary.Text = T("detailMembers") + Environment.NewLine
+            + (runtimePeers.Length > 0 ? runtimePeers : T("runtimePeers") + "=" + runtimePeerCount)
+            + Environment.NewLine
+            + T("detailGamePorts") + " " + SafeText(ports.Text);
+        if (relayFallback.Length > 0)
+        {
+            memberSummary.Text += Environment.NewLine + T("detailRelay") + Environment.NewLine + relayFallback;
+        }
+        nextActionSummary.Text = T("detailNext") + " " + nextAction;
     }
 
     void RefreshRuntimeLogTail()
@@ -1296,6 +1839,23 @@ public class LocalAreaInterconnectionDesktop : Form
         return " --runtime-snapshot " + Quote(path);
     }
 
+    string GameCatalogArgs()
+    {
+        string path = gameCatalog.Text.Trim();
+        if (path.Length == 0) return "";
+        return " --catalog " + Quote(path);
+    }
+
+    string FirewallReadinessArgs()
+    {
+        string path = netshOutput.Text.Trim();
+        if (path.Length > 0)
+        {
+            return " --firewall-netsh-output " + Quote(path);
+        }
+        return " --firewall-scan true";
+    }
+
     string RuntimeCoordinationArgs()
     {
         string args = "";
@@ -1307,6 +1867,117 @@ public class LocalAreaInterconnectionDesktop : Form
             args += " --coordination-peer " + Quote(peer);
         }
         return args;
+    }
+
+    string RuntimeCoordinationMonitorArgs()
+    {
+        if (coordinationServer.Text.Trim().Length == 0 && coordinationStoreFile.Length == 0)
+        {
+            return "";
+        }
+        return " --coordination-monitor true --coordination-monitor-interval-ms 1000";
+    }
+
+    string RelayExportArgs()
+    {
+        string peer = SafePeerId(hostName.Text);
+        if (CreateNativeOffer(peer, false).Length == 0)
+        {
+            return "";
+        }
+        string remoteOffer = RemoteOfferForRelayPlan(peer);
+        if (remoteOffer.Length == 0)
+        {
+            return "";
+        }
+        return " --relay-local-offer " + Quote(latestNativeOfferFile)
+            + " --relay-remote-offer " + Quote(remoteOffer)
+            + " --relay-p2p-status failed";
+    }
+
+    string RemoteOfferForRelayPlan(string localPeer)
+    {
+        string value = remotePeer.Text.Trim();
+        if (value.Length == 0)
+        {
+            return "";
+        }
+
+        string explicitOffer = RemoteOfferPart(value);
+        string prepared = PrepareOfferArgumentFile(explicitOffer, "remote-offer-relay.json");
+        if (prepared.Length > 0)
+        {
+            return prepared;
+        }
+
+        string server = coordinationServer.Text.Trim();
+        string remoteId = RemotePeerIdForKick();
+        if (server.Length == 0 || remoteId.Length == 0)
+        {
+            return "";
+        }
+
+        string fetch = RunNativeCliCapture("coordination-http-offer-fetch"
+            + " --server " + Quote(server)
+            + " --room-id desktop_runtime"
+            + " --peer-id " + Quote(localPeer));
+        string offer = NatOfferObjectByPeer(fetch, remoteId);
+        if (offer.Length == 0)
+        {
+            return "";
+        }
+        string path = Path.Combine(AppDataDirectory(), "remote-offer-relay-" + remoteId + ".json");
+        File.WriteAllText(path, offer + Environment.NewLine, Encoding.UTF8);
+        return path;
+    }
+
+    string RemoteOfferPart(string value)
+    {
+        int first = value.IndexOf(',');
+        if (first < 0) return value.Trim();
+        int second = value.IndexOf(',', first + 1);
+        if (second < 0) return value.Trim();
+        return value.Substring(second + 1).Trim();
+    }
+
+    string PrepareOfferArgumentFile(string value, string fileName)
+    {
+        if (value.Length == 0)
+        {
+            return "";
+        }
+        if (File.Exists(value))
+        {
+            return value;
+        }
+        if (value.StartsWith("{", StringComparison.Ordinal))
+        {
+            string path = Path.Combine(AppDataDirectory(), fileName);
+            File.WriteAllText(path, value + Environment.NewLine, Encoding.UTF8);
+            return path;
+        }
+        return "";
+    }
+
+    string NatOfferObjectByPeer(string json, string peerId)
+    {
+        string array = JsonArrayValue(json, "offers");
+        if (array.Length == 0) return "";
+        int search = 0;
+        while (search < array.Length)
+        {
+            int start = array.IndexOf('{', search);
+            if (start < 0) break;
+            int end = MatchingJsonBrace(array, start);
+            if (end < 0) break;
+            string offer = array.Substring(start, end - start + 1);
+            if (JsonStringValue(offer, "peer_id") == peerId)
+            {
+                return offer;
+            }
+            search = end + 1;
+        }
+        return "";
     }
 
     void RefreshCoordinationPresence()
@@ -1379,7 +2050,8 @@ public class LocalAreaInterconnectionDesktop : Form
         }
         string result = RunNativeCliCapture("coordination-http-close"
             + " --server " + Quote(server)
-            + " --room-id desktop_runtime");
+            + " --room-id desktop_runtime"
+            + " --closed-by " + Quote(SafePeerId(hostName.Text)));
         return T("coordinationRoomClosed") + Environment.NewLine + result;
     }
 
@@ -1706,6 +2378,27 @@ public class LocalAreaInterconnectionDesktop : Form
         return json.Substring(start + 1, end - start - 1).Replace("\\\"", "\"").Replace("\\\\", "\\");
     }
 
+    string JsonCheckStatus(string json, string key)
+    {
+        string checks = JsonArrayValue(json, "checks");
+        if (checks.Length == 0) return "";
+        int search = 0;
+        while (search < checks.Length)
+        {
+            int start = checks.IndexOf('{', search);
+            if (start < 0) break;
+            int end = MatchingJsonBrace(checks, start);
+            if (end < 0) break;
+            string check = checks.Substring(start, end - start + 1);
+            if (JsonStringValue(check, "key") == key)
+            {
+                return JsonStringValue(check, "status");
+            }
+            search = end + 1;
+        }
+        return "";
+    }
+
     string JsonObjectValue(string json, string key)
     {
         string marker = "\"" + key + "\":";
@@ -1764,11 +2457,13 @@ public class LocalAreaInterconnectionDesktop : Form
             string peer = JsonStringValue(member, "peer_id");
             string virtualIp = JsonStringValue(member, "virtual_ip");
             string status = JsonStringValue(member, "status");
+            bool isHost = JsonBoolValue(member, "is_host");
             if (peer.Length > 0)
             {
                 string text = peer;
                 if (virtualIp.Length > 0) text += " @ " + virtualIp;
                 if (status.Length > 0) text += " (" + status + ")";
+                if (isHost) text += " [" + T("detailHost") + "]";
                 members.Add(text);
             }
             search = end + 1;
@@ -1778,7 +2473,122 @@ public class LocalAreaInterconnectionDesktop : Form
         {
             members.Add("+" + (memberCount - members.Count).ToString());
         }
-        return String.Join(", ", members.ToArray());
+        return String.Join(Environment.NewLine, members.ToArray());
+    }
+
+    string RuntimePeersText(string json)
+    {
+        string array = JsonArrayValue(json, "runtimePeerSummaries");
+        if (array.Length == 0) array = JsonArrayValue(json, "summaries");
+        if (array.Length == 0) return "";
+        List<string> peers = new List<string>();
+        int search = 0;
+        while (search < array.Length && peers.Count < 8)
+        {
+            int start = array.IndexOf('{', search);
+            if (start < 0) break;
+            int end = MatchingJsonBrace(array, start);
+            if (end < 0) break;
+            string peer = array.Substring(start, end - start + 1);
+            string peerId = JsonStringValue(peer, "peerId");
+            string virtualIp = JsonStringValue(peer, "virtualIp");
+            string selectedPath = JsonStringValue(peer, "selectedPath");
+            string pathKind = JsonStringValue(peer, "pathKind");
+            string latencyMs = JsonNumberValue(peer, "latencyMs");
+            string loss = JsonNumberValue(peer, "heartbeatLossWindowPercent");
+            if (loss.Length == 0) loss = JsonNumberValue(peer, "heartbeatLossPercent");
+            string jitter = JsonNumberValue(peer, "heartbeatRttJitterMs");
+            string healthObject = JsonObjectValue(peer, "health");
+            string health = JsonStringValue(healthObject, "status");
+            string healthReason = JsonStringValue(healthObject, "reason");
+            string healthNextAction = JsonStringValue(healthObject, "nextAction");
+            string bytesSent = JsonNumberValue(peer, "bytesSent");
+            string bytesReceived = JsonNumberValue(peer, "bytesReceived");
+            string directSent = JsonNumberValue(peer, "directBytesSent");
+            string directReceived = JsonNumberValue(peer, "directBytesReceived");
+            string relaySent = JsonNumberValue(peer, "relayBytesSent");
+            string relayReceived = JsonNumberValue(peer, "relayBytesReceived");
+            if (peerId.Length > 0)
+            {
+                string text = peerId;
+                if (virtualIp.Length > 0) text += " @ " + virtualIp;
+                if (pathKind.Length > 0) text += " [" + pathKind + "]";
+                else if (selectedPath.Length > 0) text += " [" + selectedPath + "]";
+                if (health.Length > 0) text += " " + health;
+                if (healthReason.Length > 0 && healthReason != "healthy") text += " (" + healthReason + ")";
+                if (latencyMs.Length > 0) text += " " + latencyMs + "ms";
+                if (loss.Length > 0) text += " loss " + ShortNumber(loss) + "%";
+                if (jitter.Length > 0) text += " jitter " + ShortNumber(jitter) + "ms";
+                if (bytesSent.Length > 0 || bytesReceived.Length > 0)
+                {
+                    if (bytesSent.Length == 0) bytesSent = "0";
+                    if (bytesReceived.Length == 0) bytesReceived = "0";
+                    text += " " + bytesSent + "/" + bytesReceived + "B";
+                }
+                if (directSent.Length > 0 || directReceived.Length > 0 || relaySent.Length > 0 || relayReceived.Length > 0)
+                {
+                    if (directSent.Length == 0) directSent = "0";
+                    if (directReceived.Length == 0) directReceived = "0";
+                    if (relaySent.Length == 0) relaySent = "0";
+                    if (relayReceived.Length == 0) relayReceived = "0";
+                    text += " d " + directSent + "/" + directReceived + " r " + relaySent + "/" + relayReceived;
+                }
+                if (health.Length > 0 && health != "ok" && healthNextAction.Length > 0)
+                {
+                    text += " | " + healthNextAction;
+                }
+                peers.Add(text);
+            }
+            search = end + 1;
+        }
+        return String.Join(Environment.NewLine, peers.ToArray());
+    }
+
+    string RuntimeRelayFallbackText(string json)
+    {
+        string array = JsonArrayValue(json, "runtimeRelayFallbackSummaries");
+        if (array.Length == 0) array = JsonArrayValue(json, "runtime_summaries");
+        if (array.Length == 0) return "";
+        List<string> plans = new List<string>();
+        int search = 0;
+        while (search < array.Length && plans.Count < 6)
+        {
+            int start = array.IndexOf('{', search);
+            if (start < 0) break;
+            int end = MatchingJsonBrace(array, start);
+            if (end < 0) break;
+            string plan = array.Substring(start, end - start + 1);
+            string peerId = JsonStringValue(plan, "peerId");
+            string status = JsonStringValue(plan, "status");
+            string selectedPath = JsonStringValue(plan, "selectedPath");
+            string relayEndpoint = JsonFirstStringInArray(JsonArrayValue(plan, "selectedRelayEndpoints"));
+            string nextAction = JsonFirstStringInArray(JsonArrayValue(plan, "recommendedActions"));
+            if (peerId.Length > 0)
+            {
+                string text = peerId;
+                if (status.Length > 0) text += " " + status;
+                if (selectedPath.Length > 0) text += " [" + selectedPath + "]";
+                if (relayEndpoint.Length > 0) text += " -> " + relayEndpoint;
+                if (nextAction.Length > 0) text += " | " + nextAction;
+                plans.Add(text);
+            }
+            search = end + 1;
+        }
+        return String.Join(Environment.NewLine, plans.ToArray());
+    }
+
+    string ShortNumber(string value)
+    {
+        double number;
+        if (!Double.TryParse(value, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out number))
+        {
+            return value;
+        }
+        if (Math.Abs(number - Math.Round(number)) < 0.01)
+        {
+            return Math.Round(number).ToString(System.Globalization.CultureInfo.InvariantCulture);
+        }
+        return number.ToString("0.0", System.Globalization.CultureInfo.InvariantCulture);
     }
 
     string JsonArrayValue(string json, string key)
@@ -1857,6 +2667,16 @@ public class LocalAreaInterconnectionDesktop : Form
         return -1;
     }
 
+    string FirstJsonObject(string array)
+    {
+        if (array.Length == 0) return "";
+        int start = array.IndexOf('{');
+        if (start < 0) return "";
+        int end = MatchingJsonBrace(array, start);
+        if (end < 0) return "";
+        return array.Substring(start, end - start + 1);
+    }
+
     string JsonNumberValue(string json, string key)
     {
         string marker = "\"" + key + "\":";
@@ -1867,6 +2687,16 @@ public class LocalAreaInterconnectionDesktop : Form
         int end = start;
         while (end < json.Length && (Char.IsDigit(json[end]) || json[end] == '.' || json[end] == '-')) end++;
         return end > start ? json.Substring(start, end - start) : "";
+    }
+
+    bool JsonBoolValue(string json, string key)
+    {
+        string marker = "\"" + key + "\":";
+        int start = json.IndexOf(marker, StringComparison.Ordinal);
+        if (start < 0) return false;
+        start += marker.Length;
+        while (start < json.Length && Char.IsWhiteSpace(json[start])) start++;
+        return json.IndexOf("true", start, StringComparison.OrdinalIgnoreCase) == start;
     }
 
     string JsonPortArrayCsv(string array)
@@ -1895,9 +2725,81 @@ public class LocalAreaInterconnectionDesktop : Form
         return String.Join(",", values.ToArray());
     }
 
+    string JsonFirstStringInArray(string array)
+    {
+        if (array.Length == 0) return "";
+        int start = array.IndexOf('"');
+        if (start < 0) return "";
+        int end = start + 1;
+        bool escaped = false;
+        while (end < array.Length)
+        {
+            char ch = array[end];
+            if (escaped)
+            {
+                escaped = false;
+            }
+            else if (ch == '\\')
+            {
+                escaped = true;
+            }
+            else if (ch == '"')
+            {
+                return array.Substring(start + 1, end - start - 1).Replace("\\\"", "\"").Replace("\\\\", "\\");
+            }
+            end++;
+        }
+        return "";
+    }
+
+    int JsonObjectCount(string array)
+    {
+        if (array.Length == 0) return 0;
+        int count = 0;
+        int search = 0;
+        while (search < array.Length)
+        {
+            int start = array.IndexOf('{', search);
+            if (start < 0) break;
+            int end = MatchingJsonBrace(array, start);
+            if (end < 0) break;
+            count++;
+            search = end + 1;
+        }
+        return count;
+    }
+
+    int JsonStringArrayCount(string array)
+    {
+        if (array.Length == 0) return 0;
+        int count = 0;
+        bool inString = false;
+        bool escaped = false;
+        for (int i = 0; i < array.Length; i++)
+        {
+            char ch = array[i];
+            if (escaped)
+            {
+                escaped = false;
+                continue;
+            }
+            if (ch == '\\' && inString)
+            {
+                escaped = true;
+                continue;
+            }
+            if (ch == '"')
+            {
+                inString = !inString;
+                if (!inString) count++;
+            }
+        }
+        return count;
+    }
+
     string FirewallDiagnoseArgs()
     {
-        string args = "firewall-diagnose --game-name " + Quote(gameName.Text) + " --subnet " + subnet.Text + " --ports " + ports.Text;
+        string args = "firewall-diagnose --game-name " + Quote(gameName.Text) + GameCatalogArgs() + " --subnet " + subnet.Text + " --ports " + ports.Text;
         if (netshOutput.Text.Trim().Length > 0)
         {
             return args + " --netsh-output " + Quote(netshOutput.Text.Trim());
@@ -2032,6 +2934,12 @@ public class LocalAreaInterconnectionDesktop : Form
         return directory;
     }
 
+    string DefaultGameCatalogPath()
+    {
+        string path = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "game-profiles.example.json");
+        return File.Exists(path) ? path : "";
+    }
+
     string T(string key)
     {
         if (language == "zh")
@@ -2060,7 +2968,11 @@ public class LocalAreaInterconnectionDesktop : Form
             if (key == "adapterScan") return "扫描网卡";
             if (key == "nativeAdapterEnsure") return "原生网卡检查";
             if (key == "gamePlan") return "游戏计划";
+            if (key == "gameProfileList") return "模板列表";
             if (key == "gameProfilePlan") return "模板游戏计划";
+            if (key == "gamePortScan") return "游戏端口扫描";
+            if (key == "gameReadiness") return "游戏就绪";
+            if (key == "gameReadinessCheck") return "游戏就绪检查";
             if (key == "firewallPlan") return "防火墙计划";
             if (key == "firewallDiagnose") return "防火墙诊断";
             if (key == "firewallScan") return "扫描防火墙";
@@ -2070,13 +2982,20 @@ public class LocalAreaInterconnectionDesktop : Form
             if (key == "udpTest") return "UDP 测试";
             if (key == "broadcastTest") return "广播测试";
             if (key == "nativeRuntimeSelfTest") return "原生隧道自检";
+            if (key == "wintunDetect") return "Wintun 检测";
+            if (key == "wintunProbe") return "Wintun 探针";
             if (key == "startRuntime") return "启动 runtime";
             if (key == "stopRuntime") return "停止 runtime";
+            if (key == "runtimeCleanupPlan") return "清理计划";
+            if (key == "runtimeCleanupApply") return "应用清理";
+            if (key == "routeScan") return "扫描路由";
             if (key == "startCoordination") return "启动协调";
             if (key == "stopCoordination") return "停止协调";
             if (key == "closeRoom") return "关闭房间";
             if (key == "kickPeer") return "踢出 Peer";
             if (key == "nativeNatSelfTest") return "NAT 自检";
+            if (key == "relayFallbackPlan") return "中继计划";
+            if (key == "connectionPathPlan") return "连接路径";
             if (key == "tcpTest") return "TCP 测试";
             if (key == "browseGameCatalog") return "选择模板库";
             if (key == "browseNetsh") return "选择 Netsh";
@@ -2094,10 +3013,19 @@ public class LocalAreaInterconnectionDesktop : Form
             if (key == "detailTunnel") return "隧道";
             if (key == "detailGameTraffic") return "游戏流量:";
             if (key == "detailGameProfile") return "游戏模板";
+            if (key == "gameProfileMatches") return "匹配模板";
+            if (key == "gameProfileSelected") return "已回填匹配到的模板；继续运行游戏就绪检查。";
+            if (key == "gameProfileNoMatch") return "没有匹配模板；调整游戏名称或选择其他模板库。";
             if (key == "detailCompatibility") return "兼容等级";
             if (key == "detailGamePorts") return "端口:";
+            if (key == "gamePortEndpoints") return "端点";
+            if (key == "gamePortMatches") return "端口命中";
+            if (key == "detailPath") return "路径";
+            if (key == "detailRelay") return "中继";
             if (key == "detailHost") return "房主";
             if (key == "stateUnknown") return "未知";
+            if (key == "stateYes") return "是";
+            if (key == "stateNo") return "否";
             if (key == "connectionHostReady") return "房主模式，等待朋友加入";
             if (key == "connectionJoined") return "已加入，等待连通性验证";
             if (key == "connectionExported") return "诊断包已导出";
@@ -2141,6 +3069,23 @@ public class LocalAreaInterconnectionDesktop : Form
             if (key == "runtimeHeartbeats") return "心跳";
             if (key == "runtimeSnapshots") return "snapshot";
             if (key == "runtimeLogTail") return "runtime 最近日志:";
+            if (key == "runtimeCleanup") return "清理";
+            if (key == "runtimeCleanupSteps") return "步骤";
+            if (key == "runtimeCleanupChecks") return "检查";
+            if (key == "runtimeCleanupActions") return "动作";
+            if (key == "runtimeCleanupRestore") return "还原网卡:";
+            if (key == "runtimeCleanupCommands") return "命令";
+            if (key == "runtimeCleanupConfirmed") return "已确认";
+            if (key == "runtimeCleanupUnsafe") return "拦截";
+            if (key == "runtimeCleanupApplyConfirm") return "将尝试执行 runtime 清理计划中的安全白名单命令；网卡和路由清理通常需要管理员权限。选择“否”会只输出预览。";
+            if (key == "runtimeCleanupNeedsAdmin") return "网卡还原命令需要管理员终端执行；先检查输出中的 dry-run 命令。";
+            if (key == "runtimeCleanupNoAdmin") return "当前清理计划只包含进程内资源释放，不需要管理员命令。";
+            if (key == "runtimeRouteScan") return "路由扫描";
+            if (key == "runtimeRouteCount") return "路由";
+            if (key == "runtimeRoomRouteCount") return "房间路由";
+            if (key == "runtimeRouteNoAction") return "未发现需要处理的房间路由。";
+            if (key == "wintunStatus") return "Wintun";
+            if (key == "wintunReadyNext") return "Wintun 环境可用于下一步 adapter/session 验证。";
             if (key == "coordinationAlreadyRunning") return "协调服务已在运行。";
             if (key == "coordinationStarted") return "协调服务已启动。";
             if (key == "coordinationStopped") return "协调服务已停止。";
@@ -2158,11 +3103,13 @@ public class LocalAreaInterconnectionDesktop : Form
             if (key == "coordinationServerRequired") return "需要先填写或启动协调服务。";
             if (key == "coordinationPeerRequired") return "需要先填写远端 Peer。";
             if (key == "coordinationPeerKicked") return "已请求踢出远端 Peer:";
+            if (key == "relaySelected") return "中继候选:";
             if (key == "textFilesFilter") return "文本文件 (*.txt)|*.txt|所有文件 (*.*)|*.*";
             if (key == "jsonFilesFilter") return "JSON 文件 (*.json)|*.json|所有文件 (*.*)|*.*";
             if (key == "missingCli") return "缺少 CLI 程序: ";
             if (key == "missingNativeCli") return "缺少 Rust 原生 CLI 程序，请先重新生成 exe: ";
             if (key == "missingGameCatalog") return "请先选择游戏模板库 JSON 文件。";
+            if (key == "remoteOfferRequired") return "需要在远端 Peer 中填写远端 offer JSON、offer 文件路径，或先通过协调服务发布远端 offer。";
         }
         else
         {
@@ -2190,7 +3137,11 @@ public class LocalAreaInterconnectionDesktop : Form
             if (key == "adapterScan") return "Adapter scan";
             if (key == "nativeAdapterEnsure") return "Native adapter check";
             if (key == "gamePlan") return "Game plan";
+            if (key == "gameProfileList") return "Profile list";
             if (key == "gameProfilePlan") return "Profile game plan";
+            if (key == "gamePortScan") return "Game port scan";
+            if (key == "gameReadiness") return "game readiness";
+            if (key == "gameReadinessCheck") return "Game readiness";
             if (key == "firewallPlan") return "Firewall plan";
             if (key == "firewallDiagnose") return "Firewall diagnose";
             if (key == "firewallScan") return "Firewall scan";
@@ -2200,13 +3151,20 @@ public class LocalAreaInterconnectionDesktop : Form
             if (key == "udpTest") return "UDP test";
             if (key == "broadcastTest") return "Broadcast test";
             if (key == "nativeRuntimeSelfTest") return "Native tunnel self-test";
+            if (key == "wintunDetect") return "Wintun detect";
+            if (key == "wintunProbe") return "Wintun probe";
             if (key == "startRuntime") return "Start runtime";
             if (key == "stopRuntime") return "Stop runtime";
+            if (key == "runtimeCleanupPlan") return "Cleanup plan";
+            if (key == "runtimeCleanupApply") return "Apply cleanup";
+            if (key == "routeScan") return "Route scan";
             if (key == "startCoordination") return "Start coordination";
             if (key == "stopCoordination") return "Stop coordination";
             if (key == "closeRoom") return "Close room";
             if (key == "kickPeer") return "Kick peer";
             if (key == "nativeNatSelfTest") return "NAT self-test";
+            if (key == "relayFallbackPlan") return "Relay plan";
+            if (key == "connectionPathPlan") return "Connection path";
             if (key == "tcpTest") return "TCP test";
             if (key == "browseGameCatalog") return "Browse catalog";
             if (key == "browseNetsh") return "Browse netsh";
@@ -2224,10 +3182,19 @@ public class LocalAreaInterconnectionDesktop : Form
             if (key == "detailTunnel") return "Tunnel";
             if (key == "detailGameTraffic") return "Game traffic:";
             if (key == "detailGameProfile") return "Game profile";
+            if (key == "gameProfileMatches") return "profile matches";
+            if (key == "gameProfileSelected") return "Matched profile filled in; continue with game readiness.";
+            if (key == "gameProfileNoMatch") return "No matching profile; adjust the game name or choose another catalog.";
             if (key == "detailCompatibility") return "Compatibility";
             if (key == "detailGamePorts") return "Ports:";
+            if (key == "gamePortEndpoints") return "endpoints";
+            if (key == "gamePortMatches") return "port matches";
+            if (key == "detailPath") return "Path";
+            if (key == "detailRelay") return "Relay";
             if (key == "detailHost") return "Host";
             if (key == "stateUnknown") return "unknown";
+            if (key == "stateYes") return "yes";
+            if (key == "stateNo") return "no";
             if (key == "connectionHostReady") return "Host mode, waiting for friends";
             if (key == "connectionJoined") return "Joined, waiting for connectivity checks";
             if (key == "connectionExported") return "Diagnostic bundle exported";
@@ -2271,6 +3238,23 @@ public class LocalAreaInterconnectionDesktop : Form
             if (key == "runtimeHeartbeats") return "heartbeats";
             if (key == "runtimeSnapshots") return "snapshots";
             if (key == "runtimeLogTail") return "Recent runtime log:";
+            if (key == "runtimeCleanup") return "cleanup";
+            if (key == "runtimeCleanupSteps") return "steps";
+            if (key == "runtimeCleanupChecks") return "checks";
+            if (key == "runtimeCleanupActions") return "actions";
+            if (key == "runtimeCleanupRestore") return "Restore adapter:";
+            if (key == "runtimeCleanupCommands") return "commands";
+            if (key == "runtimeCleanupConfirmed") return "confirmed";
+            if (key == "runtimeCleanupUnsafe") return "blocked";
+            if (key == "runtimeCleanupApplyConfirm") return "This will try to execute safe-listed commands from the runtime cleanup plan. Adapter and route cleanup usually require Administrator privileges. Choose No to preview only.";
+            if (key == "runtimeCleanupNeedsAdmin") return "Adapter restore commands require an Administrator terminal; review the dry-run output first.";
+            if (key == "runtimeCleanupNoAdmin") return "This cleanup plan only releases in-process runtime resources and does not need admin commands.";
+            if (key == "runtimeRouteScan") return "route scan";
+            if (key == "runtimeRouteCount") return "routes";
+            if (key == "runtimeRoomRouteCount") return "room routes";
+            if (key == "runtimeRouteNoAction") return "No room route needs attention.";
+            if (key == "wintunStatus") return "Wintun";
+            if (key == "wintunReadyNext") return "Wintun environment is ready for adapter/session verification.";
             if (key == "coordinationAlreadyRunning") return "coordination server is already running.";
             if (key == "coordinationStarted") return "coordination server started.";
             if (key == "coordinationStopped") return "coordination server stopped.";
@@ -2288,11 +3272,13 @@ public class LocalAreaInterconnectionDesktop : Form
             if (key == "coordinationServerRequired") return "Fill or start the coordination server first.";
             if (key == "coordinationPeerRequired") return "Fill the remote peer first.";
             if (key == "coordinationPeerKicked") return "Requested remote peer kick:";
+            if (key == "relaySelected") return "Relay candidate:";
             if (key == "textFilesFilter") return "Text files (*.txt)|*.txt|All files (*.*)|*.*";
             if (key == "jsonFilesFilter") return "JSON files (*.json)|*.json|All files (*.*)|*.*";
             if (key == "missingCli") return "Missing CLI executable: ";
             if (key == "missingNativeCli") return "Missing Rust native CLI executable. Build the latest exe first: ";
             if (key == "missingGameCatalog") return "Select a game catalog JSON file first.";
+            if (key == "remoteOfferRequired") return "Fill Remote peer with remote offer JSON, an offer file path, or publish the remote offer through coordination first.";
         }
         return key;
     }

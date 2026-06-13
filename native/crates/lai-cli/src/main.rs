@@ -4,21 +4,24 @@ use lai_core::{
     add_room_member, close_room, create_command_execution_preview, create_diagnostic_export_bundle,
     create_game_network_plan, create_invite, create_join_plan, create_p2p_handshake_ack,
     create_p2p_handshake_hello, create_room, create_room_runtime_plan, create_room_session,
-    create_windows_firewall_plan, create_windows_virtual_adapter_ensure_report,
-    create_windows_virtual_adapter_plan, decode_invite, evaluate_firewall_diagnostics,
-    evaluate_network_observations, find_game_profile, list_game_profile_summaries,
-    network_snapshot_from_runtime, observation_from_expected_rule, open_tunnel_payload,
-    parse_game_profile_catalog_json, parse_netsh_adapter_observation, parse_netsh_firewall_rules,
-    parse_windows_ping_observation, seal_tunnel_payload, udp_forward_summary, AdapterObservation,
-    CommandExecutionRecord, CommandExecutionStatus, CompatibilityLevel,
-    DiagnosticExportEnvironment, DiagnosticExportInputs, DiagnosticExportSources,
-    DiagnosticSnapshot, DiagnosticTextSource, DiscoveryMode, FirewallRule, FirewallRuleObservation,
-    GameProfile, Ipv4Subnet, NetworkCommand, NetworkObservationSnapshot, P2pHandshakeAck,
-    P2pHandshakeHello, PacketCaptureSummary, PacketObservation, RoomRuntimePeer, RoomRuntimePlan,
-    TunnelEnvelope, TunnelObservation, TunnelServiceSnapshot, UdpForwardObservation,
-    VirtualUdpPacket,
+    create_runtime_cleanup_report, create_windows_firewall_plan,
+    create_windows_virtual_adapter_ensure_report, create_windows_virtual_adapter_plan,
+    decode_invite, evaluate_firewall_diagnostics,
+    evaluate_game_readiness_with_firewall_and_connection_path, evaluate_network_observations,
+    find_game_profile, list_game_profile_summaries, observation_from_expected_rule,
+    open_tunnel_payload, parse_game_profile_catalog_json, parse_netsh_adapter_observation,
+    parse_netsh_firewall_rules, parse_windows_ping_observation, seal_tunnel_payload,
+    udp_forward_summary, AdapterObservation, CommandExecutionRecord, CommandExecutionStatus,
+    CompatibilityLevel, DiagnosticExportEnvironment, DiagnosticExportInputs,
+    DiagnosticExportSources, DiagnosticSnapshot, DiagnosticTextSource, DiscoveryMode,
+    FirewallDiagnosticsReport, FirewallRule, FirewallRuleObservation, GameProfile, Ipv4Subnet,
+    NetworkCommand, NetworkObservationSnapshot, P2pHandshakeAck, P2pHandshakeHello,
+    PacketCaptureSummary, PacketObservation, RoomRuntimePeer, RoomRuntimePlan, TunnelEnvelope,
+    TunnelObservation, TunnelServiceSnapshot, UdpForwardObservation, VirtualUdpPacket,
 };
 use rand::RngCore;
+use serde::Serialize;
+use std::collections::HashSet;
 use std::fs;
 use std::io::{ErrorKind, Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
@@ -40,6 +43,25 @@ struct RuntimePacketIoProbeOptions {
     wintun_receive_attempts: u32,
     wintun_receive_poll_interval_ms: u64,
     wintun_probe_send: bool,
+}
+
+#[derive(Clone, Debug)]
+struct RuntimeCoordinationMonitor {
+    store_path: Option<String>,
+    server: Option<String>,
+    interval_ms: u64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct RuntimeCoordinationMonitorReport {
+    status: String,
+    source: String,
+    room_id: String,
+    peer_id: String,
+    peer_present: bool,
+    room_present: bool,
+    checked_at_ms: u128,
+    detail: String,
 }
 
 #[derive(Subcommand)]
@@ -86,6 +108,126 @@ enum Command {
         #[arg(long, default_value = "")]
         broadcast_ports: String,
     },
+    RuntimeCleanupPlan {
+        #[arg(long)]
+        room_id: String,
+        #[arg(long)]
+        peer_id: String,
+        #[arg(long)]
+        virtual_ip: String,
+        #[arg(long)]
+        subnet: Option<String>,
+        #[arg(long, default_value = "LocalAreaInterconnection")]
+        adapter_name: String,
+        #[arg(long, default_value = "userspace-udp")]
+        packet_io_backend: String,
+        #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+        restore_adapter: bool,
+        #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+        cleanup_routes: bool,
+    },
+    RuntimeCleanupReport {
+        #[arg(long)]
+        runtime_snapshot: Option<String>,
+        #[arg(long)]
+        cleanup_plan: Option<String>,
+        #[arg(long)]
+        adapter_netsh_output: Option<String>,
+        #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+        adapter_scan: bool,
+        #[arg(long, default_value = "LocalAreaInterconnection")]
+        adapter_name: String,
+        #[arg(long)]
+        route_output: Option<String>,
+        #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+        route_scan: bool,
+    },
+    RuntimeCleanupApply {
+        #[arg(long)]
+        runtime_snapshot: Option<String>,
+        #[arg(long)]
+        cleanup_plan: Option<String>,
+        #[arg(long)]
+        adapter_netsh_output: Option<String>,
+        #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+        adapter_scan: bool,
+        #[arg(long, default_value = "LocalAreaInterconnection")]
+        adapter_name: String,
+        #[arg(long)]
+        route_output: Option<String>,
+        #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+        route_scan: bool,
+        #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+        yes: bool,
+    },
+    RouteScan {
+        #[arg(long)]
+        route_output: Option<String>,
+        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+        route_scan: bool,
+        #[arg(long)]
+        virtual_ip: Option<String>,
+        #[arg(long)]
+        subnet: Option<String>,
+    },
+    GamePortScan {
+        #[arg(long)]
+        netstat_output: Option<String>,
+        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+        netstat_scan: bool,
+        #[arg(long, default_value = "Generic LAN Game")]
+        game_name: String,
+        #[arg(long)]
+        catalog: Option<String>,
+        #[arg(long)]
+        steam_app_id: Option<String>,
+        #[arg(long, default_value = "")]
+        ports: String,
+        #[arg(long, default_value = "udp,tcp")]
+        protocols: String,
+    },
+    GameReadiness {
+        #[arg(long)]
+        network_report: String,
+        #[arg(long)]
+        game_plan: Option<String>,
+        #[arg(long)]
+        catalog: Option<String>,
+        #[arg(long, default_value = "Generic LAN Game")]
+        game_name: String,
+        #[arg(long)]
+        steam_app_id: Option<String>,
+        #[arg(long)]
+        subnet: String,
+        #[arg(long, default_value = "manual_ports")]
+        discovery: String,
+        #[arg(long, default_value = "")]
+        ports: String,
+        #[arg(long, default_value = "unknown")]
+        compatibility: String,
+        #[arg(long)]
+        host_ip: Option<String>,
+        #[arg(long)]
+        local_ip: Option<String>,
+        #[arg(long)]
+        firewall_netsh_output: Option<String>,
+        #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+        firewall_scan: bool,
+        #[arg(long)]
+        program: Option<String>,
+        #[arg(long)]
+        netstat_output: Option<String>,
+        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+        netstat_scan: bool,
+        #[arg(long, default_value = "udp,tcp")]
+        protocols: String,
+        #[arg(long)]
+        relay_local_offer: Option<String>,
+        #[arg(long)]
+        relay_remote_offer: Option<String>,
+        #[arg(long, default_value = "unknown")]
+        relay_p2p_status: String,
+    },
     RoomRuntimeRun {
         #[arg(long)]
         room_id: String,
@@ -111,6 +253,8 @@ enum Command {
         game_ports: String,
         #[arg(long, default_value = "")]
         broadcast_ports: String,
+        #[arg(long, default_value_t = 30)]
+        max_broadcast_packets_per_second: u16,
         #[arg(long)]
         key: String,
         #[arg(long, default_value_t = 1000)]
@@ -147,6 +291,10 @@ enum Command {
         stop_file: Option<String>,
         #[arg(long)]
         snapshot_interval_ms: Option<u64>,
+        #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+        coordination_monitor: bool,
+        #[arg(long, default_value_t = 1000)]
+        coordination_monitor_interval_ms: u64,
         #[arg(long, default_value = "LocalAreaInterconnection")]
         wintun_adapter_name: String,
         #[arg(long, default_value_t = 128 * 1024)]
@@ -210,6 +358,10 @@ enum Command {
         #[arg(long, default_value = "Generic LAN Game")]
         game_name: String,
         #[arg(long)]
+        catalog: Option<String>,
+        #[arg(long)]
+        steam_app_id: Option<String>,
+        #[arg(long)]
         subnet: String,
         #[arg(long, default_value = "manual_ports")]
         discovery: String,
@@ -223,6 +375,10 @@ enum Command {
     FirewallDiagnose {
         #[arg(long, default_value = "Generic LAN Game")]
         game_name: String,
+        #[arg(long)]
+        catalog: Option<String>,
+        #[arg(long)]
+        steam_app_id: Option<String>,
         #[arg(long)]
         subnet: String,
         #[arg(long, default_value = "manual_ports")]
@@ -464,6 +620,22 @@ enum Command {
         #[arg(long, default_value_t = 50)]
         interval_ms: u64,
     },
+    RelayFallbackPlan {
+        #[arg(long)]
+        local_offer: String,
+        #[arg(long)]
+        remote_offer: String,
+        #[arg(long, default_value = "unknown")]
+        p2p_status: String,
+    },
+    ConnectionPathPlan {
+        #[arg(long)]
+        local_offer: String,
+        #[arg(long)]
+        remote_offer: String,
+        #[arg(long, default_value = "unknown")]
+        p2p_status: String,
+    },
     NatHolePunch {
         #[arg(long, default_value = "room_test")]
         room_id: String,
@@ -601,6 +773,8 @@ enum Command {
         store: String,
         #[arg(long)]
         room_id: String,
+        #[arg(long)]
+        closed_by: Option<String>,
     },
     CoordinationRoomView {
         #[arg(long)]
@@ -675,6 +849,8 @@ enum Command {
         server: String,
         #[arg(long)]
         room_id: String,
+        #[arg(long)]
+        closed_by: Option<String>,
     },
     CoordinationHttpPrune {
         #[arg(long)]
@@ -718,6 +894,36 @@ enum Command {
         #[arg(long)]
         observe_file: Option<String>,
     },
+    UdpLoopbackTest {
+        #[arg(long, default_value_t = 39077)]
+        port: u16,
+        #[arg(long, default_value = "ping")]
+        message: String,
+        #[arg(long, default_value_t = 3000)]
+        timeout_ms: u64,
+        #[arg(long)]
+        observe_file: Option<String>,
+    },
+    UdpBroadcastTest {
+        #[arg(long, default_value_t = 39078)]
+        port: u16,
+        #[arg(long, default_value = "discover")]
+        message: String,
+        #[arg(long, default_value_t = 3000)]
+        timeout_ms: u64,
+        #[arg(long)]
+        observe_file: Option<String>,
+    },
+    TcpLoopbackTest {
+        #[arg(long, default_value_t = 39079)]
+        port: u16,
+        #[arg(long, default_value = "ping")]
+        message: String,
+        #[arg(long, default_value_t = 3000)]
+        timeout_ms: u64,
+        #[arg(long)]
+        observe_file: Option<String>,
+    },
     NetworkObserve {
         #[arg(long)]
         adapter_name: Option<String>,
@@ -731,6 +937,8 @@ enum Command {
         subnet: Option<String>,
         #[arg(long)]
         adapter_netsh_output: Option<String>,
+        #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+        adapter_scan: bool,
         #[arg(long, default_value = "connected")]
         tunnel_state: String,
         #[arg(long, default_value_t = 0)]
@@ -742,6 +950,10 @@ enum Command {
         #[arg(long)]
         packet_loss_percent: Option<f32>,
         #[arg(long)]
+        connection_path: Option<String>,
+        #[arg(long)]
+        ping_test: Option<String>,
+        #[arg(long)]
         ping_output: Option<String>,
         #[arg(long, default_value = "")]
         broadcast_ports: String,
@@ -751,6 +963,10 @@ enum Command {
         packets: String,
         #[arg(long)]
         packet_observations: Option<String>,
+        #[arg(long)]
+        route_output: Option<String>,
+        #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+        route_scan: bool,
     },
     DiagnosticExport {
         #[arg(long)]
@@ -787,8 +1003,20 @@ enum Command {
         packet_observations: Option<String>,
         #[arg(long)]
         runtime_snapshot: Option<String>,
+        #[arg(long)]
+        route_output: Option<String>,
+        #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+        route_scan: bool,
+        #[arg(long)]
+        netstat_output: Option<String>,
+        #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+        netstat_scan: bool,
         #[arg(long, default_value = "Generic LAN Game")]
         game_name: String,
+        #[arg(long)]
+        catalog: Option<String>,
+        #[arg(long)]
+        steam_app_id: Option<String>,
         #[arg(long, default_value = "manual_ports")]
         discovery: String,
         #[arg(long, default_value = "")]
@@ -811,6 +1039,12 @@ enum Command {
         wintun_receive_poll_interval_ms: u64,
         #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
         wintun_probe_send: bool,
+        #[arg(long)]
+        relay_local_offer: Option<String>,
+        #[arg(long)]
+        relay_remote_offer: Option<String>,
+        #[arg(long, default_value = "failed")]
+        relay_p2p_status: String,
     },
     WintunDetect,
     WintunAdapterCreate {
@@ -974,6 +1208,366 @@ fn run_main() -> Result<(), Box<dyn std::error::Error>> {
             );
             println!("{}", serde_json::to_string_pretty(&plan)?);
         }
+        Command::RuntimeCleanupPlan {
+            room_id,
+            peer_id,
+            virtual_ip,
+            subnet,
+            adapter_name,
+            packet_io_backend,
+            restore_adapter,
+            cleanup_routes,
+        } => {
+            let plan = lai_core::create_windows_runtime_cleanup_plan_with_routes(
+                room_id,
+                peer_id,
+                virtual_ip.parse::<Ipv4Addr>()?,
+                parse_optional_subnet(subnet.as_deref())?,
+                adapter_name,
+                packet_io_backend,
+                restore_adapter,
+                cleanup_routes,
+            );
+            println!("{}", serde_json::to_string_pretty(&plan)?);
+        }
+        Command::RuntimeCleanupReport {
+            runtime_snapshot,
+            cleanup_plan,
+            adapter_netsh_output,
+            adapter_scan,
+            adapter_name,
+            route_output,
+            route_scan,
+        } => {
+            let (runtime_snapshot_value, runtime_snapshot_error) =
+                load_runtime_snapshot(runtime_snapshot.as_deref());
+            if let Some(error) = runtime_snapshot_error {
+                return Err(invalid_input(format!(
+                    "failed to load runtime snapshot: {error}"
+                )));
+            }
+            let plan = load_runtime_cleanup_plan_for_report(
+                cleanup_plan.as_deref(),
+                runtime_snapshot_value.as_ref(),
+            )?;
+            let adapter_source =
+                load_adapter_source(&adapter_name, adapter_netsh_output.as_deref(), adapter_scan);
+            let adapter_observation = if adapter_source.raw_output.trim().is_empty() {
+                None
+            } else {
+                parse_netsh_adapter_observation(
+                    adapter_name.clone(),
+                    &adapter_source.raw_output,
+                    Some(plan.local_virtual_ip),
+                    None,
+                )
+            };
+            let wintun_close = runtime_snapshot_value
+                .as_ref()
+                .and_then(runtime_wintun_close_report_from_snapshot);
+            let route_source = load_route_source(route_output.as_deref(), route_scan);
+            let routes = lai_core::parse_windows_ipv4_routes(&route_source.raw_output);
+            let report =
+                create_runtime_cleanup_report(plan, adapter_observation, routes, wintun_close);
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "adapterSource": adapter_source,
+                    "routeSource": route_source,
+                    "report": report,
+                }))?
+            );
+        }
+        Command::RuntimeCleanupApply {
+            runtime_snapshot,
+            cleanup_plan,
+            adapter_netsh_output,
+            adapter_scan,
+            adapter_name,
+            route_output,
+            route_scan,
+            yes,
+        } => {
+            let (runtime_snapshot_value, runtime_snapshot_error) =
+                load_runtime_snapshot(runtime_snapshot.as_deref());
+            if let Some(error) = runtime_snapshot_error {
+                return Err(invalid_input(format!(
+                    "failed to load runtime snapshot: {error}"
+                )));
+            }
+            let plan = load_runtime_cleanup_plan_for_report(
+                cleanup_plan.as_deref(),
+                runtime_snapshot_value.as_ref(),
+            )?;
+            let unsafe_commands = runtime_cleanup_command_safety_errors(&plan);
+            let adapter_source =
+                load_adapter_source(&adapter_name, adapter_netsh_output.as_deref(), adapter_scan);
+            let adapter_observation = if adapter_source.raw_output.trim().is_empty() {
+                None
+            } else {
+                parse_netsh_adapter_observation(
+                    adapter_name.clone(),
+                    &adapter_source.raw_output,
+                    Some(plan.local_virtual_ip),
+                    plan.virtual_subnet,
+                )
+            };
+            let wintun_close = runtime_snapshot_value
+                .as_ref()
+                .and_then(runtime_wintun_close_report_from_snapshot);
+            let route_source = load_route_source(route_output.as_deref(), route_scan);
+            let routes = lai_core::parse_windows_ipv4_routes(&route_source.raw_output);
+            let report = create_runtime_cleanup_report(
+                plan.clone(),
+                adapter_observation,
+                routes,
+                wintun_close,
+            );
+            let elevated = detect_windows_elevation();
+            let preview = create_command_execution_preview(
+                &plan.commands,
+                plan.requires_elevation,
+                yes,
+                elevated,
+            );
+            let command_results = if preview.can_execute_now && unsafe_commands.is_empty() {
+                execute_network_commands(&plan.commands)
+            } else {
+                Vec::new()
+            };
+            let status = runtime_cleanup_apply_status(&preview, &command_results, &unsafe_commands);
+            let next_action = if command_results.is_empty() {
+                if unsafe_commands.is_empty() {
+                    preview.next_action.clone()
+                } else {
+                    "Regenerate the cleanup plan with runtime-cleanup-plan or room-runtime-run; unsafe commands were not executed.".to_owned()
+                }
+            } else if command_results
+                .iter()
+                .all(|record| record.status == CommandExecutionStatus::Succeeded)
+            {
+                "Run runtime-cleanup-report with adapter and route scans to verify cleanup."
+                    .to_owned()
+            } else {
+                "Review failed command output, then rerun from an Administrator terminal if needed."
+                    .to_owned()
+            };
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "status": status,
+                    "adapterSource": adapter_source,
+                    "routeSource": route_source,
+                    "reportBeforeApply": report,
+                    "executionPreview": preview,
+                    "commandResults": command_results,
+                    "unsafeCommands": unsafe_commands,
+                    "nextAction": next_action,
+                }))?
+            );
+        }
+        Command::RouteScan {
+            route_output,
+            route_scan,
+            virtual_ip,
+            subnet,
+        } => {
+            let route_source = load_route_source(route_output.as_deref(), route_scan);
+            let routes = lai_core::parse_windows_ipv4_routes(&route_source.raw_output);
+            let virtual_ip = parse_optional_ipv4(virtual_ip.as_deref())?;
+            let subnet = parse_optional_subnet(subnet.as_deref())?;
+            let room_routes = routes
+                .iter()
+                .filter(|route| route_matches_room(route, virtual_ip, subnet))
+                .cloned()
+                .collect::<Vec<_>>();
+            let status = if route_source.error.is_some() {
+                "needs-attention"
+            } else if routes.is_empty() {
+                "no-data"
+            } else if room_routes.is_empty() {
+                "ok"
+            } else {
+                "needs-attention"
+            };
+            let next_action = if route_source.error.is_some() {
+                "Run from a Windows terminal where route.exe is available, or provide --route-output."
+            } else if routes.is_empty() {
+                "Provide route print -4 output after joining or stopping a room."
+            } else if room_routes.is_empty() {
+                "No room route residue matched the provided virtual IP or subnet."
+            } else {
+                "Review matched room routes and run runtime-cleanup-apply from an Administrator terminal if they are stale."
+            };
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "status": status,
+                    "routeSource": route_source,
+                    "routeCount": routes.len(),
+                    "roomRouteCount": room_routes.len(),
+                    "routes": routes,
+                    "roomRoutes": room_routes,
+                    "nextAction": next_action,
+                }))?
+            );
+        }
+        Command::GamePortScan {
+            netstat_output,
+            netstat_scan,
+            game_name,
+            catalog,
+            steam_app_id,
+            ports,
+            protocols,
+        } => {
+            let netstat_source = load_netstat_source(netstat_output.as_deref(), netstat_scan);
+            let endpoints = if netstat_source.error.is_none() {
+                lai_core::parse_windows_netstat_ano(&netstat_source.raw_output)
+            } else {
+                Vec::new()
+            };
+            let profile = profile_from_catalog_or_args(
+                catalog.as_deref(),
+                game_name,
+                steam_app_id.as_deref(),
+                "manual_ports".to_owned(),
+                ports,
+                "unknown".to_owned(),
+            )?;
+            let expected_ports = profile.ports;
+            let expected_protocols = parse_protocol_filter(&protocols);
+            let matches = endpoints
+                .iter()
+                .filter(|endpoint| {
+                    endpoint_matches_game_ports(endpoint, &expected_ports, &expected_protocols)
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            let status = if netstat_source.error.is_some() {
+                "needs-attention"
+            } else if expected_ports.is_empty() {
+                "no-ports"
+            } else if matches.is_empty() {
+                "missing"
+            } else {
+                "ok"
+            };
+            let next_action = if netstat_source.error.is_some() {
+                "Run on Windows where netstat.exe is available, or provide --netstat-output."
+            } else if expected_ports.is_empty() {
+                "Provide --ports with the game's expected LAN ports."
+            } else if matches.is_empty() {
+                "Start or host the game, then scan again; also check whether the game uses different ports."
+            } else {
+                "Game port bindings were observed; run network-observe to check traffic, route, adapter and tunnel state."
+            };
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "status": status,
+                    "netstatSource": netstat_source,
+                    "gameName": profile.game_name,
+                    "endpointCount": endpoints.len(),
+                    "matchCount": matches.len(),
+                    "expectedPorts": expected_ports,
+                    "expectedProtocols": expected_protocols,
+                    "matches": matches,
+                    "nextAction": next_action,
+                }))?
+            );
+        }
+        Command::GameReadiness {
+            network_report,
+            game_plan,
+            catalog,
+            game_name,
+            steam_app_id,
+            subnet,
+            discovery,
+            ports,
+            compatibility,
+            host_ip,
+            local_ip,
+            firewall_netsh_output,
+            firewall_scan,
+            program,
+            netstat_output,
+            netstat_scan,
+            protocols,
+            relay_local_offer,
+            relay_remote_offer,
+            relay_p2p_status,
+        } => {
+            let network_report: lai_core::NetworkObservationReport =
+                serde_json::from_value(load_json_argument(&network_report)?).map_err(|err| {
+                    invalid_input(format!("invalid network observation report: {err}"))
+                })?;
+            let plan = load_or_create_game_plan(
+                game_plan.as_deref(),
+                catalog.as_deref(),
+                game_name,
+                steam_app_id.as_deref(),
+                subnet,
+                discovery,
+                ports,
+                compatibility,
+                host_ip.as_deref(),
+                local_ip.as_deref(),
+            )?;
+            let firewall_source =
+                load_firewall_source(firewall_netsh_output.as_deref(), firewall_scan);
+            let firewall_report = game_readiness_firewall_report(
+                &plan,
+                &firewall_source,
+                program.as_deref(),
+                firewall_scan || firewall_netsh_output.is_some(),
+            );
+            let expected_ports = game_plan_ports(&plan);
+            let expected_protocols = parse_protocol_filter(&protocols);
+            let netstat_source = load_netstat_source(netstat_output.as_deref(), netstat_scan);
+            let endpoints = if netstat_source.error.is_none() {
+                lai_core::parse_windows_netstat_ano(&netstat_source.raw_output)
+            } else {
+                Vec::new()
+            };
+            let matches = endpoints
+                .iter()
+                .filter(|endpoint| {
+                    endpoint_matches_game_ports(endpoint, &expected_ports, &expected_protocols)
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            let (_, connection_path_report, connection_path_error) = load_relay_fallback_for_export(
+                relay_local_offer.as_deref(),
+                relay_remote_offer.as_deref(),
+                &relay_p2p_status,
+            );
+            let report = evaluate_game_readiness_with_firewall_and_connection_path(
+                &plan,
+                &network_report,
+                &matches,
+                firewall_report.as_ref(),
+                connection_path_report.as_ref(),
+            );
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "status": report.status,
+                    "report": report,
+                    "networkStatus": network_report.status,
+                    "gamePlan": plan,
+                    "firewallSource": firewall_source,
+                    "firewallReport": firewall_report,
+                    "netstatSource": netstat_source,
+                    "endpointCount": endpoints.len(),
+                    "matchCount": matches.len(),
+                    "matches": matches,
+                    "connectionPathReport": connection_path_report,
+                    "connectionPathError": connection_path_error,
+                }))?
+            );
+        }
         Command::RoomRuntimeRun {
             room_id,
             peer_id,
@@ -987,6 +1581,7 @@ fn run_main() -> Result<(), Box<dyn std::error::Error>> {
             coordination_peers,
             game_ports,
             broadcast_ports,
+            max_broadcast_packets_per_second,
             key,
             duration_ms,
             observe_file,
@@ -1005,6 +1600,8 @@ fn run_main() -> Result<(), Box<dyn std::error::Error>> {
             nat_bootstrap_timeout_ms,
             stop_file,
             snapshot_interval_ms,
+            coordination_monitor,
+            coordination_monitor_interval_ms,
             wintun_adapter_name,
             wintun_ring_capacity,
             wintun_probe_receive,
@@ -1031,33 +1628,46 @@ fn run_main() -> Result<(), Box<dyn std::error::Error>> {
             )?;
             runtime_peers.append(&mut bootstrapped_peers);
             let (mut coordination_bootstrapped_peers, mut coordination_bootstrap_results) =
-                run_runtime_coordination_bootstraps(
-                    coordination_store.as_deref(),
-                    &coordination_peers,
-                    &room_id,
-                    &peer_id,
-                    local_virtual_ip,
-                    &key,
-                    &bind,
-                    nat_bootstrap_attempts,
-                    nat_bootstrap_interval_ms,
-                    nat_bootstrap_timeout_ms,
-                )?;
+                if coordination_peers.is_empty() {
+                    (Vec::new(), Vec::new())
+                } else {
+                    run_runtime_coordination_bootstraps(
+                        coordination_store.as_deref(),
+                        &coordination_peers,
+                        &room_id,
+                        &peer_id,
+                        local_virtual_ip,
+                        &key,
+                        &bind,
+                        nat_bootstrap_attempts,
+                        nat_bootstrap_interval_ms,
+                        nat_bootstrap_timeout_ms,
+                    )?
+                };
             runtime_peers.append(&mut coordination_bootstrapped_peers);
             let (mut coordination_server_peers, mut coordination_server_results) =
-                run_runtime_coordination_server_bootstraps(
-                    coordination_server.as_deref(),
-                    &coordination_peers,
-                    &room_id,
-                    &peer_id,
-                    local_virtual_ip,
-                    &key,
-                    &bind,
-                    nat_bootstrap_attempts,
-                    nat_bootstrap_interval_ms,
-                    nat_bootstrap_timeout_ms,
-                )?;
+                if coordination_peers.is_empty() {
+                    (Vec::new(), Vec::new())
+                } else {
+                    run_runtime_coordination_server_bootstraps(
+                        coordination_server.as_deref(),
+                        &coordination_peers,
+                        &room_id,
+                        &peer_id,
+                        local_virtual_ip,
+                        &key,
+                        &bind,
+                        nat_bootstrap_attempts,
+                        nat_bootstrap_interval_ms,
+                        nat_bootstrap_timeout_ms,
+                    )?
+                };
             runtime_peers.append(&mut coordination_server_peers);
+            let connection_path_reports = connection_path_reports_from_bootstrap_outputs(
+                &nat_bootstrap_results,
+                &coordination_bootstrap_results,
+                &coordination_server_results,
+            )?;
             let plan = create_room_runtime_plan(
                 room_id,
                 peer_id,
@@ -1084,6 +1694,11 @@ fn run_main() -> Result<(), Box<dyn std::error::Error>> {
                 peer_timeout_ms,
                 stop_file.as_deref(),
                 snapshot_interval_ms,
+                coordination_monitor.then(|| RuntimeCoordinationMonitor {
+                    store_path: coordination_store.clone(),
+                    server: coordination_server.clone(),
+                    interval_ms: coordination_monitor_interval_ms,
+                }),
                 &RuntimePacketIoProbeOptions {
                     wintun_adapter_name,
                     wintun_ring_capacity,
@@ -1093,13 +1708,46 @@ fn run_main() -> Result<(), Box<dyn std::error::Error>> {
                     wintun_probe_send,
                 },
                 wintun_runtime,
-                broadcast_ports,
-                game_ports,
+                broadcast_ports.clone(),
+                game_ports.clone(),
+                max_broadcast_packets_per_second,
             )?;
             result["natBootstrapResults"] = serde_json::Value::Array(nat_bootstrap_results);
             coordination_bootstrap_results.append(&mut coordination_server_results);
             result["coordinationBootstrapResults"] =
                 serde_json::Value::Array(std::mem::take(&mut coordination_bootstrap_results));
+            result["connectionPathReports"] =
+                serde_json::Value::Array(connection_path_reports.clone());
+            result["runtimeRelayFallbackSummaries"] = serde_json::Value::Array(
+                runtime_relay_fallback_summaries(&connection_path_reports),
+            );
+            let actual_tunnel_endpoint = result
+                .get("actualTunnelEndpoint")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned);
+            let runtime_peer_summary_values = runtime_peer_summaries(
+                &plan,
+                &connection_path_reports,
+                json_array_values(&result, "tunnelPackets").as_slice(),
+                json_array_values(&result, "forwardedPackets").as_slice(),
+                json_array_values(&result, "heartbeatPackets").as_slice(),
+                json_array_values(&result, "heartbeatAckPackets").as_slice(),
+                result
+                    .get("tunnelServiceSnapshot")
+                    .and_then(|snapshot| snapshot.get("connection_path"))
+                    .and_then(serde_json::Value::as_str),
+                actual_tunnel_endpoint.as_deref(),
+            );
+            refresh_runtime_network_observation(
+                &mut result,
+                &plan,
+                runtime_peer_summary_values,
+                broadcast_ports,
+                game_ports,
+            )?;
+            if let Some(path) = snapshot_out.as_deref() {
+                write_json_file(path, &result)?;
+            }
             println!("{}", serde_json::to_string_pretty(&result)?);
         }
         Command::Diagnose { p2p, firewall } => {
@@ -1194,13 +1842,22 @@ fn run_main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Command::FirewallPlan {
             game_name,
+            catalog,
+            steam_app_id,
             subnet,
             discovery,
             ports,
             compatibility,
             program,
         } => {
-            let profile = profile_from_args(game_name, discovery, ports, compatibility)?;
+            let profile = profile_from_catalog_or_args(
+                catalog.as_deref(),
+                game_name,
+                steam_app_id.as_deref(),
+                discovery,
+                ports,
+                compatibility,
+            )?;
             let subnet = subnet.parse::<Ipv4Subnet>()?;
             let network_plan = create_game_network_plan(&profile, subnet, None, None, 30);
             let firewall_plan = create_windows_firewall_plan(
@@ -1212,6 +1869,8 @@ fn run_main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Command::FirewallDiagnose {
             game_name,
+            catalog,
+            steam_app_id,
             subnet,
             discovery,
             ports,
@@ -1220,7 +1879,14 @@ fn run_main() -> Result<(), Box<dyn std::error::Error>> {
             netsh_output,
             program,
         } => {
-            let profile = profile_from_args(game_name, discovery, ports, compatibility)?;
+            let profile = profile_from_catalog_or_args(
+                catalog.as_deref(),
+                game_name,
+                steam_app_id.as_deref(),
+                discovery,
+                ports,
+                compatibility,
+            )?;
             let subnet = subnet.parse::<Ipv4Subnet>()?;
             let network_plan = create_game_network_plan(&profile, subnet, None, None, 30);
             let observed_rules = if let Some(path) = netsh_output {
@@ -1655,6 +2321,26 @@ fn run_main() -> Result<(), Box<dyn std::error::Error>> {
             let plan = lai_core::create_nat_punch_plan(&local, &remote, attempts, interval_ms);
             println!("{}", serde_json::to_string_pretty(&plan)?);
         }
+        Command::RelayFallbackPlan {
+            local_offer,
+            remote_offer,
+            p2p_status,
+        } => {
+            let local = load_nat_offer_argument(&local_offer)?;
+            let remote = load_nat_offer_argument(&remote_offer)?;
+            let plan = lai_core::create_relay_fallback_plan(&local, &remote, p2p_status);
+            println!("{}", serde_json::to_string_pretty(&plan)?);
+        }
+        Command::ConnectionPathPlan {
+            local_offer,
+            remote_offer,
+            p2p_status,
+        } => {
+            let local = load_nat_offer_argument(&local_offer)?;
+            let remote = load_nat_offer_argument(&remote_offer)?;
+            let report = lai_core::evaluate_connection_path(&local, &remote, p2p_status);
+            println!("{}", serde_json::to_string_pretty(&report)?);
+        }
         Command::NatHolePunch {
             room_id,
             peer_id,
@@ -1862,9 +2548,21 @@ fn run_main() -> Result<(), Box<dyn std::error::Error>> {
             write_json_file(&store, &coordination_store)?;
             println!("{}", serde_json::to_string_pretty(&report)?);
         }
-        Command::CoordinationClose { store, room_id } => {
+        Command::CoordinationClose {
+            store,
+            room_id,
+            closed_by,
+        } => {
             let mut coordination_store = load_coordination_store_or_default(&store)?;
-            let report = lai_core::close_coordination_room(&mut coordination_store, room_id);
+            let report = if let Some(closed_by) = closed_by {
+                lai_core::close_coordination_room_by_peer(
+                    &mut coordination_store,
+                    room_id,
+                    closed_by,
+                )
+            } else {
+                lai_core::close_coordination_room(&mut coordination_store, room_id)
+            };
             write_json_file(&store, &coordination_store)?;
             println!("{}", serde_json::to_string_pretty(&report)?);
         }
@@ -1946,8 +2644,12 @@ fn run_main() -> Result<(), Box<dyn std::error::Error>> {
             let result = coordination_http_kick(&server, &room_id, &peer_id, &kicked_by)?;
             println!("{}", serde_json::to_string_pretty(&result)?);
         }
-        Command::CoordinationHttpClose { server, room_id } => {
-            let result = coordination_http_close(&server, &room_id)?;
+        Command::CoordinationHttpClose {
+            server,
+            room_id,
+            closed_by,
+        } => {
+            let result = coordination_http_close(&server, &room_id, closed_by.as_deref())?;
             println!("{}", serde_json::to_string_pretty(&result)?);
         }
         Command::CoordinationHttpPrune { server } => {
@@ -2002,6 +2704,36 @@ fn run_main() -> Result<(), Box<dyn std::error::Error>> {
             let result = run_udp_capture_loopback_test(&message, observe_file.as_deref())?;
             println!("{}", serde_json::to_string_pretty(&result)?);
         }
+        Command::UdpLoopbackTest {
+            port,
+            message,
+            timeout_ms,
+            observe_file,
+        } => {
+            let result =
+                run_udp_loopback_test(port, &message, timeout_ms, observe_file.as_deref())?;
+            println!("{}", serde_json::to_string_pretty(&result)?);
+        }
+        Command::UdpBroadcastTest {
+            port,
+            message,
+            timeout_ms,
+            observe_file,
+        } => {
+            let result =
+                run_udp_broadcast_test(port, &message, timeout_ms, observe_file.as_deref())?;
+            println!("{}", serde_json::to_string_pretty(&result)?);
+        }
+        Command::TcpLoopbackTest {
+            port,
+            message,
+            timeout_ms,
+            observe_file,
+        } => {
+            let result =
+                run_tcp_loopback_test(port, &message, timeout_ms, observe_file.as_deref())?;
+            println!("{}", serde_json::to_string_pretty(&result)?);
+        }
         Command::NetworkObserve {
             adapter_name,
             adapter_enabled,
@@ -2009,40 +2741,51 @@ fn run_main() -> Result<(), Box<dyn std::error::Error>> {
             assigned_ip,
             subnet,
             adapter_netsh_output,
+            adapter_scan,
             tunnel_state,
             connected_peers,
             expected_peers,
             latency_ms,
             packet_loss_percent,
+            connection_path,
+            ping_test,
             ping_output,
             broadcast_ports,
             game_ports,
             packets,
             packet_observations,
+            route_output,
+            route_scan,
         } => {
             let expected_ip = parse_optional_ipv4(expected_ip.as_deref())?;
             let expected_subnet = parse_optional_subnet(subnet.as_deref())?;
-            let adapter = if let Some(path) = adapter_netsh_output {
+            let explicit_adapter_name = adapter_name.clone();
+            let adapter_name_value =
+                adapter_name.unwrap_or_else(|| "LocalAreaInterconnection".to_owned());
+            let adapter_source = load_adapter_source(
+                &adapter_name_value,
+                adapter_netsh_output.as_deref(),
+                adapter_scan,
+            );
+            let adapter = if !adapter_source.raw_output.trim().is_empty() {
                 parse_netsh_adapter_observation(
-                    adapter_name.unwrap_or_else(|| "LocalAreaInterconnection".to_owned()),
-                    &fs::read_to_string(path)?,
+                    adapter_name_value.clone(),
+                    &adapter_source.raw_output,
                     expected_ip,
                     expected_subnet,
                 )
+            } else if explicit_adapter_name.is_none() {
+                None
             } else {
-                adapter_name
-                    .map(|adapter_name| {
-                        Ok::<_, Box<dyn std::error::Error>>(AdapterObservation {
-                            adapter_name,
-                            enabled: adapter_enabled,
-                            expected_ip,
-                            assigned_ip: parse_optional_ipv4(assigned_ip.as_deref())?,
-                            virtual_subnet: expected_subnet,
-                            mtu: None,
-                            interface_metric: None,
-                        })
-                    })
-                    .transpose()?
+                Some(AdapterObservation {
+                    adapter_name: adapter_name_value,
+                    enabled: adapter_enabled,
+                    expected_ip,
+                    assigned_ip: parse_optional_ipv4(assigned_ip.as_deref())?,
+                    virtual_subnet: expected_subnet,
+                    mtu: None,
+                    interface_metric: None,
+                })
             };
             let mut packet_observations_data = if let Some(path) = packet_observations {
                 lai_core::parse_packet_observation_lines(&fs::read_to_string(path)?)?
@@ -2050,10 +2793,17 @@ fn run_main() -> Result<(), Box<dyn std::error::Error>> {
                 Vec::new()
             };
             packet_observations_data.extend(parse_packet_observations(&packets)?);
-            let report = evaluate_network_observations(NetworkObservationSnapshot {
-                adapter,
-                tunnel: Some(if let Some(path) = ping_output {
-                    parse_windows_ping_observation(&fs::read_to_string(path)?, expected_peers)
+            let route_source = load_route_source(route_output.as_deref(), route_scan);
+            let route_observations = if route_source.error.is_none() {
+                lai_core::parse_windows_ipv4_routes(&route_source.raw_output)
+            } else {
+                Vec::new()
+            };
+            let route_count = route_observations.len();
+            let ping_source = load_ping_source(ping_output.as_deref(), ping_test.as_deref());
+            let mut tunnel = if let Some(source) = ping_source.as_ref() {
+                if source.error.is_none() && !source.raw_output.trim().is_empty() {
+                    parse_windows_ping_observation(&source.raw_output, expected_peers)
                 } else {
                     TunnelObservation {
                         state: tunnel_state,
@@ -2062,13 +2812,33 @@ fn run_main() -> Result<(), Box<dyn std::error::Error>> {
                         packet_loss_percent,
                         path: None,
                     }
-                }),
+                }
+            } else {
+                TunnelObservation {
+                    state: tunnel_state,
+                    connected_peer_count: connected_peers,
+                    latency_ms,
+                    packet_loss_percent,
+                    path: None,
+                }
+            };
+            tunnel.path = connection_path;
+            let report = evaluate_network_observations(NetworkObservationSnapshot {
+                adapter,
+                tunnel: Some(tunnel),
                 packets: packet_observations_data,
                 expected_peer_count: expected_peers,
                 expected_broadcast_ports: parse_ports(&broadcast_ports)?,
                 expected_game_ports: parse_ports(&game_ports)?,
+                route_observations,
+                runtime_peers: Vec::new(),
             });
-            println!("{}", serde_json::to_string_pretty(&report)?);
+            let mut output = serde_json::to_value(&report)?;
+            output["adapterSource"] = serde_json::to_value(adapter_source)?;
+            output["pingSource"] = serde_json::to_value(ping_source)?;
+            output["routeSource"] = serde_json::to_value(route_source)?;
+            output["routeCount"] = serde_json::json!(route_count);
+            println!("{}", serde_json::to_string_pretty(&output)?);
         }
         Command::DiagnosticExport {
             out,
@@ -2088,7 +2858,13 @@ fn run_main() -> Result<(), Box<dyn std::error::Error>> {
             packets,
             packet_observations,
             runtime_snapshot,
+            route_output,
+            route_scan,
+            netstat_output,
+            netstat_scan,
             game_name,
+            catalog,
+            steam_app_id,
             discovery,
             ports,
             compatibility,
@@ -2100,6 +2876,9 @@ fn run_main() -> Result<(), Box<dyn std::error::Error>> {
             wintun_receive_attempts,
             wintun_receive_poll_interval_ms,
             wintun_probe_send,
+            relay_local_offer,
+            relay_remote_offer,
+            relay_p2p_status,
         } => {
             let expected_ip = parse_optional_ipv4(expected_ip.as_deref())?;
             let assigned_ip = parse_optional_ipv4(assigned_ip.as_deref())?;
@@ -2138,6 +2917,20 @@ fn run_main() -> Result<(), Box<dyn std::error::Error>> {
                         )
                     })
                 });
+            let (relay_fallback_plan, connection_path_report, relay_fallback_error) =
+                load_relay_fallback_for_export(
+                    relay_local_offer.as_deref(),
+                    relay_remote_offer.as_deref(),
+                    &relay_p2p_status,
+                );
+            let game_profile = profile_from_catalog_or_args(
+                catalog.as_deref(),
+                game_name,
+                steam_app_id.as_deref(),
+                discovery,
+                ports,
+                compatibility,
+            )?;
             let inputs = DiagnosticExportInputs {
                 adapter_name: adapter_name.clone(),
                 expected_ip,
@@ -2148,10 +2941,10 @@ fn run_main() -> Result<(), Box<dyn std::error::Error>> {
                 packet_observations: packet_observations_path,
                 broadcast_ports,
                 game_ports,
-                game_name,
-                discovery: parse_discovery(&discovery)?,
-                ports: parse_ports(&ports)?,
-                compatibility: parse_compatibility(&compatibility)?,
+                game_name: game_profile.game_name,
+                discovery: game_profile.discovery,
+                ports: game_profile.ports,
+                compatibility: game_profile.compatibility,
                 program,
             };
             let sources = DiagnosticExportSources {
@@ -2172,6 +2965,11 @@ fn run_main() -> Result<(), Box<dyn std::error::Error>> {
                 packet_io_probe: packet_io_probe_value,
                 runtime_snapshot: runtime_snapshot_value,
                 runtime_snapshot_error,
+                route_table: load_route_source(route_output.as_deref(), route_scan),
+                netstat_table: load_netstat_source(netstat_output.as_deref(), netstat_scan),
+                relay_fallback_plan,
+                connection_path_report,
+                relay_fallback_error,
             };
             let bundle = create_diagnostic_export_bundle(
                 current_epoch_ms(),
@@ -2362,6 +3160,24 @@ fn profile_from_args(
     })
 }
 
+fn profile_from_catalog_or_args(
+    catalog: Option<&str>,
+    game_name: String,
+    steam_app_id: Option<&str>,
+    discovery: String,
+    ports: String,
+    compatibility: String,
+) -> Result<GameProfile, Box<dyn std::error::Error>> {
+    if let Some(catalog_path) = catalog.map(str::trim).filter(|path| !path.is_empty()) {
+        let catalog_text = fs::read_to_string(catalog_path)?;
+        let catalog = parse_game_profile_catalog_json(&catalog_text)?;
+        if let Some(matched) = find_game_profile(&catalog, Some(&game_name), steam_app_id) {
+            return Ok(matched.profile);
+        }
+    }
+    profile_from_args(game_name, discovery, ports, compatibility)
+}
+
 fn parse_ports(value: &str) -> Result<Vec<u16>, Box<dyn std::error::Error>> {
     if value.trim().is_empty() {
         return Ok(Vec::new());
@@ -2436,9 +3252,25 @@ fn runtime_peer_from_bootstrap_result(
     virtual_ip: Ipv4Addr,
     result: &serde_json::Value,
 ) -> Result<RoomRuntimePeer, Box<dyn std::error::Error>> {
-    let selected = result
-        .get("selectedPeer")
-        .ok_or_else(|| invalid_input("NAT bootstrap result is missing selectedPeer".to_owned()))?;
+    let endpoint = match runtime_direct_endpoint_from_bootstrap_result(peer_id, result)? {
+        Some(endpoint) => endpoint,
+        None => runtime_fallback_endpoint_from_bootstrap_result(result)?,
+    };
+
+    Ok(RoomRuntimePeer {
+        peer_id: peer_id.to_owned(),
+        virtual_ip,
+        endpoint,
+    })
+}
+
+fn runtime_direct_endpoint_from_bootstrap_result(
+    peer_id: &str,
+    result: &serde_json::Value,
+) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    let Some(selected) = result.get("selectedPeer") else {
+        return Ok(None);
+    };
     let responder_peer_id = selected
         .get("responderPeerId")
         .and_then(serde_json::Value::as_str)
@@ -2450,35 +3282,59 @@ fn runtime_peer_from_bootstrap_result(
             "NAT bootstrap responder `{responder_peer_id}` does not match expected peer `{peer_id}`"
         )));
     }
-    if !selected
+    let accepted = selected
         .get("accepted")
         .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false)
-    {
-        return Err(invalid_input(
-            "NAT bootstrap selectedPeer was not accepted by the responder".to_owned(),
-        ));
-    }
-    if !selected
+        .unwrap_or(false);
+    let nonce_matched = selected
         .get("nonceMatched")
         .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false)
-    {
-        return Err(invalid_input(
-            "NAT bootstrap selectedPeer nonce did not match the handshake".to_owned(),
-        ));
+        .unwrap_or(false);
+    if !accepted || !nonce_matched {
+        return Ok(None);
     }
-    let endpoint = selected
+    selected
         .get("endpoint")
         .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| invalid_input("NAT bootstrap selectedPeer is missing endpoint".to_owned()))?
-        .to_owned();
+        .map(|endpoint| Ok(endpoint.to_owned()))
+        .unwrap_or_else(|| {
+            Err(invalid_input(
+                "NAT bootstrap selectedPeer is missing endpoint".to_owned(),
+            ))
+        })
+        .map(Some)
+}
 
-    Ok(RoomRuntimePeer {
-        peer_id: peer_id.to_owned(),
-        virtual_ip,
-        endpoint,
-    })
+fn runtime_fallback_endpoint_from_bootstrap_result(
+    result: &serde_json::Value,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let local_offer: lai_core::NatTraversalOffer =
+        serde_json::from_value(result.get("localOffer").cloned().ok_or_else(|| {
+            invalid_input("NAT bootstrap result is missing localOffer".to_owned())
+        })?)?;
+    let remote_offer: lai_core::NatTraversalOffer =
+        serde_json::from_value(result.get("remoteOffer").cloned().ok_or_else(|| {
+            invalid_input("NAT bootstrap result is missing remoteOffer".to_owned())
+        })?)?;
+    let status = result
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown");
+    let report = lai_core::evaluate_connection_path(
+        &local_offer,
+        &remote_offer,
+        connection_path_status_from_bootstrap_status(status),
+    );
+    report
+        .selected_endpoints
+        .first()
+        .cloned()
+        .ok_or_else(|| {
+            invalid_input(
+                "NAT bootstrap did not produce a direct peer and no relay/P2P fallback endpoint was available."
+                    .to_owned(),
+            )
+        })
 }
 
 fn run_runtime_nat_bootstraps(
@@ -2831,6 +3687,22 @@ fn handle_coordination_http_request(
             write_json_file(store_path, store)?;
             Ok((200, serde_json::to_value(result)?))
         }
+        ("GET", ["v1", "rooms", room_id, "view"]) => {
+            let peer_id = query_value(&request.query, "peer_id")
+                .or_else(|| query_value(&request.query, "peerId"))
+                .ok_or_else(|| invalid_input("missing query parameter `peer_id`".to_owned()))?;
+            let subnet = query_value(&request.query, "subnet")
+                .ok_or_else(|| invalid_input("missing query parameter `subnet`".to_owned()))?
+                .parse::<Ipv4Subnet>()?;
+            let view = lai_core::coordination_room_view(
+                store,
+                room_id.to_owned(),
+                peer_id,
+                subnet,
+                current_epoch_ms(),
+            );
+            Ok((200, serde_json::to_value(view)?))
+        }
         ("POST", ["v1", "rooms", room_id, "peers", peer_id, "heartbeat"]) => {
             let body = if request.body.is_empty() {
                 serde_json::json!({})
@@ -2885,7 +3757,24 @@ fn handle_coordination_http_request(
             Ok((200, serde_json::to_value(report)?))
         }
         ("POST", ["v1", "rooms", room_id, "close"]) => {
-            let report = lai_core::close_coordination_room(store, room_id.to_owned());
+            let body = if request.body.is_empty() {
+                serde_json::json!({})
+            } else {
+                serde_json::from_slice::<serde_json::Value>(&request.body)?
+            };
+            let closed_by = body
+                .get("closedBy")
+                .or_else(|| body.get("closed_by"))
+                .and_then(serde_json::Value::as_str);
+            let report = if let Some(closed_by) = closed_by {
+                lai_core::close_coordination_room_by_peer(
+                    store,
+                    room_id.to_owned(),
+                    closed_by.to_owned(),
+                )
+            } else {
+                lai_core::close_coordination_room(store, room_id.to_owned())
+            };
             write_json_file(store_path, store)?;
             Ok((200, serde_json::to_value(report)?))
         }
@@ -3020,6 +3909,21 @@ fn coordination_http_fetch_offers(
     ))
 }
 
+fn coordination_http_room_view(
+    server: &str,
+    room_id: &str,
+    peer_id: &str,
+    subnet: Ipv4Subnet,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    http_get_json(&format!(
+        "{}/v1/rooms/{}/view?peer_id={}&subnet={}",
+        trim_trailing_slash(server),
+        percent_encode(room_id),
+        percent_encode(peer_id),
+        percent_encode(&subnet.to_string())
+    ))
+}
+
 fn coordination_http_heartbeat(
     server: &str,
     room_id: &str,
@@ -3073,14 +3977,18 @@ fn coordination_http_kick(
 fn coordination_http_close(
     server: &str,
     room_id: &str,
+    closed_by: Option<&str>,
 ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    let body = closed_by
+        .map(|closed_by| serde_json::json!({ "closedBy": closed_by }))
+        .unwrap_or_else(|| serde_json::json!({}));
     http_post_json(
         &format!(
             "{}/v1/rooms/{}/close",
             trim_trailing_slash(server),
             percent_encode(room_id)
         ),
-        &serde_json::json!({}),
+        &body,
     )
 }
 
@@ -3467,6 +4375,34 @@ fn load_firewall_source(
     }
 }
 
+fn load_route_source(route_output: Option<&str>, route_scan: bool) -> DiagnosticTextSource {
+    if let Some(path) = route_output {
+        return read_text_source("route-file", path);
+    }
+    if route_scan {
+        return run_text_source("route-scan", "route", &["print", "-4"]);
+    }
+    DiagnosticTextSource {
+        source: "skipped".to_owned(),
+        raw_output: String::new(),
+        error: None,
+    }
+}
+
+fn load_netstat_source(netstat_output: Option<&str>, netstat_scan: bool) -> DiagnosticTextSource {
+    if let Some(path) = netstat_output {
+        return read_text_source("netstat-file", path);
+    }
+    if netstat_scan {
+        return run_text_source("netstat-scan", "netstat", &["-ano"]);
+    }
+    DiagnosticTextSource {
+        source: "skipped".to_owned(),
+        raw_output: String::new(),
+        error: None,
+    }
+}
+
 fn load_ping_source(
     ping_output: Option<&str>,
     ping_test: Option<&str>,
@@ -3574,6 +4510,36 @@ fn load_runtime_snapshot(path: Option<&str>) -> (Option<serde_json::Value>, Opti
     }
 }
 
+fn load_runtime_cleanup_plan_for_report(
+    cleanup_plan: Option<&str>,
+    runtime_snapshot: Option<&serde_json::Value>,
+) -> Result<lai_core::RuntimeCleanupPlan, Box<dyn std::error::Error>> {
+    if let Some(plan) = cleanup_plan {
+        return serde_json::from_value(load_json_argument(plan)?)
+            .map_err(|err| invalid_input(format!("invalid runtime cleanup plan: {err}")).into());
+    }
+    let Some(plan_value) =
+        runtime_snapshot.and_then(|snapshot| snapshot.get("runtimeCleanupPlan").cloned())
+    else {
+        return Err(invalid_input(
+            "runtime-cleanup-report requires --cleanup-plan or a --runtime-snapshot containing runtimeCleanupPlan".to_owned(),
+        ));
+    };
+    serde_json::from_value(plan_value).map_err(|err| {
+        invalid_input(format!("invalid runtime cleanup plan in snapshot: {err}")).into()
+    })
+}
+
+fn runtime_wintun_close_report_from_snapshot(
+    runtime_snapshot: &serde_json::Value,
+) -> Option<lai_core::WintunPacketIoCloseReport> {
+    runtime_snapshot
+        .get("wintunRuntime")
+        .and_then(|runtime| runtime.get("close"))
+        .cloned()
+        .and_then(|value| serde_json::from_value(value).ok())
+}
+
 fn merge_runtime_packet_observations(
     packet_data: &mut PacketLoadResult,
     runtime_snapshot: &serde_json::Value,
@@ -3648,6 +4614,172 @@ fn detect_windows_elevation() -> Option<bool> {
         .output()
         .ok()
         .map(|output| output.status.success())
+}
+
+fn runtime_cleanup_apply_status(
+    preview: &lai_core::CommandExecutionPreview,
+    command_results: &[CommandExecutionRecord],
+    unsafe_commands: &[String],
+) -> String {
+    if !unsafe_commands.is_empty() {
+        return "blocked-unsafe-command".to_owned();
+    }
+    if command_results.is_empty() {
+        if preview.commands.is_empty() {
+            "nothing-to-apply".to_owned()
+        } else if !preview.confirmed {
+            "needs-confirmation".to_owned()
+        } else if preview.requires_elevation && !preview.can_execute_now {
+            "needs-elevation".to_owned()
+        } else {
+            "planned".to_owned()
+        }
+    } else if command_results
+        .iter()
+        .all(|record| record.status == CommandExecutionStatus::Succeeded)
+    {
+        "applied".to_owned()
+    } else {
+        "failed".to_owned()
+    }
+}
+
+fn runtime_cleanup_command_safety_errors(plan: &lai_core::RuntimeCleanupPlan) -> Vec<String> {
+    let allowed = lai_core::create_windows_runtime_cleanup_plan_with_routes(
+        plan.room_id.clone(),
+        plan.local_peer_id.clone(),
+        plan.local_virtual_ip,
+        plan.virtual_subnet,
+        plan.adapter_name.clone(),
+        plan.packet_io_backend.clone(),
+        plan.restore_adapter,
+        plan.cleanup_routes,
+    );
+    plan.commands
+        .iter()
+        .filter(|command| {
+            !allowed
+                .commands
+                .iter()
+                .any(|allowed| command.tool == allowed.tool && command.args == allowed.args)
+        })
+        .map(|command| {
+            format!(
+                "Rejected cleanup command not generated from the current plan fields: {}",
+                command.command
+            )
+        })
+        .collect()
+}
+
+fn route_matches_room(
+    route: &lai_core::WindowsRouteObservation,
+    virtual_ip: Option<Ipv4Addr>,
+    subnet: Option<Ipv4Subnet>,
+) -> bool {
+    if route.destination.prefix == 0 {
+        return false;
+    }
+    virtual_ip.is_some_and(|ip| route.destination.contains(ip))
+        || subnet.is_some_and(|subnet| route.destination.intersects(subnet))
+}
+
+fn parse_protocol_filter(value: &str) -> Vec<String> {
+    let mut protocols = value
+        .split(',')
+        .map(str::trim)
+        .filter(|protocol| !protocol.is_empty())
+        .map(str::to_ascii_lowercase)
+        .filter(|protocol| protocol == "tcp" || protocol == "udp")
+        .collect::<Vec<_>>();
+    protocols.sort();
+    protocols.dedup();
+    protocols
+}
+
+fn load_or_create_game_plan(
+    game_plan: Option<&str>,
+    catalog: Option<&str>,
+    game_name: String,
+    steam_app_id: Option<&str>,
+    subnet: String,
+    discovery: String,
+    ports: String,
+    compatibility: String,
+    host_ip: Option<&str>,
+    local_ip: Option<&str>,
+) -> Result<lai_core::GameNetworkPlan, Box<dyn std::error::Error>> {
+    if let Some(plan) = game_plan {
+        return serde_json::from_value(load_json_argument(plan)?)
+            .map_err(|err| invalid_input(format!("invalid game network plan: {err}")).into());
+    }
+    let profile = profile_from_catalog_or_args(
+        catalog,
+        game_name,
+        steam_app_id,
+        discovery,
+        ports,
+        compatibility,
+    )?;
+    Ok(create_game_network_plan(
+        &profile,
+        subnet.parse::<Ipv4Subnet>()?,
+        parse_optional_ipv4(host_ip)?,
+        parse_optional_ipv4(local_ip)?,
+        30,
+    ))
+}
+
+fn game_plan_ports(plan: &lai_core::GameNetworkPlan) -> Vec<u16> {
+    let mut ports = plan
+        .firewall_rules
+        .iter()
+        .map(|rule| rule.port)
+        .collect::<Vec<_>>();
+    ports.sort_unstable();
+    ports.dedup();
+    ports
+}
+
+fn game_readiness_firewall_report(
+    plan: &lai_core::GameNetworkPlan,
+    source: &DiagnosticTextSource,
+    program: Option<&str>,
+    requested: bool,
+) -> Option<FirewallDiagnosticsReport> {
+    if !requested {
+        return None;
+    }
+    if let Some(error) = source.error.as_ref() {
+        return Some(FirewallDiagnosticsReport {
+            status: "needs-attention".to_owned(),
+            summary: format!("Firewall diagnostics failed: {error}"),
+            expected_rule_count: plan.firewall_rules.len(),
+            observed_rule_count: 0,
+            problem_count: plan.firewall_rules.len().max(1),
+            checks: Vec::new(),
+        });
+    }
+    let observed_rules = parse_netsh_firewall_rules(&source.raw_output);
+    Some(evaluate_firewall_diagnostics(
+        &plan.firewall_rules,
+        &observed_rules,
+        program,
+    ))
+}
+
+fn endpoint_matches_game_ports(
+    endpoint: &lai_core::WindowsNetstatEndpoint,
+    expected_ports: &[u16],
+    expected_protocols: &[String],
+) -> bool {
+    endpoint
+        .local_port
+        .is_some_and(|port| expected_ports.contains(&port))
+        && (expected_protocols.is_empty()
+            || expected_protocols
+                .iter()
+                .any(|protocol| protocol.eq_ignore_ascii_case(&endpoint.protocol)))
 }
 
 fn execute_network_commands(commands: &[NetworkCommand]) -> Vec<CommandExecutionRecord> {
@@ -4077,6 +5209,296 @@ fn load_nat_offer_argument(
         value.to_owned()
     };
     Ok(serde_json::from_str(&text)?)
+}
+
+fn load_relay_fallback_for_export(
+    local_offer: Option<&str>,
+    remote_offer: Option<&str>,
+    p2p_status: &str,
+) -> (
+    Option<lai_core::RelayFallbackPlan>,
+    Option<lai_core::ConnectionPathReport>,
+    Option<String>,
+) {
+    match (local_offer, remote_offer) {
+        (None, None) => (None, None, None),
+        (Some(_), None) | (None, Some(_)) => (
+            None,
+            None,
+            Some(
+                "Both --relay-local-offer and --relay-remote-offer are required for relay fallback export."
+                    .to_owned(),
+            ),
+        ),
+        (Some(local_offer), Some(remote_offer)) => {
+            let local = match load_nat_offer_argument(local_offer) {
+                Ok(offer) => offer,
+                Err(err) => {
+                    return (
+                        None,
+                        None,
+                        Some(format!("failed to load relay local offer: {err}")),
+                    )
+                }
+            };
+            let remote = match load_nat_offer_argument(remote_offer) {
+                Ok(offer) => offer,
+                Err(err) => {
+                    return (
+                        None,
+                        None,
+                        Some(format!("failed to load relay remote offer: {err}")),
+                    )
+                }
+            };
+            let relay_fallback =
+                lai_core::create_relay_fallback_plan(&local, &remote, p2p_status);
+            let connection_path = lai_core::evaluate_connection_path(&local, &remote, p2p_status);
+            (
+                Some(relay_fallback),
+                Some(connection_path),
+                None,
+            )
+        }
+    }
+}
+
+fn connection_path_reports_from_bootstrap_outputs(
+    nat_results: &[serde_json::Value],
+    coordination_results: &[serde_json::Value],
+    coordination_server_results: &[serde_json::Value],
+) -> Result<Vec<serde_json::Value>, Box<dyn std::error::Error>> {
+    let mut reports = Vec::new();
+    for result in nat_results {
+        if let Some(report) = connection_path_report_from_bootstrap_result(
+            "nat-bootstrap-remote-peer",
+            result
+                .get("remoteOffer")
+                .and_then(|offer| offer.get("peer_id"))
+                .and_then(serde_json::Value::as_str),
+            result,
+        )? {
+            reports.push(report);
+        }
+    }
+    for wrapper in coordination_results
+        .iter()
+        .chain(coordination_server_results.iter())
+    {
+        let Some(result) = wrapper.get("result") else {
+            continue;
+        };
+        let source = wrapper
+            .get("source")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("coordination");
+        if let Some(report) = connection_path_report_from_bootstrap_result(
+            source,
+            wrapper.get("peerId").and_then(serde_json::Value::as_str),
+            result,
+        )? {
+            reports.push(report);
+        }
+    }
+    Ok(reports)
+}
+
+fn runtime_relay_fallback_summaries(
+    connection_path_reports: &[serde_json::Value],
+) -> Vec<serde_json::Value> {
+    connection_path_reports
+        .iter()
+        .filter_map(|entry| {
+            let report = entry.get("report").or(Some(entry))?;
+            let fallback = report.get("relay_fallback")?;
+            let status = fallback
+                .get("status")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown");
+            let selected_path = report
+                .get("selected_path")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown");
+            let selected_relay_endpoints = fallback
+                .get("selected_relay_endpoints")
+                .and_then(serde_json::Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            let recommended_actions = fallback
+                .get("recommended_actions")
+                .and_then(serde_json::Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            let warnings = fallback
+                .get("warnings")
+                .and_then(serde_json::Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            Some(serde_json::json!({
+                "source": entry
+                    .get("source")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("connection-path"),
+                "peerId": connection_path_peer_id(entry).unwrap_or_else(|| {
+                    report
+                        .get("remote_peer_id")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("unknown")
+                        .to_owned()
+                }),
+                "bootstrapStatus": entry
+                    .get("bootstrapStatus")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("unknown"),
+                "status": status,
+                "selectedPath": selected_path,
+                "p2pStatus": fallback
+                    .get("p2p_status")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("unknown"),
+                "p2pCandidateCount": fallback
+                    .get("p2p_candidate_count")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or_default(),
+                "relayCandidateCount": fallback
+                    .get("relay_candidate_count")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or_default(),
+                "selectedRelayEndpoints": selected_relay_endpoints,
+                "recommendedActions": recommended_actions,
+                "warnings": warnings,
+            }))
+        })
+        .collect()
+}
+
+fn connection_path_report_from_bootstrap_result(
+    source: &str,
+    peer_id: Option<&str>,
+    result: &serde_json::Value,
+) -> Result<Option<serde_json::Value>, Box<dyn std::error::Error>> {
+    let Some(local_offer_value) = result.get("localOffer").cloned() else {
+        return Ok(None);
+    };
+    let Some(remote_offer_value) = result.get("remoteOffer").cloned() else {
+        return Ok(None);
+    };
+    let local_offer: lai_core::NatTraversalOffer = serde_json::from_value(local_offer_value)?;
+    let remote_offer: lai_core::NatTraversalOffer = serde_json::from_value(remote_offer_value)?;
+    let bootstrap_status = result
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown");
+    let p2p_status = connection_path_status_from_bootstrap_status(bootstrap_status);
+    let report = lai_core::evaluate_connection_path(&local_offer, &remote_offer, p2p_status);
+    let selected_peer = result.get("selectedPeer");
+    Ok(Some(serde_json::json!({
+        "source": source,
+        "peerId": peer_id.unwrap_or(remote_offer.peer_id.as_str()),
+        "bootstrapStatus": bootstrap_status,
+        "bootstrapLatencyMs": selected_peer
+            .and_then(|peer| peer.get("latencyMs"))
+            .and_then(serde_json::Value::as_u64),
+        "observedEndpoint": selected_peer
+            .and_then(|peer| peer.get("observedEndpoint"))
+            .and_then(serde_json::Value::as_str),
+        "report": report,
+    })))
+}
+
+fn connection_path_status_from_bootstrap_status(status: &str) -> &'static str {
+    match status {
+        "ok" | "connected" | "success" | "succeeded" => "ok",
+        "handshake-timeout" | "timeout" | "timed-out" | "no-response" => "timeout",
+        "failed" | "blocked" | "unreachable" | "disconnected" => "failed",
+        _ => "unknown",
+    }
+}
+
+fn check_runtime_coordination_monitor(
+    monitor: &RuntimeCoordinationMonitor,
+    room_id: &str,
+    peer_id: &str,
+    virtual_ip: Ipv4Addr,
+) -> Result<RuntimeCoordinationMonitorReport, Box<dyn std::error::Error>> {
+    let subnet = monitor_subnet_for_virtual_ip(virtual_ip);
+    let checked_at_ms = current_epoch_ms();
+    let (source, view) = if let Some(store_path) = monitor.store_path.as_deref() {
+        let store = load_coordination_store_or_default(store_path)?;
+        (
+            format!("coordination-store:{store_path}"),
+            serde_json::to_value(lai_core::coordination_room_view(
+                &store,
+                room_id.to_owned(),
+                peer_id.to_owned(),
+                subnet,
+                checked_at_ms,
+            ))?,
+        )
+    } else if let Some(server) = monitor.server.as_deref() {
+        (
+            format!("coordination-http:{server}"),
+            coordination_http_room_view(server, room_id, peer_id, subnet)?,
+        )
+    } else {
+        return Ok(RuntimeCoordinationMonitorReport {
+            status: "disabled".to_owned(),
+            source: "none".to_owned(),
+            room_id: room_id.to_owned(),
+            peer_id: peer_id.to_owned(),
+            peer_present: true,
+            room_present: true,
+            checked_at_ms,
+            detail: "Coordination monitor has no store or server configured.".to_owned(),
+        });
+    };
+
+    let members = view
+        .get("members")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let peer_present = members
+        .iter()
+        .any(|member| member.get("peer_id").and_then(serde_json::Value::as_str) == Some(peer_id));
+    let room_present = !members.is_empty();
+    let status = if !room_present {
+        "room-closed"
+    } else if !peer_present {
+        "peer-removed"
+    } else {
+        "ok"
+    }
+    .to_owned();
+    let detail = match status.as_str() {
+        "room-closed" => {
+            "Coordination room is missing or empty; stopping local runtime.".to_owned()
+        }
+        "peer-removed" => {
+            "Local peer is no longer present in coordination room; stopping local runtime."
+                .to_owned()
+        }
+        _ => "Local peer is still present in coordination room.".to_owned(),
+    };
+
+    Ok(RuntimeCoordinationMonitorReport {
+        status,
+        source,
+        room_id: room_id.to_owned(),
+        peer_id: peer_id.to_owned(),
+        peer_present,
+        room_present,
+        checked_at_ms,
+        detail,
+    })
+}
+
+fn monitor_subnet_for_virtual_ip(virtual_ip: Ipv4Addr) -> Ipv4Subnet {
+    let octets = virtual_ip.octets();
+    Ipv4Subnet {
+        network: Ipv4Addr::new(octets[0], octets[1], octets[2], 0),
+        prefix: 24,
+    }
 }
 
 fn resolve_observed_endpoint(
@@ -4615,10 +6037,12 @@ fn run_room_runtime(
     peer_timeout_ms: u64,
     stop_file: Option<&str>,
     snapshot_interval_ms: Option<u64>,
+    coordination_monitor: Option<RuntimeCoordinationMonitor>,
     packet_io_probe_options: &RuntimePacketIoProbeOptions,
     wintun_runtime: bool,
     expected_broadcast_ports: Vec<u16>,
     expected_game_ports: Vec<u16>,
+    max_broadcast_packets_per_second: u16,
 ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
     let started_at_ms = current_epoch_ms();
     let started_at = Instant::now();
@@ -4689,6 +6113,25 @@ fn run_room_runtime(
         normalize_runtime_expected_ports(expected_game_ports, &actual_game_ports);
     let runtime_expected_broadcast_ports =
         normalize_runtime_expected_ports(expected_broadcast_ports, &actual_broadcast_ports);
+    let runtime_cleanup_plan = lai_core::create_windows_runtime_cleanup_plan_with_routes(
+        plan.room_id.clone(),
+        plan.local_peer_id.clone(),
+        plan.local_virtual_ip,
+        Some(runtime_subnet_from_local_ip(plan.local_virtual_ip)),
+        packet_io_probe_options.wintun_adapter_name.clone(),
+        packet_io_backend.to_owned(),
+        false,
+        false,
+    );
+    let mut broadcast_gate = lai_core::BroadcastForwardGate::new(
+        lai_core::BroadcastPolicy::with_limit(
+            runtime_subnet_from_local_ip(plan.local_virtual_ip),
+            runtime_expected_broadcast_ports.clone(),
+            max_broadcast_packets_per_second,
+        ),
+        started_at_ms,
+    );
+    let mut broadcast_forward_events = Vec::new();
     let forward_targets_by_port = runtime_forward_targets(
         plan,
         &actual_broadcast_ports,
@@ -4720,7 +6163,15 @@ fn run_room_runtime(
     let mut next_heartbeat_at = started_at;
     let mut next_snapshot_at =
         snapshot_interval_ms.map(|interval_ms| started_at + Duration::from_millis(interval_ms));
+    let coordination_monitor_interval = coordination_monitor
+        .as_ref()
+        .map(|monitor| Duration::from_millis(monitor.interval_ms.max(1)));
+    let mut next_coordination_monitor_at = coordination_monitor
+        .as_ref()
+        .map(|_| started_at + Duration::from_millis(1));
     let mut heartbeat_packets = Vec::new();
+    let mut heartbeat_ack_packets = Vec::new();
+    let mut coordination_monitor_reports = Vec::new();
     let mut snapshot_write_count = 0u32;
     let mut last_peer_packet_at = None;
     let mut peer_timed_out = false;
@@ -4766,19 +6217,20 @@ fn run_room_runtime(
         if heartbeat_interval.is_some() && now >= next_heartbeat_at {
             for target in &heartbeat_targets {
                 let sequence = heartbeat_packets.len() as u64 + 1;
+                let sent_at_ms = current_epoch_ms();
                 let heartbeat = serde_json::json!({
                     "room_id": plan.room_id,
                     "peer_id": plan.local_peer_id,
                     "virtual_ip": plan.local_virtual_ip,
                     "kind": "runtime-heartbeat",
                     "sequence": sequence,
-                    "sent_at_ms": current_epoch_ms(),
+                    "sent_at_ms": sent_at_ms,
                 });
                 let envelope = seal_tunnel_payload(
                     key,
                     "runtime-heartbeat",
                     sequence,
-                    current_epoch_ms(),
+                    sent_at_ms,
                     serde_json::to_string(&heartbeat)?.as_bytes(),
                 )?;
                 let wire = serde_json::to_vec(&envelope)?;
@@ -4789,6 +6241,7 @@ fn run_room_runtime(
                             "target": target.to_string(),
                             "bytesSent": sent,
                             "sequence": sequence,
+                            "sentAtMs": sent_at_ms,
                         }));
                     }
                     Err(err) => {
@@ -4807,17 +6260,22 @@ fn run_room_runtime(
             (snapshot_out, snapshot_interval_ms, next_snapshot_at)
         {
             if now >= next_snapshot {
+                let tunnel_endpoint_text = tunnel_endpoint.to_string();
                 let tick = serde_json::json!({
                     "status": "running",
                     "startedAtMs": started_at_ms,
                     "updatedAtMs": current_epoch_ms(),
-                    "actualTunnelEndpoint": tunnel_endpoint.to_string(),
+                    "actualTunnelEndpoint": tunnel_endpoint_text.clone(),
                     "bytesSent": bytes_sent,
                     "bytesReceived": bytes_received,
                     "heartbeatPacketsSent": heartbeat_packets.len(),
                     "tunnelPacketCount": tunnel_packets.len(),
                     "packetCaptureCount": capture_summaries.len(),
                     "forwardedPacketCount": forwarded_packets.len(),
+                    "broadcastForwardReport": lai_core::create_broadcast_forward_report(
+                        broadcast_gate.policy(),
+                        broadcast_forward_events.clone(),
+                    ),
                     "injectedPacketCount": injected_packets.len(),
                     "wintunRuntimeReceivedPacketCount": wintun_runtime_received_packets.len(),
                     "wintunRuntimeSentPacketCount": wintun_runtime_sent_packets.len(),
@@ -4825,11 +6283,73 @@ fn run_room_runtime(
                     "adapterWriteStatus": packet_io_probe["adapterWriteStatus"].clone(),
                     "adapterReadStatus": packet_io_probe["adapterReadStatus"].clone(),
                     "wintunRuntime": wintun_runtime_open.clone(),
+                    "runtimeCleanupPlan": runtime_cleanup_plan.clone(),
+                    "runtimePeerSummaries": runtime_peer_summaries(
+                        plan,
+                        &[],
+                        &tunnel_packets,
+                        &forwarded_packets,
+                        &heartbeat_packets,
+                        &heartbeat_ack_packets,
+                        if connected_peer_count > 0 { Some("p2p") } else { None },
+                        Some(tunnel_endpoint_text.as_str()),
+                    ),
+                    "coordinationMonitorReports": coordination_monitor_reports.clone(),
                     "lastError": last_error.clone(),
                 });
                 write_json_file(path, &tick)?;
                 snapshot_write_count += 1;
                 next_snapshot_at = Some(now + Duration::from_millis(interval_ms));
+            }
+        }
+
+        if let (Some(monitor), Some(interval), Some(next_check)) = (
+            coordination_monitor.as_ref(),
+            coordination_monitor_interval,
+            next_coordination_monitor_at,
+        ) {
+            if now >= next_check {
+                let report = check_runtime_coordination_monitor(
+                    monitor,
+                    &plan.room_id,
+                    &plan.local_peer_id,
+                    plan.local_virtual_ip,
+                );
+                let stop_status = report.as_ref().ok().map(|report| report.status.clone());
+                match report {
+                    Ok(report) => {
+                        let should_stop =
+                            matches!(report.status.as_str(), "room-closed" | "peer-removed");
+                        if should_stop {
+                            last_error = Some(report.detail.clone());
+                            coordination_monitor_reports.push(serde_json::to_value(&report)?);
+                            stop_reason = match report.status.as_str() {
+                                "room-closed" => "coordination-room-closed",
+                                "peer-removed" => "coordination-peer-removed",
+                                _ => "coordination-monitor",
+                            };
+                            break;
+                        }
+                        coordination_monitor_reports.push(serde_json::to_value(report)?);
+                    }
+                    Err(err) => {
+                        last_error = Some(format!("Coordination monitor failed: {err}"));
+                        coordination_monitor_reports.push(serde_json::json!({
+                            "status": "error",
+                            "room_id": plan.room_id,
+                            "peer_id": plan.local_peer_id,
+                            "checked_at_ms": current_epoch_ms(),
+                            "detail": err.to_string(),
+                        }));
+                    }
+                }
+                next_coordination_monitor_at = Some(now + interval);
+                if matches!(
+                    stop_status.as_deref(),
+                    Some("room-closed") | Some("peer-removed")
+                ) {
+                    continue;
+                }
             }
         }
 
@@ -4855,9 +6375,66 @@ fn run_room_runtime(
                     .and_then(|envelope| open_tunnel_payload(key, &envelope).ok())
                 {
                     Some(payload) => {
+                        let received_at_ms = current_epoch_ms();
                         last_peer_packet_at = Some(Instant::now());
                         peer_timed_out = false;
                         connected_peer_count = connected_peer_count.max(1);
+                        if payload.metadata.packet_kind == "runtime-heartbeat" {
+                            match runtime_heartbeat_ack_payload(
+                                plan,
+                                &payload.plaintext,
+                                received_at_ms,
+                            ) {
+                                Ok((ack_payload, acked_sequence, heartbeat_sent_at_ms)) => {
+                                    let ack_sent_at_ms = current_epoch_ms();
+                                    let envelope = seal_tunnel_payload(
+                                        key,
+                                        "runtime-heartbeat-ack",
+                                        acked_sequence,
+                                        ack_sent_at_ms,
+                                        serde_json::to_string(&ack_payload)?.as_bytes(),
+                                    )?;
+                                    let wire = serde_json::to_vec(&envelope)?;
+                                    match tunnel_socket.send_to(&wire, peer) {
+                                        Ok(sent) => {
+                                            bytes_sent += sent as u64;
+                                            heartbeat_ack_packets.push(serde_json::json!({
+                                                "direction": "sent",
+                                                "target": peer.to_string(),
+                                                "bytesSent": sent,
+                                                "ackedSequence": acked_sequence,
+                                                "heartbeatSentAtMs": heartbeat_sent_at_ms,
+                                                "receivedAtMs": received_at_ms,
+                                                "sentAtMs": ack_sent_at_ms,
+                                            }));
+                                        }
+                                        Err(err) => {
+                                            last_error = Some(format!(
+                                                "Failed to send runtime heartbeat ack to {peer}: {err}"
+                                            ));
+                                        }
+                                    }
+                                }
+                                Err(err) => {
+                                    last_error =
+                                        Some(format!("Failed to decode runtime heartbeat: {err}"));
+                                }
+                            }
+                        } else if payload.metadata.packet_kind == "runtime-heartbeat-ack" {
+                            match runtime_heartbeat_ack_observation(
+                                peer,
+                                received,
+                                &payload.plaintext,
+                                received_at_ms,
+                            ) {
+                                Ok(ack) => heartbeat_ack_packets.push(ack),
+                                Err(err) => {
+                                    last_error = Some(format!(
+                                        "Failed to decode runtime heartbeat ack: {err}"
+                                    ));
+                                }
+                            }
+                        }
                         if payload.metadata.packet_kind == "runtime-udp-forward"
                             || payload.metadata.packet_kind == "runtime-ipv4-forward"
                         {
@@ -5006,6 +6583,8 @@ fn run_room_runtime(
                             "bytes": received,
                             "kind": payload.metadata.packet_kind,
                             "sequence": payload.metadata.sequence,
+                            "sentAtMs": payload.metadata.sent_at_ms,
+                            "receivedAtMs": received_at_ms,
                         }));
                     }
                     None => {
@@ -5057,6 +6636,20 @@ fn run_room_runtime(
                             .find(|(forward_port, _)| forward_port == port)
                             .map(|(_, targets)| targets.as_slice())
                             .unwrap_or(&[]);
+                        broadcast_forward_events.push(lai_core::BroadcastForwardEvent {
+                            protocol: "udp".to_owned(),
+                            source_ip: socket_addr_ipv4(source),
+                            destination_ip: socket_addr_ipv4(destination),
+                            destination_port: destination.port(),
+                            forwarded: !targets.is_empty(),
+                            reason: if targets.is_empty() {
+                                "no-forward-targets".to_owned()
+                            } else {
+                                "userspace-capture-forwarded".to_owned()
+                            },
+                            target_count: targets.len(),
+                            packet_io_backend: packet_io_backend.to_owned(),
+                        });
                         for target in targets {
                             let raw_virtual_packet = if forward_raw_ipv4 {
                                 Some(runtime_virtual_udp_packet(
@@ -5121,6 +6714,7 @@ fn run_room_runtime(
                                         "bytesSent": sent,
                                         "payloadBytes": received,
                                         "rawIpv4PacketBytes": raw_ipv4_packet.as_ref().map(Vec::len),
+                                        "sentAtMs": current_epoch_ms(),
                                     }));
                                 }
                                 Err(err) => {
@@ -5169,6 +6763,38 @@ fn run_room_runtime(
                                 packet_count: 1,
                                 bytes: udp_packet.payload.len() as u32,
                             });
+                            let (broadcast_decision, should_forward_udp) = if udp_packet.broadcast {
+                                let packet = lai_core::BroadcastPacket {
+                                    protocol: "udp".to_owned(),
+                                    source_ip: udp_packet.source_ip,
+                                    destination_ip: udp_packet.destination_ip,
+                                    destination_port: udp_packet.destination_port,
+                                };
+                                let decision = broadcast_gate.decide(&packet, current_epoch_ms());
+                                let should_forward =
+                                    decision.forward && !heartbeat_targets.is_empty();
+                                broadcast_forward_events.push(lai_core::BroadcastForwardEvent {
+                                    protocol: "udp".to_owned(),
+                                    source_ip: udp_packet.source_ip,
+                                    destination_ip: udp_packet.destination_ip,
+                                    destination_port: udp_packet.destination_port,
+                                    forwarded: should_forward,
+                                    reason: if decision.forward && heartbeat_targets.is_empty() {
+                                        "no-forward-targets".to_owned()
+                                    } else {
+                                        decision.reason.clone()
+                                    },
+                                    target_count: if should_forward {
+                                        heartbeat_targets.len()
+                                    } else {
+                                        0
+                                    },
+                                    packet_io_backend: packet_io_backend.to_owned(),
+                                });
+                                (Some(decision), should_forward)
+                            } else {
+                                (None, !heartbeat_targets.is_empty())
+                            };
                             wintun_runtime_received_packets.push(serde_json::json!({
                                 "packetIndex": packet_index,
                                 "packetBytes": packet.packet_bytes,
@@ -5178,10 +6804,16 @@ fn run_room_runtime(
                                 "destinationPort": udp_packet.destination_port,
                                 "payloadBytes": udp_packet.payload.len(),
                                 "broadcast": udp_packet.broadcast,
-                                "forwarded": !heartbeat_targets.is_empty(),
+                                "forwarded": should_forward_udp,
+                                "broadcastDecision": broadcast_decision,
                             }));
 
-                            for target in &heartbeat_targets {
+                            let udp_forward_targets = if should_forward_udp {
+                                heartbeat_targets.as_slice()
+                            } else {
+                                &[]
+                            };
+                            for target in udp_forward_targets {
                                 let forward_payload = serde_json::json!({
                                     "room_id": plan.room_id,
                                     "peer_id": plan.local_peer_id,
@@ -5216,6 +6848,7 @@ fn run_room_runtime(
                                             "payloadBytes": udp_packet.payload.len(),
                                             "rawIpv4PacketBytes": packet.packet_bytes,
                                             "packetIoBackend": "wintun",
+                                            "sentAtMs": current_epoch_ms(),
                                         }));
                                     }
                                     Err(err) => {
@@ -5295,6 +6928,7 @@ fn run_room_runtime(
                                             "rawIpv4PacketBytes": packet.packet_bytes,
                                             "packetIoBackend": "wintun",
                                             "protocol": "tcp",
+                                            "sentAtMs": current_epoch_ms(),
                                         }));
                                     }
                                     Err(err) => {
@@ -5351,6 +6985,7 @@ fn run_room_runtime(
                                             "rawIpv4PacketBytes": packet.packet_bytes,
                                             "packetIoBackend": "wintun",
                                             "protocol": summary.protocol.clone(),
+                                            "sentAtMs": current_epoch_ms(),
                                         }));
                                     }
                                     Err(err) => {
@@ -5424,19 +7059,11 @@ fn run_room_runtime(
         bytes_received,
         last_error,
     };
-    let network_report = evaluate_network_observations(network_snapshot_from_runtime(
-        None,
-        Some(tunnel_snapshot.clone()),
-        &capture_summaries,
-        if plan.peers.is_empty() {
-            connected_peer_count
-        } else {
-            plan.peers.len() as u16
-        },
-        runtime_expected_broadcast_ports,
-        runtime_expected_game_ports,
-    ));
     let heartbeat_packets_sent = heartbeat_packets.len();
+    let broadcast_forward_report = lai_core::create_broadcast_forward_report(
+        broadcast_gate.policy(),
+        broadcast_forward_events,
+    );
     let wintun_runtime_close = wintun_packet_io
         .as_mut()
         .map(|session| serde_json::to_value(session.close()))
@@ -5447,6 +7074,42 @@ fn run_room_runtime(
                 "closed": false,
             })
         });
+    let tunnel_endpoint_text = tunnel_endpoint.to_string();
+    let runtime_peer_summary_values = runtime_peer_summaries(
+        plan,
+        &[],
+        &tunnel_packets,
+        &forwarded_packets,
+        &heartbeat_packets,
+        &heartbeat_ack_packets,
+        if connected_peer_count > 0 {
+            Some("p2p")
+        } else {
+            None
+        },
+        Some(tunnel_endpoint_text.as_str()),
+    );
+    let runtime_peer_observations =
+        runtime_peer_observations_from_summaries(&runtime_peer_summary_values);
+    let expected_peer_count = if runtime_peer_observations.is_empty() {
+        if plan.peers.is_empty() {
+            connected_peer_count
+        } else {
+            plan.peers.len() as u16
+        }
+    } else {
+        runtime_peer_observations.len() as u16
+    };
+    let network_report =
+        evaluate_network_observations(lai_core::network_snapshot_from_runtime_with_peers(
+            None,
+            Some(tunnel_snapshot.clone()),
+            &capture_summaries,
+            runtime_peer_observations,
+            expected_peer_count,
+            runtime_expected_broadcast_ports,
+            runtime_expected_game_ports,
+        ));
     let result = serde_json::json!({
         "status": if tunnel_snapshot.last_error.is_none() { "ok" } else { "degraded" },
         "startedAtMs": started_at_ms,
@@ -5458,14 +7121,17 @@ fn run_room_runtime(
         "adapterWriteStatus": packet_io_probe["adapterWriteStatus"].clone(),
         "adapterReadStatus": packet_io_probe["adapterReadStatus"].clone(),
         "forwardRawIpv4": forward_raw_ipv4,
-        "actualTunnelEndpoint": tunnel_endpoint.to_string(),
+        "actualTunnelEndpoint": tunnel_endpoint_text,
         "tunnelServiceSnapshot": tunnel_snapshot,
         "heartbeatTargets": heartbeat_targets.iter().map(SocketAddr::to_string).collect::<Vec<_>>(),
         "heartbeatPackets": heartbeat_packets,
         "heartbeatPacketsSent": heartbeat_packets_sent,
+        "heartbeatAckPackets": heartbeat_ack_packets,
+        "coordinationMonitorReports": coordination_monitor_reports,
         "snapshotWriteCount": snapshot_write_count,
         "tunnelPackets": tunnel_packets,
         "forwardedPackets": forwarded_packets,
+        "broadcastForwardReport": broadcast_forward_report,
         "rawVirtualPackets": raw_virtual_packets,
         "wintunRuntime": {
             "enabled": wintun_runtime,
@@ -5475,12 +7141,14 @@ fn run_room_runtime(
             "sentPackets": wintun_runtime_sent_packets,
             "errors": wintun_runtime_errors,
         },
+        "runtimeCleanupPlan": runtime_cleanup_plan,
         "injectedPackets": injected_packets,
         "injectedReceivedPackets": injected_received_packets,
         "injectTarget": inject_target.map(|target| target.to_string()),
         "packetCaptureSummaries": capture_summaries,
         "packetObservationLines": observation_lines,
         "networkObservation": network_report,
+        "runtimePeerSummaries": runtime_peer_summary_values,
     });
     if let Some(path) = snapshot_out {
         write_json_file(path, &result)?;
@@ -5781,6 +7449,123 @@ fn run_udp_capture_loopback_test(
     }))
 }
 
+fn run_udp_loopback_test(
+    port: u16,
+    message: &str,
+    timeout_ms: u64,
+    observe_file: Option<&str>,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    let listener = UdpSocket::bind(("127.0.0.1", port))?;
+    listener.set_read_timeout(Some(Duration::from_millis(timeout_ms)))?;
+    let sender = UdpSocket::bind("127.0.0.1:0")?;
+    let start = Instant::now();
+    sender.send_to(message.as_bytes(), listener.local_addr()?)?;
+
+    let mut buffer = vec![0u8; 65_535];
+    let (received, source) = listener.recv_from(&mut buffer)?;
+    let received_message = String::from_utf8_lossy(&buffer[..received]).to_string();
+    let observation = UdpForwardObservation {
+        source,
+        destination: listener.local_addr()?,
+        bytes: received,
+        broadcast: false,
+        direction: "inbound".to_owned(),
+    };
+    append_observation_lines(observe_file, std::slice::from_ref(&observation))?;
+
+    Ok(serde_json::json!({
+        "status": if received_message == message { "ok" } else { "mismatch" },
+        "protocol": "udp",
+        "localAddress": "127.0.0.1",
+        "port": port,
+        "bytesReceived": received,
+        "elapsedMs": start.elapsed().as_millis() as u64,
+        "message": received_message,
+        "packetObservationLine": lai_core::packet_observation_line_from_udp_forward(&observation),
+    }))
+}
+
+fn run_udp_broadcast_test(
+    port: u16,
+    message: &str,
+    timeout_ms: u64,
+    observe_file: Option<&str>,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    let listener = UdpSocket::bind(("0.0.0.0", port))?;
+    listener.set_broadcast(true)?;
+    listener.set_read_timeout(Some(Duration::from_millis(timeout_ms)))?;
+    let sender = UdpSocket::bind("0.0.0.0:0")?;
+    sender.set_broadcast(true)?;
+    let broadcast_destination = format!("255.255.255.255:{port}").parse::<SocketAddr>()?;
+    let start = Instant::now();
+    sender.send_to(message.as_bytes(), broadcast_destination)?;
+
+    let mut buffer = vec![0u8; 65_535];
+    let (received, source) = listener.recv_from(&mut buffer)?;
+    let received_message = String::from_utf8_lossy(&buffer[..received]).to_string();
+    let observation = UdpForwardObservation {
+        source,
+        destination: broadcast_destination,
+        bytes: received,
+        broadcast: true,
+        direction: "inbound".to_owned(),
+    };
+    append_observation_lines(observe_file, std::slice::from_ref(&observation))?;
+
+    Ok(serde_json::json!({
+        "status": if received_message == message { "ok" } else { "mismatch" },
+        "protocol": "udp",
+        "broadcastAddress": "255.255.255.255",
+        "port": port,
+        "remote": source.to_string(),
+        "bytesReceived": received,
+        "elapsedMs": start.elapsed().as_millis() as u64,
+        "message": received_message,
+        "packetObservationLine": lai_core::packet_observation_line_from_udp_forward(&observation),
+    }))
+}
+
+fn run_tcp_loopback_test(
+    port: u16,
+    message: &str,
+    timeout_ms: u64,
+    observe_file: Option<&str>,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    let listener = TcpListener::bind(("127.0.0.1", port))?;
+    let start = Instant::now();
+    let mut client = TcpStream::connect(("127.0.0.1", port))?;
+    client.set_write_timeout(Some(Duration::from_millis(timeout_ms)))?;
+    client.write_all(message.as_bytes())?;
+    client.shutdown(std::net::Shutdown::Write)?;
+
+    let (mut accepted, source) = listener.accept()?;
+    accepted.set_read_timeout(Some(Duration::from_millis(timeout_ms)))?;
+    let mut buffer = vec![0u8; 4096];
+    let received = accepted.read(&mut buffer)?;
+    let received_message = String::from_utf8_lossy(&buffer[..received]).to_string();
+    let destination = listener.local_addr()?;
+    let observation = UdpForwardObservation {
+        source,
+        destination,
+        bytes: received,
+        broadcast: false,
+        direction: "inbound".to_owned(),
+    };
+    let observation_line = lai_core::packet_observation_line_from_transport("tcp", &observation);
+    append_observation_text_lines(observe_file, std::slice::from_ref(&observation_line))?;
+
+    Ok(serde_json::json!({
+        "status": if received_message == message { "ok" } else { "mismatch" },
+        "protocol": "tcp",
+        "localAddress": "127.0.0.1",
+        "port": port,
+        "bytesReceived": received,
+        "elapsedMs": start.elapsed().as_millis() as u64,
+        "message": received_message,
+        "packetObservationLine": observation_line,
+    }))
+}
+
 fn append_observation_lines(
     observe_file: Option<&str>,
     observations: &[UdpForwardObservation],
@@ -5834,6 +7619,14 @@ fn normalize_runtime_expected_ports(
         expected_ports.dedup();
     }
     expected_ports
+}
+
+fn runtime_subnet_from_local_ip(local_ip: Ipv4Addr) -> Ipv4Subnet {
+    let octets = local_ip.octets();
+    Ipv4Subnet {
+        network: Ipv4Addr::new(octets[0], octets[1], octets[2], 0),
+        prefix: 24,
+    }
 }
 
 fn runtime_forward_targets(
@@ -5902,6 +7695,735 @@ fn runtime_heartbeat_targets(
     targets.sort_unstable();
     targets.dedup();
     Ok(targets)
+}
+
+fn refresh_runtime_network_observation(
+    result: &mut serde_json::Value,
+    plan: &RoomRuntimePlan,
+    runtime_peer_summary_values: Vec<serde_json::Value>,
+    expected_broadcast_ports: Vec<u16>,
+    expected_game_ports: Vec<u16>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let runtime_peer_observations =
+        runtime_peer_observations_from_summaries(&runtime_peer_summary_values);
+    let connected_peer_count = result
+        .get("tunnelServiceSnapshot")
+        .and_then(|snapshot| snapshot.get("connected_peer_count"))
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or_default()
+        .min(u16::MAX as u64) as u16;
+    let expected_peer_count = if runtime_peer_observations.is_empty() {
+        if plan.peers.is_empty() {
+            connected_peer_count
+        } else {
+            plan.peers.len().min(u16::MAX as usize) as u16
+        }
+    } else {
+        runtime_peer_observations.len().min(u16::MAX as usize) as u16
+    };
+    let tunnel_snapshot = result
+        .get("tunnelServiceSnapshot")
+        .cloned()
+        .map(serde_json::from_value::<TunnelServiceSnapshot>)
+        .transpose()?;
+    let capture_summaries = json_array_values(result, "packetCaptureSummaries")
+        .into_iter()
+        .map(serde_json::from_value::<PacketCaptureSummary>)
+        .collect::<Result<Vec<_>, _>>()?;
+    let actual_broadcast_ports = capture_summaries
+        .iter()
+        .filter(|summary| summary.broadcast)
+        .map(|summary| summary.destination_port)
+        .collect::<Vec<_>>();
+    let actual_game_ports = capture_summaries
+        .iter()
+        .filter(|summary| !summary.broadcast)
+        .map(|summary| summary.destination_port)
+        .collect::<Vec<_>>();
+    let expected_broadcast_ports =
+        normalize_runtime_expected_ports(expected_broadcast_ports, &actual_broadcast_ports);
+    let expected_game_ports =
+        normalize_runtime_expected_ports(expected_game_ports, &actual_game_ports);
+    let network_report =
+        evaluate_network_observations(lai_core::network_snapshot_from_runtime_with_peers(
+            None,
+            tunnel_snapshot,
+            &capture_summaries,
+            runtime_peer_observations,
+            expected_peer_count,
+            expected_broadcast_ports,
+            expected_game_ports,
+        ));
+    result["networkObservation"] = serde_json::to_value(network_report)?;
+    result["runtimePeerSummaries"] = serde_json::Value::Array(runtime_peer_summary_values);
+    Ok(())
+}
+
+fn runtime_peer_summaries(
+    plan: &RoomRuntimePlan,
+    connection_path_reports: &[serde_json::Value],
+    tunnel_packets: &[serde_json::Value],
+    forwarded_packets: &[serde_json::Value],
+    heartbeat_packets: &[serde_json::Value],
+    heartbeat_ack_packets: &[serde_json::Value],
+    runtime_path: Option<&str>,
+    local_endpoint: Option<&str>,
+) -> Vec<serde_json::Value> {
+    runtime_observed_peers(
+        plan,
+        tunnel_packets,
+        heartbeat_packets,
+        heartbeat_ack_packets,
+        local_endpoint,
+    )
+    .iter()
+    .map(|peer| {
+        let path_entry = connection_path_reports
+            .iter()
+            .find(|entry| connection_path_peer_id(entry).as_deref() == Some(&peer.peer_id));
+        let report = path_entry
+            .and_then(|entry| entry.get("report"))
+            .or(path_entry);
+        let selected_path = report
+            .and_then(|report| report.get("selected_path"))
+            .and_then(serde_json::Value::as_str)
+            .or_else(|| {
+                runtime_path.filter(|_| peer_has_tunnel_packets(tunnel_packets, &peer.endpoint))
+            })
+            .unwrap_or("unknown");
+        let connection_path_status = report
+            .and_then(|report| report.get("status"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_else(|| {
+                if peer_has_tunnel_packets(tunnel_packets, &peer.endpoint) {
+                    "observed"
+                } else {
+                    "unknown"
+                }
+            });
+        let bootstrap_status = path_entry
+            .and_then(|entry| entry.get("bootstrapStatus"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("not-run");
+        let latency_ms = path_entry
+            .and_then(|entry| entry.get("bootstrapLatencyMs"))
+            .and_then(serde_json::Value::as_u64)
+            .or_else(|| max_json_u64(heartbeat_ack_packets, "peer", &peer.endpoint, "roundTripMs"));
+        let bytes_sent = sum_json_bytes(heartbeat_packets, "target", &peer.endpoint, "bytesSent")
+            + sum_json_bytes(heartbeat_ack_packets, "target", &peer.endpoint, "bytesSent")
+            + sum_json_bytes(forwarded_packets, "target", &peer.endpoint, "bytesSent");
+        let bytes_received = sum_json_bytes(tunnel_packets, "peer", &peer.endpoint, "bytes");
+        let heartbeat_packets_sent =
+            count_json_matches(heartbeat_packets, "target", &peer.endpoint);
+        let heartbeat_ack_packets_received =
+            count_json_matches(heartbeat_ack_packets, "peer", &peer.endpoint);
+        let heartbeat_ack_packets_sent =
+            count_json_matches(heartbeat_ack_packets, "target", &peer.endpoint);
+        let forwarded_packets_sent =
+            count_json_matches(forwarded_packets, "target", &peer.endpoint);
+        let tunnel_packets_received = count_json_matches(tunnel_packets, "peer", &peer.endpoint);
+        let last_seen_at_ms = max_json_u64(tunnel_packets, "peer", &peer.endpoint, "receivedAtMs");
+        let last_sent_at_ms = max_optional_u64(
+            max_json_u64(heartbeat_packets, "target", &peer.endpoint, "sentAtMs"),
+            max_optional_u64(
+                max_json_u64(heartbeat_ack_packets, "target", &peer.endpoint, "sentAtMs"),
+                max_json_u64(forwarded_packets, "target", &peer.endpoint, "sentAtMs"),
+            ),
+        );
+        let heartbeat_loss_percent = percent_unacked(
+            heartbeat_packets_sent as u64,
+            heartbeat_ack_packets_received as u64,
+        );
+        let recent_loss_window_size =
+            heartbeat_loss_window_size(heartbeat_packets, "target", &peer.endpoint, 10);
+        let heartbeat_loss_window_percent = heartbeat_loss_window_percent(
+            heartbeat_packets,
+            heartbeat_ack_packets,
+            "target",
+            "peer",
+            &peer.endpoint,
+            recent_loss_window_size,
+        );
+        let heartbeat_rtt_sample_count =
+            count_json_u64(heartbeat_ack_packets, "peer", &peer.endpoint, "roundTripMs");
+        let heartbeat_rtt_jitter_ms =
+            round_trip_jitter_ms(heartbeat_ack_packets, "peer", &peer.endpoint);
+        let path_kind = runtime_peer_path_kind(selected_path, connection_path_status);
+        let direct_bytes_sent = if path_kind == "direct" { bytes_sent } else { 0 };
+        let direct_bytes_received = if path_kind == "direct" {
+            bytes_received
+        } else {
+            0
+        };
+        let relay_bytes_sent = if path_kind == "relay" { bytes_sent } else { 0 };
+        let relay_bytes_received = if path_kind == "relay" {
+            bytes_received
+        } else {
+            0
+        };
+        let unknown_path_bytes_sent = if path_kind == "unknown" {
+            bytes_sent
+        } else {
+            0
+        };
+        let unknown_path_bytes_received = if path_kind == "unknown" {
+            bytes_received
+        } else {
+            0
+        };
+        let connected = tunnel_packets_received > 0;
+        let health = runtime_peer_summary_health(
+            selected_path,
+            connection_path_status,
+            connected,
+            heartbeat_ack_packets_received,
+            heartbeat_loss_percent,
+            heartbeat_loss_window_percent,
+            latency_ms,
+            heartbeat_rtt_jitter_ms,
+        );
+        serde_json::json!({
+            "peerId": peer.peer_id,
+            "virtualIp": peer.virtual_ip,
+            "endpoint": peer.endpoint,
+            "selectedPath": selected_path,
+            "pathKind": path_kind,
+            "connectionPathStatus": connection_path_status,
+            "bootstrapStatus": bootstrap_status,
+            "connected": connected,
+            "health": health,
+            "latencyMs": latency_ms,
+            "lastSeenAtMs": last_seen_at_ms,
+            "lastSentAtMs": last_sent_at_ms,
+            "bytesSent": bytes_sent,
+            "bytesReceived": bytes_received,
+            "directBytesSent": direct_bytes_sent,
+            "directBytesReceived": direct_bytes_received,
+            "relayBytesSent": relay_bytes_sent,
+            "relayBytesReceived": relay_bytes_received,
+            "unknownPathBytesSent": unknown_path_bytes_sent,
+            "unknownPathBytesReceived": unknown_path_bytes_received,
+            "heartbeatPacketsSent": heartbeat_packets_sent,
+            "heartbeatAckPacketsReceived": heartbeat_ack_packets_received,
+            "heartbeatAckPacketsSent": heartbeat_ack_packets_sent,
+            "heartbeatLossPercent": heartbeat_loss_percent,
+            "heartbeatLossWindowSize": recent_loss_window_size,
+            "heartbeatLossWindowPercent": heartbeat_loss_window_percent,
+            "heartbeatRttSampleCount": heartbeat_rtt_sample_count,
+            "heartbeatRttJitterMs": heartbeat_rtt_jitter_ms,
+            "forwardedPacketsSent": forwarded_packets_sent,
+            "tunnelPacketsReceived": tunnel_packets_received,
+        })
+    })
+    .collect()
+}
+
+fn runtime_observed_peers(
+    plan: &RoomRuntimePlan,
+    tunnel_packets: &[serde_json::Value],
+    heartbeat_packets: &[serde_json::Value],
+    heartbeat_ack_packets: &[serde_json::Value],
+    local_endpoint: Option<&str>,
+) -> Vec<RoomRuntimePeer> {
+    if !plan.peers.is_empty() {
+        return plan.peers.clone();
+    }
+    let mut endpoints = tunnel_packets
+        .iter()
+        .filter_map(|packet| packet.get("peer").and_then(serde_json::Value::as_str))
+        .chain(
+            heartbeat_packets
+                .iter()
+                .filter_map(|packet| packet.get("target").and_then(serde_json::Value::as_str)),
+        )
+        .chain(
+            heartbeat_ack_packets
+                .iter()
+                .filter_map(|packet| packet.get("peer").and_then(serde_json::Value::as_str)),
+        )
+        .chain(
+            heartbeat_ack_packets
+                .iter()
+                .filter_map(|packet| packet.get("target").and_then(serde_json::Value::as_str)),
+        )
+        .map(str::to_owned)
+        .filter(|endpoint| !endpoint.trim().is_empty())
+        .collect::<Vec<_>>();
+    endpoints.sort();
+    endpoints.dedup();
+    endpoints
+        .into_iter()
+        .enumerate()
+        .map(|(index, endpoint)| RoomRuntimePeer {
+            peer_id: if local_endpoint == Some(endpoint.as_str()) || endpoint == "self" {
+                format!("{}-self-probe", plan.local_peer_id)
+            } else {
+                format!("observed-peer-{}", index + 1)
+            },
+            virtual_ip: plan.local_virtual_ip,
+            endpoint,
+        })
+        .collect()
+}
+
+fn runtime_peer_observations_from_summaries(
+    summaries: &[serde_json::Value],
+) -> Vec<lai_core::RuntimePeerObservation> {
+    summaries
+        .iter()
+        .filter_map(|summary| {
+            let peer_id = summary.get("peerId")?.as_str()?.to_owned();
+            Some(lai_core::RuntimePeerObservation {
+                peer_id,
+                virtual_ip: summary
+                    .get("virtualIp")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned(),
+                selected_path: summary
+                    .get("selectedPath")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned(),
+                connection_path_status: summary
+                    .get("connectionPathStatus")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned(),
+                bootstrap_status: summary
+                    .get("bootstrapStatus")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned(),
+                connected: summary
+                    .get("connected")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false),
+                path_kind: summary
+                    .get("pathKind")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned),
+                latency_ms: summary.get("latencyMs").and_then(serde_json::Value::as_u64),
+                last_seen_at_ms: summary
+                    .get("lastSeenAtMs")
+                    .and_then(serde_json::Value::as_u64),
+                last_sent_at_ms: summary
+                    .get("lastSentAtMs")
+                    .and_then(serde_json::Value::as_u64),
+                bytes_sent: summary
+                    .get("bytesSent")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or_default(),
+                bytes_received: summary
+                    .get("bytesReceived")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or_default(),
+                direct_bytes_sent: summary
+                    .get("directBytesSent")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or_default(),
+                direct_bytes_received: summary
+                    .get("directBytesReceived")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or_default(),
+                relay_bytes_sent: summary
+                    .get("relayBytesSent")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or_default(),
+                relay_bytes_received: summary
+                    .get("relayBytesReceived")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or_default(),
+                unknown_path_bytes_sent: summary
+                    .get("unknownPathBytesSent")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or_default(),
+                unknown_path_bytes_received: summary
+                    .get("unknownPathBytesReceived")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or_default(),
+                heartbeat_packets_sent: summary
+                    .get("heartbeatPacketsSent")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or_default(),
+                heartbeat_ack_packets_received: summary
+                    .get("heartbeatAckPacketsReceived")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or_default(),
+                heartbeat_loss_percent: summary
+                    .get("heartbeatLossPercent")
+                    .and_then(serde_json::Value::as_f64),
+                heartbeat_loss_window_size: summary
+                    .get("heartbeatLossWindowSize")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or_default() as usize,
+                heartbeat_loss_window_percent: summary
+                    .get("heartbeatLossWindowPercent")
+                    .and_then(serde_json::Value::as_f64),
+                heartbeat_rtt_sample_count: summary
+                    .get("heartbeatRttSampleCount")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or_default() as usize,
+                heartbeat_rtt_jitter_ms: summary
+                    .get("heartbeatRttJitterMs")
+                    .and_then(serde_json::Value::as_f64),
+                forwarded_packets_sent: summary
+                    .get("forwardedPacketsSent")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or_default(),
+                tunnel_packets_received: summary
+                    .get("tunnelPacketsReceived")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or_default(),
+            })
+        })
+        .collect()
+}
+
+fn runtime_peer_summary_health(
+    selected_path: &str,
+    connection_path_status: &str,
+    connected: bool,
+    heartbeat_ack_packets_received: usize,
+    heartbeat_loss_percent: Option<f64>,
+    heartbeat_loss_window_percent: Option<f64>,
+    latency_ms: Option<u64>,
+    heartbeat_rtt_jitter_ms: Option<f64>,
+) -> serde_json::Value {
+    let (status, reason, next_action) = if matches!(
+        connection_path_status,
+        "no-path" | "needs-relay" | "config-error"
+    ) || matches!(selected_path, "none" | "failed")
+    {
+        (
+            "needs-attention",
+            "no usable path",
+            "Refresh NAT candidates or configure relay before starting the game.",
+        )
+    } else if !connected && heartbeat_ack_packets_received == 0 {
+        (
+            "needs-attention",
+            "missing runtime packets",
+            "Check that the peer runtime is still running and reachable on its tunnel endpoint.",
+        )
+    } else if heartbeat_loss_window_percent.is_some_and(|loss| loss >= 50.0) {
+        (
+            "needs-attention",
+            "high recent heartbeat loss",
+            "Check firewall, NAT mapping, or relay fallback; recent heartbeat acknowledgements are missing.",
+        )
+    } else if heartbeat_loss_percent.is_some_and(|loss| loss >= 50.0) {
+        (
+            "needs-attention",
+            "high heartbeat loss",
+            "Check firewall, NAT mapping, or relay fallback; heartbeat acknowledgements are missing.",
+        )
+    } else if latency_ms.is_some_and(|latency| latency >= 150) {
+        (
+            "degraded",
+            "high latency",
+            "Direct IP may work, but expect delay; consider relay region or network changes.",
+        )
+    } else if heartbeat_rtt_jitter_ms.is_some_and(|jitter| jitter >= 50.0) {
+        (
+            "degraded",
+            "high jitter",
+            "Direct IP may work, but unstable latency can affect games; consider relay region or network changes.",
+        )
+    } else {
+        (
+            "ok",
+            "healthy",
+            "Peer runtime path, heartbeat, and traffic evidence look healthy.",
+        )
+    };
+    serde_json::json!({
+        "status": status,
+        "reason": reason,
+        "nextAction": next_action,
+    })
+}
+
+fn runtime_heartbeat_ack_payload(
+    plan: &RoomRuntimePlan,
+    plaintext: &[u8],
+    received_at_ms: u128,
+) -> Result<(serde_json::Value, u64, u64), Box<dyn std::error::Error>> {
+    let heartbeat: serde_json::Value = serde_json::from_slice(plaintext)?;
+    let sequence = heartbeat
+        .get("sequence")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| invalid_input("runtime heartbeat is missing sequence".to_owned()))?;
+    let heartbeat_sent_at_ms = heartbeat
+        .get("sent_at_ms")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or_default();
+    let source_peer_id = heartbeat
+        .get("peer_id")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown");
+    Ok((
+        serde_json::json!({
+            "room_id": plan.room_id,
+            "peer_id": plan.local_peer_id,
+            "virtual_ip": plan.local_virtual_ip,
+            "kind": "runtime-heartbeat-ack",
+            "ack_sequence": sequence,
+            "ack_peer_id": source_peer_id,
+            "heartbeat_sent_at_ms": heartbeat_sent_at_ms,
+            "received_at_ms": received_at_ms,
+            "sent_at_ms": current_epoch_ms(),
+        }),
+        sequence,
+        heartbeat_sent_at_ms,
+    ))
+}
+
+fn runtime_heartbeat_ack_observation(
+    peer: SocketAddr,
+    bytes_received: usize,
+    plaintext: &[u8],
+    received_at_ms: u128,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    let ack: serde_json::Value = serde_json::from_slice(plaintext)?;
+    let heartbeat_sent_at_ms = ack
+        .get("heartbeat_sent_at_ms")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or_default();
+    let round_trip_ms = if heartbeat_sent_at_ms == 0 {
+        None
+    } else {
+        Some(received_at_ms.saturating_sub(heartbeat_sent_at_ms as u128))
+    };
+    Ok(serde_json::json!({
+        "direction": "received",
+        "peer": peer.to_string(),
+        "bytesReceived": bytes_received,
+        "ackedSequence": ack.get("ack_sequence").and_then(serde_json::Value::as_u64),
+        "heartbeatSentAtMs": heartbeat_sent_at_ms,
+        "ackSentAtMs": ack.get("sent_at_ms").and_then(serde_json::Value::as_u64),
+        "receivedAtMs": received_at_ms,
+        "roundTripMs": round_trip_ms,
+    }))
+}
+
+fn percent_unacked(sent: u64, acked: u64) -> Option<f64> {
+    if sent == 0 {
+        None
+    } else {
+        let lost = sent.saturating_sub(acked);
+        Some((lost as f64 / sent as f64) * 100.0)
+    }
+}
+
+fn runtime_peer_path_kind(selected_path: &str, connection_path_status: &str) -> &'static str {
+    if selected_path.eq_ignore_ascii_case("relay")
+        || selected_path.eq_ignore_ascii_case("relayed")
+        || connection_path_status.eq_ignore_ascii_case("relay-ready")
+    {
+        "relay"
+    } else if selected_path.eq_ignore_ascii_case("p2p")
+        || selected_path.eq_ignore_ascii_case("direct")
+        || connection_path_status.eq_ignore_ascii_case("p2p-candidate-ready")
+        || connection_path_status.eq_ignore_ascii_case("observed")
+    {
+        "direct"
+    } else {
+        "unknown"
+    }
+}
+
+fn heartbeat_loss_window_size(
+    sent_packets: &[serde_json::Value],
+    match_key: &str,
+    endpoint: &str,
+    max_window_size: usize,
+) -> usize {
+    sent_packets
+        .iter()
+        .filter(|packet| {
+            packet.get(match_key).and_then(serde_json::Value::as_str) == Some(endpoint)
+        })
+        .count()
+        .min(max_window_size)
+}
+
+fn heartbeat_loss_window_percent(
+    sent_packets: &[serde_json::Value],
+    ack_packets: &[serde_json::Value],
+    sent_match_key: &str,
+    ack_match_key: &str,
+    endpoint: &str,
+    window_size: usize,
+) -> Option<f64> {
+    if window_size == 0 {
+        return None;
+    }
+    let mut sent = sent_packets
+        .iter()
+        .filter(|packet| {
+            packet
+                .get(sent_match_key)
+                .and_then(serde_json::Value::as_str)
+                == Some(endpoint)
+        })
+        .filter_map(|packet| {
+            Some((
+                packet
+                    .get("sentAtMs")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or_default(),
+                packet.get("sequence").and_then(serde_json::Value::as_u64)?,
+            ))
+        })
+        .collect::<Vec<_>>();
+    sent.sort_by_key(|(sent_at_ms, sequence)| (*sent_at_ms, *sequence));
+    let window = sent
+        .iter()
+        .rev()
+        .take(window_size)
+        .map(|(_, sequence)| *sequence)
+        .collect::<HashSet<_>>();
+    let acked = ack_packets
+        .iter()
+        .filter(|packet| {
+            packet
+                .get(ack_match_key)
+                .and_then(serde_json::Value::as_str)
+                == Some(endpoint)
+        })
+        .filter_map(|packet| {
+            packet
+                .get("ackedSequence")
+                .and_then(serde_json::Value::as_u64)
+        })
+        .filter(|sequence| window.contains(sequence))
+        .collect::<HashSet<_>>()
+        .len() as u64;
+    percent_unacked(window.len() as u64, acked)
+}
+
+fn round_trip_jitter_ms(
+    values: &[serde_json::Value],
+    match_key: &str,
+    endpoint: &str,
+) -> Option<f64> {
+    let mut samples = values
+        .iter()
+        .filter(|value| value.get(match_key).and_then(serde_json::Value::as_str) == Some(endpoint))
+        .filter_map(|value| {
+            Some((
+                value
+                    .get("receivedAtMs")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or_default(),
+                value
+                    .get("roundTripMs")
+                    .and_then(serde_json::Value::as_u64)?,
+            ))
+        })
+        .collect::<Vec<_>>();
+    if samples.len() < 2 {
+        return None;
+    }
+    samples.sort_by_key(|(received_at_ms, _)| *received_at_ms);
+    let total_delta = samples
+        .windows(2)
+        .map(|pair| pair[1].1.abs_diff(pair[0].1))
+        .sum::<u64>();
+    Some(total_delta as f64 / (samples.len() - 1) as f64)
+}
+
+fn connection_path_peer_id(entry: &serde_json::Value) -> Option<String> {
+    entry
+        .get("peerId")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| {
+            entry
+                .get("report")
+                .and_then(|report| report.get("remote_peer_id"))
+                .and_then(serde_json::Value::as_str)
+        })
+        .map(str::to_owned)
+}
+
+fn peer_has_tunnel_packets(packets: &[serde_json::Value], endpoint: &str) -> bool {
+    packets
+        .iter()
+        .any(|packet| packet.get("peer").and_then(serde_json::Value::as_str) == Some(endpoint))
+}
+
+fn sum_json_bytes(
+    values: &[serde_json::Value],
+    match_key: &str,
+    match_value: &str,
+    bytes_key: &str,
+) -> u64 {
+    values
+        .iter()
+        .filter(|value| {
+            value.get(match_key).and_then(serde_json::Value::as_str) == Some(match_value)
+        })
+        .filter_map(|value| value.get(bytes_key).and_then(serde_json::Value::as_u64))
+        .sum()
+}
+
+fn count_json_matches(values: &[serde_json::Value], key: &str, expected: &str) -> usize {
+    values
+        .iter()
+        .filter(|value| value.get(key).and_then(serde_json::Value::as_str) == Some(expected))
+        .count()
+}
+
+fn count_json_u64(
+    values: &[serde_json::Value],
+    match_key: &str,
+    match_value: &str,
+    value_key: &str,
+) -> usize {
+    values
+        .iter()
+        .filter(|value| {
+            value.get(match_key).and_then(serde_json::Value::as_str) == Some(match_value)
+        })
+        .filter(|value| {
+            value
+                .get(value_key)
+                .and_then(serde_json::Value::as_u64)
+                .is_some()
+        })
+        .count()
+}
+
+fn max_json_u64(
+    values: &[serde_json::Value],
+    match_key: &str,
+    match_value: &str,
+    value_key: &str,
+) -> Option<u64> {
+    values
+        .iter()
+        .filter(|value| {
+            value.get(match_key).and_then(serde_json::Value::as_str) == Some(match_value)
+        })
+        .filter_map(|value| value.get(value_key).and_then(serde_json::Value::as_u64))
+        .max()
+}
+
+fn max_optional_u64(left: Option<u64>, right: Option<u64>) -> Option<u64> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(left.max(right)),
+        (Some(value), None) | (None, Some(value)) => Some(value),
+        (None, None) => None,
+    }
+}
+
+fn json_array_values(value: &serde_json::Value, key: &str) -> Vec<serde_json::Value> {
+    value
+        .get(key)
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default()
 }
 
 struct RuntimeForwardPayloadData {

@@ -28,15 +28,16 @@ The repository stores source code only. Release `.exe` files are built separatel
 - Probe and report Wintun virtual adapter readiness.
 - Diagnose adapter, firewall, ping, broadcast, and game traffic issues.
 - Export a read-only diagnostic bundle for troubleshooting.
+- Explain the selected connection path: direct P2P, relay fallback, or no usable path.
 - Switch the desktop UI language between English and Chinese inside the app.
 
 ### Current Status
 
 The project is still under active MVP development.
 
-Implemented code already includes the Windows desktop test shell, Rust native CLI, room and invite models, diagnostics, encrypted tunnel envelope, NAT/P2P bootstrap, local JSON coordination store, lightweight HTTP coordination service, UDP forwarding, raw IPv4 UDP/TCP packet handling, and Wintun runtime probes.
+Implemented code already includes the Windows desktop test shell, Rust native CLI, room and invite models, diagnostics, encrypted tunnel envelope, NAT/P2P bootstrap, local JSON coordination store, lightweight HTTP coordination service, UDP forwarding, raw IPv4 UDP/TCP packet handling, connection path assessment, relay fallback planning, and Wintun runtime probes.
 
-Recent native builds also include a small STUN-like UDP observer for endpoint discovery and diagnostic export support for `room-runtime-run` snapshot files. This lets a troubleshooting bundle include runtime packet I/O evidence such as raw virtual packet counts, Wintun send/receive summaries, and packet observation lines captured during a run.
+Recent native builds also include a small STUN-like UDP observer for endpoint discovery and diagnostic export support for `room-runtime-run` snapshot files. This lets a troubleshooting bundle include runtime packet I/O evidence such as raw virtual packet counts, Wintun send/receive summaries, packet observation lines, and per-peer runtime path and traffic summaries captured during a run.
 
 The desktop test shell can start and stop a controlled native runtime. Runtime snapshots and packet observation files are written under the user's application data folder, and the diagnostic export button automatically includes the latest runtime snapshot when one exists.
 
@@ -149,15 +150,16 @@ LocalAreaInterconnection 是一个面向仅支持局域网联机的 PC 游戏的
 - 探测并报告 Wintun 虚拟网卡就绪状态。
 - 诊断网卡、防火墙、Ping、广播和游戏流量问题。
 - 导出只读诊断包用于排障。
+- 解释当前连接路径：P2P 直连、中继兜底，或暂无可用路径。
 - 在应用内切换桌面 UI 的中英文。
 
 ### 当前状态
 
 项目仍处在 MVP 持续开发阶段。
 
-当前已实现 Windows 桌面测试壳、Rust 原生 CLI、房间与邀请模型、诊断、加密隧道封装、NAT/P2P bootstrap、本地 JSON coordination store、轻量 HTTP 协调服务、UDP 转发、原始 IPv4 UDP/TCP 包处理和 Wintun 运行时探测。
+当前已实现 Windows 桌面测试壳、Rust 原生 CLI、房间与邀请模型、诊断、加密隧道封装、NAT/P2P bootstrap、本地 JSON coordination store、轻量 HTTP 协调服务、UDP 转发、原始 IPv4 UDP/TCP 包处理、连接路径评估、中继兜底计划和 Wintun 运行时探测。
 
-最近的原生构建还加入了一个轻量 STUN-like UDP 观测器，用于端点发现，并支持把 `room-runtime-run` 的 snapshot 文件导入诊断导出。这样故障包里就能包含运行时的 packet I/O 证据，例如原始虚拟包计数、Wintun 收发摘要和运行期间记录的包观测行。
+最近的原生构建还加入了一个轻量 STUN-like UDP 观测器，用于端点发现，并支持把 `room-runtime-run` 的 snapshot 文件导入诊断导出。这样故障包里就能包含运行时的 packet I/O 证据，例如原始虚拟包计数、Wintun 收发摘要、运行期间记录的包观测行，以及每个 peer 的运行时路径和流量摘要。
 
 桌面测试壳可以启动和停止一个受控的 native runtime。runtime snapshot 和包观测文件会写到用户的应用数据目录，诊断导出按钮在存在最近 snapshot 时会自动合并进去。
 

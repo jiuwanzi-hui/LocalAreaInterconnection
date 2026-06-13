@@ -1,5 +1,6 @@
 pub mod broadcast_policy;
 pub mod command_execution;
+pub mod connection_path;
 pub mod coordination_room_view;
 pub mod coordination_store;
 pub mod diagnostic_export;
@@ -10,6 +11,7 @@ pub mod firewall_plan;
 pub mod game_network_plan;
 pub mod game_profile;
 pub mod game_profile_catalog;
+pub mod game_readiness;
 pub mod invite;
 pub mod ip;
 pub mod join_plan;
@@ -17,9 +19,11 @@ pub mod nat_traversal;
 pub mod network_observation;
 pub mod p2p_handshake;
 pub mod packet_observation_parser;
+pub mod relay_fallback_plan;
 pub mod room;
 pub mod room_lifecycle;
 pub mod room_runtime_plan;
+pub mod runtime_cleanup_plan;
 pub mod runtime_observation;
 pub mod udp_forwarding;
 pub mod virtual_adapter_ensure;
@@ -27,7 +31,9 @@ pub mod virtual_adapter_plan;
 pub mod virtual_packet_io;
 pub mod windows_adapter_parser;
 pub mod windows_firewall_parser;
+pub mod windows_netstat_parser;
 pub mod windows_ping_parser;
+pub mod windows_route_parser;
 pub mod wintun_adapter;
 pub mod wintun_adapter_delete;
 pub mod wintun_adapter_open;
@@ -38,27 +44,33 @@ pub mod wintun_runtime;
 pub mod wintun_session;
 
 pub use broadcast_policy::{
-    should_forward_broadcast, BroadcastDecision, BroadcastPacket, BroadcastPolicy,
+    create_broadcast_forward_report, should_forward_broadcast, BroadcastDecision,
+    BroadcastForwardEvent, BroadcastForwardGate, BroadcastForwardReport, BroadcastPacket,
+    BroadcastPolicy,
 };
 pub use command_execution::{
     create_command_execution_preview, CommandExecutionPreview, CommandExecutionRecord,
     CommandExecutionStatus,
 };
+pub use connection_path::{evaluate_connection_path, ConnectionPathReport};
 pub use coordination_room_view::{
     coordination_room_view, CoordinationRoomMemberView, CoordinationRoomView,
 };
 pub use coordination_store::{
-    close_coordination_room, create_coordination_store, fetch_coordination_offers,
-    heartbeat_coordination_peer, kick_coordination_peer, leave_coordination_room,
-    prune_expired_coordination_peers, publish_coordination_offer, CoordinationCloseReport,
-    CoordinationFetchResult, CoordinationKickReport, CoordinationLeaveReport, CoordinationPeer,
-    CoordinationPruneReport, CoordinationRoom, CoordinationStore, CoordinationStoreUpdate,
+    close_coordination_room, close_coordination_room_by_peer, create_coordination_store,
+    fetch_coordination_offers, heartbeat_coordination_peer, kick_coordination_peer,
+    leave_coordination_room, prune_expired_coordination_peers, publish_coordination_offer,
+    CoordinationCloseReport, CoordinationFetchResult, CoordinationKickReport,
+    CoordinationLeaveReport, CoordinationPeer, CoordinationPruneReport, CoordinationRoom,
+    CoordinationStore, CoordinationStoreUpdate,
 };
 pub use diagnostic_export::{
-    create_diagnostic_export_bundle, DiagnosticAdapterScanSection, DiagnosticExportBundle,
-    DiagnosticExportEnvironment, DiagnosticExportInputs, DiagnosticExportSources,
-    DiagnosticFirewallScanSection, DiagnosticPacketSection, DiagnosticPingSection,
-    DiagnosticTextSource,
+    create_diagnostic_export_bundle, DiagnosticAdapterScanSection, DiagnosticConnectionPathSection,
+    DiagnosticExportBundle, DiagnosticExportEnvironment, DiagnosticExportInputs,
+    DiagnosticExportSources, DiagnosticFirewallScanSection, DiagnosticGamePortScanSection,
+    DiagnosticPacketSection, DiagnosticPingSection, DiagnosticRelayFallbackSection,
+    DiagnosticRouteScanSection, DiagnosticRuntimeCleanupSection, DiagnosticRuntimePeerSummary,
+    DiagnosticRuntimePeersSection, DiagnosticTextSource,
 };
 pub use diagnostics::{
     evaluate_diagnostics, DiagnosticProblem, DiagnosticReport, DiagnosticSnapshot,
@@ -84,6 +96,11 @@ pub use game_profile_catalog::{
     find_game_profile, list_game_profile_summaries, parse_game_profile_catalog_json,
     profile_summary, GameProfileCatalog, GameProfileMatch, GameProfileSummary,
 };
+pub use game_readiness::{
+    evaluate_game_readiness, evaluate_game_readiness_with_firewall,
+    evaluate_game_readiness_with_firewall_and_connection_path, GameReadinessCheck,
+    GameReadinessReport,
+};
 pub use invite::{create_invite, decode_invite, verify_invite, InvitePayload};
 pub use ip::{broadcast_address, host_address, peer_address, subnet_for_room, Ipv4Subnet};
 pub use join_plan::{create_join_plan, JoinPlan};
@@ -93,7 +110,8 @@ pub use nat_traversal::{
 };
 pub use network_observation::{
     evaluate_network_observations, AdapterObservation, NetworkObservationCheck,
-    NetworkObservationReport, NetworkObservationSnapshot, PacketObservation, TunnelObservation,
+    NetworkObservationReport, NetworkObservationSnapshot, PacketObservation,
+    RuntimePeerObservation, TunnelObservation,
 };
 pub use p2p_handshake::{
     create_p2p_handshake_ack, create_p2p_handshake_hello, P2pHandshakeAck, P2pHandshakeHello,
@@ -101,6 +119,7 @@ pub use p2p_handshake::{
 pub use packet_observation_parser::{
     parse_packet_observation_line, parse_packet_observation_lines,
 };
+pub use relay_fallback_plan::{create_relay_fallback_plan, RelayFallbackPlan};
 pub use room::{create_room, Room};
 pub use room_lifecycle::{
     add_room_member, close_room, create_room_session, mark_member_left, update_member_connection,
@@ -111,9 +130,15 @@ pub use room_runtime_plan::{
     create_room_runtime_plan, RoomRuntimePeer, RoomRuntimePlan, RuntimePortBinding,
     RuntimeTunnelPlan, RuntimeUdpForwardPlan,
 };
+pub use runtime_cleanup_plan::{
+    create_runtime_cleanup_report, create_windows_runtime_cleanup_plan,
+    create_windows_runtime_cleanup_plan_with_routes, RuntimeCleanupCheck, RuntimeCleanupPlan,
+    RuntimeCleanupReport, RuntimeCleanupStep, RuntimeCleanupWarning,
+};
 pub use runtime_observation::{
-    network_snapshot_from_runtime, packet_observation_from_capture_summary,
-    tunnel_observation_from_service, PacketCaptureSummary, TunnelServiceSnapshot,
+    network_snapshot_from_runtime, network_snapshot_from_runtime_with_peers,
+    packet_observation_from_capture_summary, tunnel_observation_from_service, PacketCaptureSummary,
+    TunnelServiceSnapshot,
 };
 pub use udp_forwarding::{
     packet_observation_line_from_transport, packet_observation_line_from_udp_forward,
@@ -134,7 +159,9 @@ pub use virtual_packet_io::{
 };
 pub use windows_adapter_parser::parse_netsh_adapter_observation;
 pub use windows_firewall_parser::parse_netsh_firewall_rules;
+pub use windows_netstat_parser::{parse_windows_netstat_ano, WindowsNetstatEndpoint};
 pub use windows_ping_parser::parse_windows_ping_observation;
+pub use windows_route_parser::{parse_windows_ipv4_routes, WindowsRouteObservation};
 pub use wintun_adapter::{
     create_wintun_adapter, WintunAdapterCreateReport, WintunAdapterCreateRequest,
 };

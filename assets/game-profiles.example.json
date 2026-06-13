@@ -1,0 +1,31 @@
+{
+  "profiles": [
+    {
+      "game_name": "Generic UDP Broadcast LAN Game",
+      "steam_app_id": null,
+      "discovery": "udp_broadcast",
+      "ports": [27015, 27016],
+      "join_method": "lan_list_or_direct_ip",
+      "compatibility": "A",
+      "notes": "Use for games that advertise LAN rooms through UDP broadcast and can also fall back to Direct IP."
+    },
+    {
+      "game_name": "Generic Direct IP LAN Game",
+      "steam_app_id": null,
+      "discovery": "direct_ip",
+      "ports": [7777],
+      "join_method": "direct_ip",
+      "compatibility": "B",
+      "notes": "Use when the game does not reliably list LAN rooms but supports joining the host virtual IP."
+    },
+    {
+      "game_name": "Generic Manual Ports Game",
+      "steam_app_id": null,
+      "discovery": "manual_ports",
+      "ports": [2302, 2303],
+      "join_method": "lan_list_or_direct_ip",
+      "compatibility": "C",
+      "notes": "Use as a starting point when the game needs known ports and manual firewall checks."
+    }
+  ]
+}

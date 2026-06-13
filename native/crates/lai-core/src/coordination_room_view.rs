@@ -7,6 +7,7 @@ pub struct CoordinationRoomMemberView {
     pub peer_id: String,
     pub virtual_ip: Option<Ipv4Addr>,
     pub status: String,
+    pub is_host: bool,
     pub candidate_count: usize,
     pub preferred_endpoint: Option<String>,
     pub last_seen_ms: u128,
@@ -18,6 +19,7 @@ pub struct CoordinationRoomView {
     pub status: String,
     pub room_id: String,
     pub local_peer_id: String,
+    pub host_peer_id: Option<String>,
     pub member_count: usize,
     pub online_count: usize,
     pub expired_count: usize,
@@ -34,11 +36,17 @@ pub fn coordination_room_view(
 ) -> CoordinationRoomView {
     let room_id = room_id.into();
     let local_peer_id = local_peer_id.into();
+    let host_peer_id = store
+        .rooms
+        .iter()
+        .find(|room| room.room_id == room_id)
+        .and_then(|room| room.host_peer_id.clone());
     let mut members = store
         .rooms
         .iter()
         .find(|room| room.room_id == room_id)
         .map(|room| {
+            let host_peer_id = room.host_peer_id.clone();
             room.peers
                 .iter()
                 .map(|peer| {
@@ -59,6 +67,7 @@ pub fn coordination_room_view(
                         peer_id: peer.peer_id.clone(),
                         virtual_ip: peer_virtual_ip(virtual_subnet, &peer.peer_id),
                         status: if online { "online" } else { "expired" }.to_owned(),
+                        is_host: host_peer_id.as_deref() == Some(peer.peer_id.as_str()),
                         candidate_count,
                         preferred_endpoint,
                         last_seen_ms: peer.last_seen_ms,
@@ -102,6 +111,7 @@ pub fn coordination_room_view(
         status: if remote_online { "ready" } else { "waiting" }.to_owned(),
         room_id,
         local_peer_id,
+        host_peer_id,
         member_count: members.len(),
         online_count,
         expired_count,
@@ -163,9 +173,11 @@ mod tests {
 
         assert_eq!(view.status, "ready");
         assert_eq!(view.member_count, 2);
+        assert_eq!(view.host_peer_id.as_deref(), Some("peer_a"));
         assert_eq!(view.online_count, 2);
         assert_eq!(view.expired_count, 0);
         assert_eq!(view.members[0].peer_id, "peer_a");
+        assert!(view.members[0].is_host);
         assert_eq!(
             view.members[1].preferred_endpoint.as_deref(),
             Some("127.0.0.1:10001")

@@ -12,6 +12,8 @@ pub struct CoordinationRoom {
     pub room_id: String,
     pub created_at_ms: u128,
     pub updated_at_ms: u128,
+    #[serde(default)]
+    pub host_peer_id: Option<String>,
     pub peers: Vec<CoordinationPeer>,
 }
 
@@ -62,6 +64,8 @@ pub struct CoordinationLeaveReport {
 pub struct CoordinationCloseReport {
     pub status: String,
     pub room_id: String,
+    pub closed_by: Option<String>,
+    pub host_peer_id: Option<String>,
     pub room_removed: bool,
     pub removed_peer_count: usize,
 }
@@ -72,6 +76,7 @@ pub struct CoordinationKickReport {
     pub room_id: String,
     pub peer_id: String,
     pub kicked_by: String,
+    pub host_peer_id: Option<String>,
     pub peer_removed: bool,
     pub room_removed: bool,
     pub remaining_peer_count: usize,
@@ -95,6 +100,7 @@ pub fn publish_coordination_offer(
     let expires_at_ms = now_ms.saturating_add(ttl_ms.max(1));
     let room = get_or_insert_room(store, &room_id, now_ms);
     room.updated_at_ms = now_ms;
+    ensure_room_host(room, &peer_id);
     let peer = get_or_insert_peer(room, &peer_id, now_ms, expires_at_ms);
     peer.last_seen_ms = now_ms;
     peer.expires_at_ms = expires_at_ms;
@@ -128,6 +134,7 @@ pub fn heartbeat_coordination_peer(
     let expires_at_ms = now_ms.saturating_add(ttl_ms.max(1));
     let room = get_or_insert_room(store, &room_id, now_ms);
     room.updated_at_ms = now_ms;
+    ensure_room_host(room, &peer_id);
     let peer = get_or_insert_peer(room, &peer_id, now_ms, expires_at_ms);
     peer.last_seen_ms = now_ms;
     peer.expires_at_ms = expires_at_ms;
@@ -254,6 +261,8 @@ pub fn close_coordination_room(
         return CoordinationCloseReport {
             status: "not-found".to_owned(),
             room_id,
+            closed_by: None,
+            host_peer_id: None,
             room_removed: false,
             removed_peer_count: 0,
         };
@@ -264,6 +273,58 @@ pub fn close_coordination_room(
     CoordinationCloseReport {
         status: "ok".to_owned(),
         room_id,
+        closed_by: None,
+        host_peer_id: None,
+        room_removed: true,
+        removed_peer_count,
+    }
+}
+
+pub fn close_coordination_room_by_peer(
+    store: &mut CoordinationStore,
+    room_id: impl Into<String>,
+    closed_by: impl Into<String>,
+) -> CoordinationCloseReport {
+    let room_id = room_id.into();
+    let closed_by = closed_by.into();
+    let Some(room_index) = store.rooms.iter().position(|room| room.room_id == room_id) else {
+        return CoordinationCloseReport {
+            status: "not-found".to_owned(),
+            room_id,
+            closed_by: Some(closed_by),
+            host_peer_id: None,
+            room_removed: false,
+            removed_peer_count: 0,
+        };
+    };
+
+    let room = &mut store.rooms[room_index];
+    if room.host_peer_id.is_none() && room.peers.iter().any(|peer| peer.peer_id == closed_by) {
+        room.host_peer_id = Some(closed_by.clone());
+    }
+    let host_peer_id = room.host_peer_id.clone();
+    if host_peer_id
+        .as_deref()
+        .is_some_and(|host| host != closed_by)
+    {
+        return CoordinationCloseReport {
+            status: "forbidden".to_owned(),
+            room_id,
+            closed_by: Some(closed_by),
+            host_peer_id,
+            room_removed: false,
+            removed_peer_count: 0,
+        };
+    }
+
+    let removed_peer_count = store.rooms[room_index].peers.len();
+    store.rooms.remove(room_index);
+
+    CoordinationCloseReport {
+        status: "ok".to_owned(),
+        room_id,
+        closed_by: Some(closed_by),
+        host_peer_id,
         room_removed: true,
         removed_peer_count,
     }
@@ -285,6 +346,7 @@ pub fn kick_coordination_peer(
             room_id,
             peer_id,
             kicked_by,
+            host_peer_id: None,
             peer_removed: false,
             room_removed: false,
             remaining_peer_count: 0,
@@ -292,6 +354,26 @@ pub fn kick_coordination_peer(
     };
 
     let room = &mut store.rooms[room_index];
+    if room.host_peer_id.is_none() && room.peers.iter().any(|peer| peer.peer_id == kicked_by) {
+        room.host_peer_id = Some(kicked_by.clone());
+    }
+    let host_peer_id = room.host_peer_id.clone();
+    if host_peer_id
+        .as_deref()
+        .is_some_and(|host| host != kicked_by)
+    {
+        return CoordinationKickReport {
+            status: "forbidden".to_owned(),
+            room_id,
+            peer_id,
+            kicked_by,
+            host_peer_id,
+            peer_removed: false,
+            room_removed: false,
+            remaining_peer_count: room.peers.len(),
+        };
+    }
+
     let before = room.peers.len();
     room.peers.retain(|peer| peer.peer_id != peer_id);
     let peer_removed = room.peers.len() != before;
@@ -307,6 +389,7 @@ pub fn kick_coordination_peer(
         room_id,
         peer_id,
         kicked_by,
+        host_peer_id,
         peer_removed,
         room_removed,
         remaining_peer_count,
@@ -325,9 +408,16 @@ fn get_or_insert_room<'a>(
         room_id: room_id.to_owned(),
         created_at_ms: now_ms,
         updated_at_ms: now_ms,
+        host_peer_id: None,
         peers: Vec::new(),
     });
     store.rooms.last_mut().expect("room inserted")
+}
+
+fn ensure_room_host(room: &mut CoordinationRoom, peer_id: &str) {
+    if room.host_peer_id.is_none() {
+        room.host_peer_id = Some(peer_id.to_owned());
+    }
 }
 
 fn get_or_insert_peer<'a>(
@@ -436,13 +526,19 @@ mod tests {
         heartbeat_coordination_peer(&mut store, "room", "host", 100, 1000);
         heartbeat_coordination_peer(&mut store, "room", "guest", 100, 1000);
 
+        let forbidden = kick_coordination_peer(&mut store, "room", "host", "guest", 110);
         let kick = kick_coordination_peer(&mut store, "room", "guest", "host", 120);
         let fetched = fetch_coordination_offers(&mut store, "room", "host", 130);
         let kick_again = kick_coordination_peer(&mut store, "room", "guest", "host", 140);
 
+        assert_eq!(forbidden.status, "forbidden");
+        assert_eq!(forbidden.host_peer_id.as_deref(), Some("host"));
+        assert!(!forbidden.peer_removed);
+        assert_eq!(forbidden.remaining_peer_count, 2);
         assert_eq!(kick.status, "ok");
         assert_eq!(kick.peer_id, "guest");
         assert_eq!(kick.kicked_by, "host");
+        assert_eq!(kick.host_peer_id.as_deref(), Some("host"));
         assert!(kick.peer_removed);
         assert!(!kick.room_removed);
         assert_eq!(kick.remaining_peer_count, 1);
@@ -450,5 +546,29 @@ mod tests {
         assert_eq!(fetched.status, "empty");
         assert_eq!(kick_again.status, "not-found");
         assert!(!kick_again.peer_removed);
+    }
+
+    #[test]
+    fn coordination_store_closes_room_only_by_host() {
+        let mut store = create_coordination_store();
+        heartbeat_coordination_peer(&mut store, "room", "host", 100, 1000);
+        heartbeat_coordination_peer(&mut store, "room", "guest", 100, 1000);
+
+        let forbidden = close_coordination_room_by_peer(&mut store, "room", "guest");
+
+        assert_eq!(forbidden.status, "forbidden");
+        assert_eq!(forbidden.closed_by.as_deref(), Some("guest"));
+        assert_eq!(forbidden.host_peer_id.as_deref(), Some("host"));
+        assert!(!forbidden.room_removed);
+        assert_eq!(store.rooms.len(), 1);
+
+        let close = close_coordination_room_by_peer(&mut store, "room", "host");
+
+        assert_eq!(close.status, "ok");
+        assert_eq!(close.closed_by.as_deref(), Some("host"));
+        assert_eq!(close.host_peer_id.as_deref(), Some("host"));
+        assert!(close.room_removed);
+        assert_eq!(close.removed_peer_count, 2);
+        assert_eq!(store.rooms.len(), 0);
     }
 }

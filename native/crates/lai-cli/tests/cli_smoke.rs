@@ -84,6 +84,98 @@ fn network_observe_reports_packet_statuses() {
 }
 
 #[test]
+fn network_observe_reports_connection_path_relay() {
+    let value = run_cli(&[
+        "network-observe",
+        "--adapter-name",
+        "LocalAreaInterconnection",
+        "--expected-ip",
+        "10.77.12.2",
+        "--assigned-ip",
+        "10.77.12.2",
+        "--subnet",
+        "10.77.12.0/24",
+        "--tunnel-state",
+        "connected",
+        "--connected-peers",
+        "1",
+        "--expected-peers",
+        "1",
+        "--connection-path",
+        "relay",
+        "--packets",
+        "udp:10.77.12.2:10.77.12.255:27015:broadcast:outbound:8,udp:10.77.12.2:10.77.12.1:27015:unicast:outbound:8",
+        "--broadcast-ports",
+        "27015",
+        "--game-ports",
+        "27015",
+    ]);
+
+    assert_eq!(value["status"], "needs-attention");
+    assert!(value["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|check| check["key"] == "connection-path" && check["status"] == "relay"));
+}
+
+#[test]
+fn network_observe_reports_room_route_present() {
+    let route_path = std::env::temp_dir().join(format!(
+        "lai-cli-network-observe-route-{}.txt",
+        std::process::id()
+    ));
+    let route_arg = route_path.to_string_lossy().to_string();
+    fs::write(
+        &route_path,
+        r#"
+IPv4 Route Table
+===========================================================================
+Active Routes:
+Network Destination        Netmask          Gateway       Interface  Metric
+       10.77.12.0    255.255.255.0         On-link       10.77.12.2      5
+"#,
+    )
+    .expect("write route output");
+
+    let value = run_cli(&[
+        "network-observe",
+        "--adapter-name",
+        "LocalAreaInterconnection",
+        "--expected-ip",
+        "10.77.12.2",
+        "--assigned-ip",
+        "10.77.12.2",
+        "--subnet",
+        "10.77.12.0/24",
+        "--route-output",
+        &route_arg,
+        "--tunnel-state",
+        "connected",
+        "--connected-peers",
+        "1",
+        "--expected-peers",
+        "1",
+        "--packets",
+        "udp:10.77.12.2:10.77.12.255:27015:broadcast:outbound:8,udp:10.77.12.2:10.77.12.1:27015:unicast:outbound:8",
+        "--broadcast-ports",
+        "27015",
+        "--game-ports",
+        "27015",
+    ]);
+    fs::remove_file(&route_path).ok();
+
+    assert_eq!(value["status"], "ok");
+    assert_eq!(value["routeSource"]["source"], "route-file");
+    assert_eq!(value["routeCount"], 1);
+    assert!(value["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|check| check["key"] == "route" && check["status"] == "ok"));
+}
+
+#[test]
 fn room_summary_outputs_session_members() {
     let value = run_cli(&[
         "room-summary",
@@ -295,6 +387,12 @@ fn room_runtime_run_can_bootstrap_nat_remote_peer_before_starting() {
     let probe = UdpSocket::bind("127.0.0.1:0").expect("free udp port");
     let listener_addr = probe.local_addr().unwrap();
     drop(probe);
+    let snapshot_path = std::env::temp_dir().join(format!(
+        "lai-cli-runtime-bootstrap-snapshot-{}.json",
+        std::process::id()
+    ));
+    let snapshot_path_string = snapshot_path.display().to_string();
+    fs::remove_file(&snapshot_path).ok();
 
     let listener = Command::new(env!("CARGO_BIN_EXE_lai-cli"))
         .args([
@@ -345,6 +443,8 @@ fn room_runtime_run_can_bootstrap_nat_remote_peer_before_starting() {
         "test-room-key",
         "--duration-ms",
         "50",
+        "--snapshot-out",
+        &snapshot_path_string,
         "--peer-timeout-ms",
         "0",
         "--nat-bootstrap-remote-peer",
@@ -370,6 +470,30 @@ fn room_runtime_run_can_bootstrap_nat_remote_peer_before_starting() {
         value["natBootstrapResults"][0]["selectedPeer"]["responderPeerId"],
         "peer_b"
     );
+    assert_eq!(
+        value["connectionPathReports"][0]["report"]["selected_path"],
+        "p2p"
+    );
+    assert_eq!(value["runtimePeerSummaries"][0]["peerId"], "peer_b");
+    assert_eq!(value["runtimePeerSummaries"][0]["selectedPath"], "p2p");
+    assert_eq!(
+        value["runtimePeerSummaries"][0]["connectionPathStatus"],
+        "p2p-candidate-ready"
+    );
+    assert_eq!(value["runtimePeerSummaries"][0]["bootstrapStatus"], "ok");
+    assert!(value["runtimePeerSummaries"][0]["latencyMs"].is_number());
+    assert!(value["runtimePeerSummaries"][0]["lastSentAtMs"].is_number());
+    let snapshot: Value =
+        serde_json::from_str(&fs::read_to_string(&snapshot_path).expect("runtime snapshot"))
+            .unwrap();
+    fs::remove_file(&snapshot_path).ok();
+    assert_eq!(
+        snapshot["connectionPathReports"][0]["report"]["selected_path"],
+        "p2p"
+    );
+    assert_eq!(snapshot["runtimePeerSummaries"][0]["peerId"], "peer_b");
+    assert_eq!(snapshot["runtimePeerSummaries"][0]["selectedPath"], "p2p");
+    assert!(snapshot["runtimePeerSummaries"][0]["latencyMs"].is_number());
     assert!(
         listener_output.status.success(),
         "listener failed\nstatus: {}\nstdout: {}\nstderr: {}",
@@ -721,6 +845,140 @@ fn coordination_http_server_kicks_peer_from_room() {
             "--store",
             &store_path_string,
             "--max-requests",
+            "5",
+            "--request-timeout-ms",
+            "5000",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn coordination http server");
+    std::thread::sleep(Duration::from_millis(100));
+    let server_url = format!("http://{server_addr}");
+
+    let offer_a = serde_json::json!({
+        "schema_version": 1,
+        "room_id": "room_test",
+        "peer_id": "peer_a",
+        "nonce": "nonce-a",
+        "created_at_ms": 1,
+        "candidates": [{
+            "candidate_type": "host",
+            "transport": "udp",
+            "endpoint": "127.0.0.1:39090",
+            "priority": 100,
+            "source": "test"
+        }]
+    });
+    let offer_b = serde_json::json!({
+        "schema_version": 1,
+        "room_id": "room_test",
+        "peer_id": "peer_b",
+        "nonce": "nonce-b",
+        "created_at_ms": 1,
+        "candidates": [{
+            "candidate_type": "host",
+            "transport": "udp",
+            "endpoint": "127.0.0.1:39091",
+            "priority": 100,
+            "source": "test"
+        }]
+    });
+    let offer_a = serde_json::to_string(&offer_a).unwrap();
+    let offer_b = serde_json::to_string(&offer_b).unwrap();
+    run_cli(&[
+        "coordination-http-offer-publish",
+        "--server",
+        &server_url,
+        "--offer",
+        &offer_a,
+        "--ttl-ms",
+        "30000",
+    ]);
+    run_cli(&[
+        "coordination-http-offer-publish",
+        "--server",
+        &server_url,
+        "--offer",
+        &offer_b,
+        "--ttl-ms",
+        "30000",
+    ]);
+    let forbidden = run_cli(&[
+        "coordination-http-kick",
+        "--server",
+        &server_url,
+        "--room-id",
+        "room_test",
+        "--peer-id",
+        "peer_a",
+        "--kicked-by",
+        "peer_b",
+    ]);
+    let kick = run_cli(&[
+        "coordination-http-kick",
+        "--server",
+        &server_url,
+        "--room-id",
+        "room_test",
+        "--peer-id",
+        "peer_b",
+        "--kicked-by",
+        "peer_a",
+    ]);
+    let fetch = run_cli(&[
+        "coordination-http-offer-fetch",
+        "--server",
+        &server_url,
+        "--room-id",
+        "room_test",
+        "--peer-id",
+        "peer_a",
+    ]);
+    let server_output = server.wait_with_output().expect("server exits");
+    fs::remove_file(&store_path).ok();
+
+    assert_eq!(forbidden["status"], "forbidden");
+    assert_eq!(forbidden["peer_removed"], false);
+    assert_eq!(forbidden["host_peer_id"], "peer_a");
+    assert_eq!(kick["status"], "ok");
+    assert_eq!(kick["peer_removed"], true);
+    assert_eq!(kick["kicked_by"], "peer_a");
+    assert_eq!(kick["host_peer_id"], "peer_a");
+    assert_eq!(kick["remaining_peer_count"], 1);
+    assert_eq!(fetch["status"], "empty");
+    assert!(
+        server_output.status.success(),
+        "server failed\nstatus: {}\nstdout: {}\nstderr: {}",
+        server_output.status,
+        String::from_utf8_lossy(&server_output.stdout),
+        String::from_utf8_lossy(&server_output.stderr)
+    );
+    let server_json: Value =
+        serde_json::from_slice(&server_output.stdout).expect("server final json");
+    assert_eq!(server_json["handledRequests"], 5);
+}
+
+#[test]
+fn coordination_http_server_closes_room_only_by_host_when_actor_is_provided() {
+    let probe = TcpListener::bind("127.0.0.1:0").expect("free local port");
+    let server_addr = probe.local_addr().unwrap();
+    drop(probe);
+    let store_path = std::env::temp_dir().join(format!(
+        "lai-cli-coordination-http-close-auth-store-{}.json",
+        std::process::id()
+    ));
+    let store_path_string = store_path.display().to_string();
+    fs::remove_file(&store_path).ok();
+
+    let server = Command::new(env!("CARGO_BIN_EXE_lai-cli"))
+        .args([
+            "coordination-http-serve",
+            "--bind",
+            &server_addr.to_string(),
+            "--store",
+            &store_path_string,
+            "--max-requests",
             "4",
             "--request-timeout-ms",
             "5000",
@@ -780,34 +1038,36 @@ fn coordination_http_server_kicks_peer_from_room() {
         "--ttl-ms",
         "30000",
     ]);
-    let kick = run_cli(&[
-        "coordination-http-kick",
+    let forbidden = run_cli(&[
+        "coordination-http-close",
         "--server",
         &server_url,
         "--room-id",
         "room_test",
-        "--peer-id",
+        "--closed-by",
         "peer_b",
-        "--kicked-by",
-        "peer_a",
     ]);
-    let fetch = run_cli(&[
-        "coordination-http-offer-fetch",
+    let close = run_cli(&[
+        "coordination-http-close",
         "--server",
         &server_url,
         "--room-id",
         "room_test",
-        "--peer-id",
+        "--closed-by",
         "peer_a",
     ]);
     let server_output = server.wait_with_output().expect("server exits");
     fs::remove_file(&store_path).ok();
 
-    assert_eq!(kick["status"], "ok");
-    assert_eq!(kick["peer_removed"], true);
-    assert_eq!(kick["kicked_by"], "peer_a");
-    assert_eq!(kick["remaining_peer_count"], 1);
-    assert_eq!(fetch["status"], "empty");
+    assert_eq!(forbidden["status"], "forbidden");
+    assert_eq!(forbidden["closed_by"], "peer_b");
+    assert_eq!(forbidden["host_peer_id"], "peer_a");
+    assert_eq!(forbidden["room_removed"], false);
+    assert_eq!(close["status"], "ok");
+    assert_eq!(close["closed_by"], "peer_a");
+    assert_eq!(close["host_peer_id"], "peer_a");
+    assert_eq!(close["room_removed"], true);
+    assert_eq!(close["removed_peer_count"], 2);
     assert!(
         server_output.status.success(),
         "server failed\nstatus: {}\nstdout: {}\nstderr: {}",
@@ -961,6 +1221,156 @@ fn room_runtime_run_fetches_http_coordination_offer_before_bootstrap() {
 }
 
 #[test]
+fn room_runtime_run_stops_when_coordination_store_peer_is_removed() {
+    let store_path = std::env::temp_dir().join(format!(
+        "lai-cli-runtime-monitor-kick-store-{}.json",
+        std::process::id()
+    ));
+    let store_path_string = store_path.display().to_string();
+    fs::remove_file(&store_path).ok();
+
+    run_cli(&["coordination-store-init", "--out", &store_path_string]);
+    let remote = run_cli(&[
+        "nat-candidates",
+        "--room-id",
+        "room_test",
+        "--peer-id",
+        "peer_b",
+        "--bind",
+        "127.0.0.1:0",
+        "--nonce",
+        "nonce-b",
+    ]);
+    let remote_offer = serde_json::to_string(&remote["offer"]).unwrap();
+    run_cli(&[
+        "coordination-offer-publish",
+        "--store",
+        &store_path_string,
+        "--offer",
+        &remote_offer,
+        "--ttl-ms",
+        "30000",
+    ]);
+
+    let value = run_cli(&[
+        "room-runtime-run",
+        "--room-id",
+        "room_test",
+        "--peer-id",
+        "peer_a",
+        "--virtual-ip",
+        "10.77.12.2",
+        "--bind",
+        "127.0.0.1:0",
+        "--key",
+        "test-room-key",
+        "--duration-ms",
+        "1000",
+        "--peer-timeout-ms",
+        "0",
+        "--coordination-store",
+        &store_path_string,
+        "--coordination-monitor",
+        "true",
+        "--coordination-monitor-interval-ms",
+        "1",
+    ]);
+    fs::remove_file(&store_path).ok();
+
+    assert_eq!(value["status"], "degraded");
+    assert_eq!(value["stopReason"], "coordination-peer-removed");
+    assert_eq!(
+        value["coordinationMonitorReports"][0]["status"],
+        "peer-removed"
+    );
+    assert_eq!(
+        value["coordinationMonitorReports"][0]["peer_present"],
+        false
+    );
+    assert_eq!(value["coordinationMonitorReports"][0]["room_present"], true);
+}
+
+#[test]
+fn room_runtime_run_stops_when_http_coordination_room_is_closed() {
+    let probe = TcpListener::bind("127.0.0.1:0").expect("free local port");
+    let server_addr = probe.local_addr().unwrap();
+    drop(probe);
+    let store_path = std::env::temp_dir().join(format!(
+        "lai-cli-runtime-monitor-http-store-{}.json",
+        std::process::id()
+    ));
+    let store_path_string = store_path.display().to_string();
+    fs::remove_file(&store_path).ok();
+
+    let server = Command::new(env!("CARGO_BIN_EXE_lai-cli"))
+        .args([
+            "coordination-http-serve",
+            "--bind",
+            &server_addr.to_string(),
+            "--store",
+            &store_path_string,
+            "--max-requests",
+            "1",
+            "--request-timeout-ms",
+            "5000",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn coordination http server");
+    std::thread::sleep(Duration::from_millis(100));
+    let server_url = format!("http://{server_addr}");
+
+    let value = run_cli(&[
+        "room-runtime-run",
+        "--room-id",
+        "room_test",
+        "--peer-id",
+        "peer_a",
+        "--virtual-ip",
+        "10.77.12.2",
+        "--bind",
+        "127.0.0.1:0",
+        "--key",
+        "test-room-key",
+        "--duration-ms",
+        "1000",
+        "--peer-timeout-ms",
+        "0",
+        "--coordination-server",
+        &server_url,
+        "--coordination-monitor",
+        "true",
+        "--coordination-monitor-interval-ms",
+        "1",
+    ]);
+    let server_output = server.wait_with_output().expect("server exits");
+    fs::remove_file(&store_path).ok();
+
+    assert_eq!(value["status"], "degraded");
+    assert_eq!(value["stopReason"], "coordination-room-closed");
+    assert_eq!(
+        value["coordinationMonitorReports"][0]["status"],
+        "room-closed"
+    );
+    assert_eq!(
+        value["coordinationMonitorReports"][0]["peer_present"],
+        false
+    );
+    assert_eq!(
+        value["coordinationMonitorReports"][0]["room_present"],
+        false
+    );
+    assert!(
+        server_output.status.success(),
+        "server failed\nstatus: {}\nstdout: {}\nstderr: {}",
+        server_output.status,
+        String::from_utf8_lossy(&server_output.stdout),
+        String::from_utf8_lossy(&server_output.stderr)
+    );
+}
+
+#[test]
 fn room_runtime_run_outputs_snapshots_and_packet_observations() {
     let path = std::env::temp_dir().join(format!(
         "lai-cli-room-runtime-observation-{}.txt",
@@ -1021,6 +1431,13 @@ fn room_runtime_run_outputs_snapshots_and_packet_observations() {
     );
     assert_eq!(value["packetCaptureSummaries"].as_array().unwrap().len(), 2);
     assert_eq!(value["forwardedPackets"].as_array().unwrap().len(), 1);
+    assert_eq!(value["broadcastForwardReport"]["status"], "ok");
+    assert_eq!(value["broadcastForwardReport"]["event_count"], 1);
+    assert_eq!(value["broadcastForwardReport"]["forwarded_event_count"], 1);
+    assert_eq!(
+        value["broadcastForwardReport"]["events"][0]["reason"],
+        "userspace-capture-forwarded"
+    );
     assert_eq!(value["injectedPackets"].as_array().unwrap().len(), 1);
     assert_eq!(
         value["injectedReceivedPackets"].as_array().unwrap().len(),
@@ -1031,6 +1448,23 @@ fn room_runtime_run_outputs_snapshots_and_packet_observations() {
         .unwrap()
         .iter()
         .any(|packet| packet["kind"] == "runtime-udp-forward"));
+    let peer_summaries = value["runtimePeerSummaries"].as_array().unwrap();
+    assert_eq!(peer_summaries.len(), 1);
+    assert_eq!(peer_summaries[0]["peerId"], "peer_a-self-probe");
+    assert_eq!(peer_summaries[0]["pathKind"], "direct");
+    assert_eq!(peer_summaries[0]["health"]["status"], "ok");
+    assert_eq!(peer_summaries[0]["forwardedPacketsSent"], 1);
+    assert_eq!(peer_summaries[0]["tunnelPacketsReceived"], 3);
+    assert_eq!(
+        value["runtimeCleanupPlan"]["packet_io_backend"],
+        "userspace-udp"
+    );
+    assert_eq!(value["runtimeCleanupPlan"]["requires_elevation"], false);
+    assert!(value["runtimeCleanupPlan"]["process_cleanup_steps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|step| step["key"] == "close-tunnel-socket"));
 
     let observations = fs::read_to_string(&path).expect("observation file");
     let snapshot = fs::read_to_string(&snapshot_path).expect("snapshot file");
@@ -1039,6 +1473,750 @@ fn room_runtime_run_outputs_snapshots_and_packet_observations() {
     assert!(observations.contains(":unicast:inbound:21"));
     assert!(observations.contains(":broadcast:inbound:21"));
     assert!(snapshot.contains("\"tunnelServiceSnapshot\""));
+}
+
+#[test]
+fn runtime_cleanup_plan_can_include_adapter_restore_commands() {
+    let value = run_cli(&[
+        "runtime-cleanup-plan",
+        "--room-id",
+        "room_test",
+        "--peer-id",
+        "peer_a",
+        "--virtual-ip",
+        "10.77.12.2",
+        "--adapter-name",
+        "Local Area Interconnection",
+        "--packet-io-backend",
+        "wintun",
+        "--restore-adapter",
+        "true",
+    ]);
+
+    assert_eq!(value["platform"], "windows");
+    assert_eq!(value["dry_run"], true);
+    assert_eq!(value["requires_elevation"], true);
+    assert_eq!(value["commands"].as_array().unwrap().len(), 4);
+    assert!(value["commands"][0]["command"]
+        .as_str()
+        .unwrap()
+        .contains("set address name=\"Local Area Interconnection\" dhcp"));
+    assert!(value["process_cleanup_steps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|step| step["key"] == "close-wintun-session"));
+}
+
+#[test]
+fn runtime_cleanup_report_flags_adapter_that_still_has_room_ip() {
+    let snapshot_path = std::env::temp_dir().join(format!(
+        "lai-runtime-cleanup-snapshot-{}.json",
+        std::process::id()
+    ));
+    let netsh_path = std::env::temp_dir().join(format!(
+        "lai-runtime-cleanup-netsh-{}.txt",
+        std::process::id()
+    ));
+    let route_path = std::env::temp_dir().join(format!(
+        "lai-runtime-cleanup-route-{}.txt",
+        std::process::id()
+    ));
+    let snapshot_arg = snapshot_path.to_string_lossy().to_string();
+    let netsh_arg = netsh_path.to_string_lossy().to_string();
+    let route_arg = route_path.to_string_lossy().to_string();
+    fs::write(
+        &snapshot_path,
+        serde_json::to_string_pretty(&serde_json::json!({
+            "status": "ok",
+            "wintunRuntime": {
+                "close": {
+                    "session_ended": true,
+                    "closed": true
+                }
+            },
+            "runtimeCleanupPlan": {
+                "platform": "windows",
+                "dry_run": true,
+                "room_id": "room_test",
+                "local_peer_id": "peer_a",
+                "local_virtual_ip": "10.77.12.2",
+                "adapter_name": "LocalAreaInterconnection",
+                "packet_io_backend": "wintun",
+                "restore_adapter": true,
+                "requires_elevation": true,
+                "process_cleanup_steps": [{
+                    "key": "close-wintun-session",
+                    "status": "automatic",
+                    "detail": "Close Wintun session."
+                }],
+                "commands": [{
+                    "tool": "netsh",
+                    "args": ["interface", "ipv4", "set", "address", "name=LocalAreaInterconnection", "dhcp"],
+                    "command": "netsh interface ipv4 set address name=LocalAreaInterconnection dhcp",
+                    "purpose": "Restore adapter IPv4 address mode."
+                }],
+                "verification_checks": ["Adapter configuration reviewed."],
+                "warnings": []
+            }
+        }))
+        .unwrap(),
+    )
+    .expect("write runtime snapshot");
+    fs::write(
+        &netsh_path,
+        r#"
+Configuration for interface "LocalAreaInterconnection"
+    DHCP enabled:                         No
+    IP Address:                           10.77.12.2
+    Subnet Prefix:                        10.77.12.0/24 (mask 255.255.255.0)
+    MTU:                                  1420
+"#,
+    )
+    .expect("write netsh output");
+    fs::write(
+        &route_path,
+        r#"
+IPv4 Route Table
+===========================================================================
+Active Routes:
+Network Destination        Netmask          Gateway       Interface  Metric
+       10.77.12.0    255.255.255.0         On-link       10.77.12.2      5
+"#,
+    )
+    .expect("write route output");
+
+    let value = run_cli(&[
+        "runtime-cleanup-report",
+        "--runtime-snapshot",
+        &snapshot_arg,
+        "--adapter-netsh-output",
+        &netsh_arg,
+        "--route-output",
+        &route_arg,
+    ]);
+    fs::remove_file(&snapshot_path).ok();
+    fs::remove_file(&netsh_path).ok();
+    fs::remove_file(&route_path).ok();
+
+    assert_eq!(value["adapterSource"]["source"], "netsh-file");
+    assert_eq!(value["routeSource"]["source"], "route-file");
+    assert_eq!(value["report"]["status"], "needs-attention");
+    assert_eq!(value["report"]["wintun_close"]["closed"], true);
+    assert!(value["report"]["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|check| check["key"] == "adapter-restore" && check["status"] == "needs-attention"));
+    assert!(value["report"]["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|check| check["key"] == "route-cleanup" && check["status"] == "needs-attention"));
+}
+
+#[test]
+fn runtime_cleanup_apply_requires_confirmation_for_safe_plan() {
+    let plan = run_cli(&[
+        "runtime-cleanup-plan",
+        "--room-id",
+        "room_test",
+        "--peer-id",
+        "peer_a",
+        "--virtual-ip",
+        "10.77.12.2",
+        "--subnet",
+        "10.77.12.0/24",
+        "--adapter-name",
+        "LocalAreaInterconnection",
+        "--packet-io-backend",
+        "wintun",
+        "--restore-adapter",
+        "true",
+        "--cleanup-routes",
+        "true",
+    ]);
+    let plan_arg = serde_json::to_string(&plan).unwrap();
+    let value = run_cli(&["runtime-cleanup-apply", "--cleanup-plan", &plan_arg]);
+
+    assert_eq!(value["status"], "needs-confirmation");
+    assert_eq!(value["executionPreview"]["confirmed"], false);
+    assert_eq!(value["executionPreview"]["can_execute_now"], false);
+    assert_eq!(value["commandResults"].as_array().unwrap().len(), 0);
+    assert_eq!(value["unsafeCommands"].as_array().unwrap().len(), 0);
+    assert!(value["nextAction"].as_str().unwrap().contains("--yes true"));
+}
+
+#[test]
+fn runtime_cleanup_apply_blocks_tampered_commands() {
+    let plan = serde_json::json!({
+        "platform": "windows",
+        "dry_run": true,
+        "room_id": "room_test",
+        "local_peer_id": "peer_a",
+        "local_virtual_ip": "10.77.12.2",
+        "adapter_name": "LocalAreaInterconnection",
+        "packet_io_backend": "userspace-udp",
+        "restore_adapter": false,
+        "cleanup_routes": false,
+        "requires_elevation": false,
+        "process_cleanup_steps": [],
+        "commands": [{
+            "tool": "powershell",
+            "args": ["-NoProfile", "-Command", "Write-Output bad"],
+            "command": "powershell -NoProfile -Command Write-Output bad",
+            "purpose": "Unexpected command."
+        }],
+        "verification_checks": [],
+        "warnings": []
+    });
+    let plan_arg = serde_json::to_string(&plan).unwrap();
+    let value = run_cli(&[
+        "runtime-cleanup-apply",
+        "--cleanup-plan",
+        &plan_arg,
+        "--yes",
+        "true",
+    ]);
+
+    assert_eq!(value["status"], "blocked-unsafe-command");
+    assert_eq!(value["executionPreview"]["can_execute_now"], true);
+    assert_eq!(value["commandResults"].as_array().unwrap().len(), 0);
+    assert!(value["unsafeCommands"][0]
+        .as_str()
+        .unwrap()
+        .contains("Rejected cleanup command"));
+}
+
+#[test]
+fn route_scan_reports_room_route_matches() {
+    let route_path =
+        std::env::temp_dir().join(format!("lai-cli-route-scan-{}.txt", std::process::id()));
+    let route_arg = route_path.to_string_lossy().to_string();
+    fs::write(
+        &route_path,
+        r#"
+IPv4 Route Table
+===========================================================================
+Active Routes:
+Network Destination        Netmask          Gateway       Interface  Metric
+        0.0.0.0          0.0.0.0      192.168.1.1    192.168.1.10     25
+       10.77.12.0    255.255.255.0         On-link       10.77.12.2      5
+Persistent Routes:
+  Network Address          Netmask  Gateway Address  Metric
+       10.77.12.2  255.255.255.255         On-link       1
+"#,
+    )
+    .expect("write route output");
+
+    let value = run_cli(&[
+        "route-scan",
+        "--route-output",
+        &route_arg,
+        "--route-scan",
+        "false",
+        "--virtual-ip",
+        "10.77.12.2",
+        "--subnet",
+        "10.77.12.0/24",
+    ]);
+    fs::remove_file(&route_path).ok();
+
+    assert_eq!(value["status"], "needs-attention");
+    assert_eq!(value["routeSource"]["source"], "route-file");
+    assert_eq!(value["routeCount"], 3);
+    assert_eq!(value["roomRouteCount"], 2);
+    assert!(value["roomRoutes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|route| { route["destination"] == "10.77.12.0/24" && route["persistent"] == false }));
+    assert!(value["roomRoutes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|route| { route["destination"] == "10.77.12.2/32" && route["persistent"] == true }));
+}
+
+#[test]
+fn game_port_scan_matches_netstat_ports() {
+    let netstat_path =
+        std::env::temp_dir().join(format!("lai-cli-netstat-scan-{}.txt", std::process::id()));
+    let netstat_arg = netstat_path.to_string_lossy().to_string();
+    fs::write(
+        &netstat_path,
+        r#"
+Active Connections
+
+  Proto  Local Address          Foreign Address        State           PID
+  TCP    0.0.0.0:27015          0.0.0.0:0              LISTENING       4242
+  UDP    0.0.0.0:27016          *:*                                    4243
+  TCP    127.0.0.1:50000        127.0.0.1:50001        ESTABLISHED     4244
+"#,
+    )
+    .expect("write netstat output");
+
+    let value = run_cli(&[
+        "game-port-scan",
+        "--netstat-output",
+        &netstat_arg,
+        "--netstat-scan",
+        "false",
+        "--ports",
+        "27015,27016",
+    ]);
+    fs::remove_file(&netstat_path).ok();
+
+    assert_eq!(value["status"], "ok");
+    assert_eq!(value["netstatSource"]["source"], "netstat-file");
+    assert_eq!(value["endpointCount"], 3);
+    assert_eq!(value["matchCount"], 2);
+    assert!(value["matches"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|endpoint| endpoint["protocol"] == "tcp" && endpoint["local_port"] == 27015));
+    assert!(value["matches"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|endpoint| endpoint["protocol"] == "udp" && endpoint["local_port"] == 27016));
+}
+
+#[test]
+fn game_port_scan_can_use_catalog_profile_ports() {
+    let catalog_path = std::env::temp_dir().join(format!(
+        "lai-cli-port-scan-catalog-{}.json",
+        std::process::id()
+    ));
+    let netstat_path = std::env::temp_dir().join(format!(
+        "lai-cli-port-scan-catalog-netstat-{}.txt",
+        std::process::id()
+    ));
+    let catalog_arg = catalog_path.to_string_lossy().to_string();
+    let netstat_arg = netstat_path.to_string_lossy().to_string();
+    fs::write(
+        &catalog_path,
+        serde_json::json!({
+            "profiles": [{
+                "game_name": "Catalog Port Game",
+                "discovery": "udp_broadcast",
+                "ports": [28015],
+                "compatibility": "A"
+            }]
+        })
+        .to_string(),
+    )
+    .expect("write catalog");
+    fs::write(
+        &netstat_path,
+        r#"
+  Proto  Local Address          Foreign Address        State           PID
+  UDP    0.0.0.0:28015          *:*                                    4242
+"#,
+    )
+    .expect("write netstat output");
+
+    let value = run_cli(&[
+        "game-port-scan",
+        "--catalog",
+        &catalog_arg,
+        "--game-name",
+        "catalog port game",
+        "--netstat-output",
+        &netstat_arg,
+        "--netstat-scan",
+        "false",
+    ]);
+    fs::remove_file(&catalog_path).ok();
+    fs::remove_file(&netstat_path).ok();
+
+    assert_eq!(value["status"], "ok");
+    assert_eq!(value["gameName"], "Catalog Port Game");
+    assert_eq!(value["expectedPorts"][0], 28015);
+    assert_eq!(value["matchCount"], 1);
+}
+
+#[test]
+fn firewall_plan_can_use_catalog_profile_ports() {
+    let catalog_path = std::env::temp_dir().join(format!(
+        "lai-cli-firewall-plan-catalog-{}.json",
+        std::process::id()
+    ));
+    let catalog_arg = catalog_path.to_string_lossy().to_string();
+    fs::write(
+        &catalog_path,
+        serde_json::json!({
+            "profiles": [{
+                "game_name": "Catalog Firewall Game",
+                "discovery": "udp_broadcast",
+                "ports": [28016],
+                "compatibility": "A"
+            }]
+        })
+        .to_string(),
+    )
+    .expect("write catalog");
+
+    let value = run_cli(&[
+        "firewall-plan",
+        "--catalog",
+        &catalog_arg,
+        "--game-name",
+        "catalog firewall game",
+        "--subnet",
+        "10.77.12.0/24",
+    ]);
+    fs::remove_file(&catalog_path).ok();
+
+    assert_eq!(value["dry_run"], true);
+    assert!(value["commands"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|command| command["command"].as_str().unwrap().contains("28016")));
+}
+
+#[test]
+fn game_readiness_combines_network_report_and_netstat_ports() {
+    let network = run_cli(&[
+        "network-observe",
+        "--adapter-name",
+        "LocalAreaInterconnection",
+        "--expected-ip",
+        "10.77.12.2",
+        "--assigned-ip",
+        "10.77.12.2",
+        "--subnet",
+        "10.77.12.0/24",
+        "--tunnel-state",
+        "connected",
+        "--connected-peers",
+        "1",
+        "--expected-peers",
+        "1",
+        "--packets",
+        "udp:10.77.12.2:10.77.12.255:27015:broadcast:outbound:8,udp:10.77.12.2:10.77.12.1:27015:unicast:outbound:8",
+        "--broadcast-ports",
+        "27015",
+        "--game-ports",
+        "27015",
+    ]);
+    let network_path = std::env::temp_dir().join(format!(
+        "lai-cli-game-readiness-network-{}.json",
+        std::process::id()
+    ));
+    let netstat_path = std::env::temp_dir().join(format!(
+        "lai-cli-game-readiness-netstat-{}.txt",
+        std::process::id()
+    ));
+    let firewall_path = std::env::temp_dir().join(format!(
+        "lai-cli-game-readiness-firewall-{}.txt",
+        std::process::id()
+    ));
+    let network_arg = network_path.to_string_lossy().to_string();
+    let netstat_arg = netstat_path.to_string_lossy().to_string();
+    let firewall_arg = firewall_path.to_string_lossy().to_string();
+    fs::write(
+        &network_path,
+        serde_json::to_string_pretty(&network).unwrap(),
+    )
+    .expect("write network report");
+    fs::write(
+        &netstat_path,
+        r#"
+  Proto  Local Address          Foreign Address        State           PID
+  UDP    0.0.0.0:27015          *:*                                    4242
+"#,
+    )
+    .expect("write netstat output");
+    fs::write(
+        &firewall_path,
+        r#"
+Rule Name:                            Example UDP 27015
+Enabled:                              Yes
+Direction:                            In
+Profiles:                             Private
+RemoteIP:                             10.77.12.0/24
+Protocol:                             UDP
+LocalPort:                            27015
+Action:                               Allow
+
+Rule Name:                            Example TCP 27015
+Enabled:                              Yes
+Direction:                            In
+Profiles:                             Private
+RemoteIP:                             10.77.12.0/24
+Protocol:                             TCP
+LocalPort:                            27015
+Action:                               Allow
+"#,
+    )
+    .expect("write firewall output");
+
+    let value = run_cli(&[
+        "game-readiness",
+        "--network-report",
+        &network_arg,
+        "--game-name",
+        "Example Game",
+        "--subnet",
+        "10.77.12.0/24",
+        "--discovery",
+        "udp_broadcast",
+        "--ports",
+        "27015",
+        "--compatibility",
+        "A",
+        "--firewall-netsh-output",
+        &firewall_arg,
+        "--netstat-output",
+        &netstat_arg,
+        "--netstat-scan",
+        "false",
+    ]);
+    fs::remove_file(&network_path).ok();
+    fs::remove_file(&netstat_path).ok();
+    fs::remove_file(&firewall_path).ok();
+
+    assert_eq!(value["status"], "ready");
+    assert_eq!(value["report"]["game_name"], "Example Game");
+    assert_eq!(value["firewallReport"]["status"], "ok");
+    assert_eq!(value["matchCount"], 1);
+    assert!(value["report"]["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|check| check["key"] == "game-port-binding" && check["status"] == "ok"));
+    assert!(value["report"]["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|check| check["key"] == "firewall" && check["status"] == "ok"));
+}
+
+#[test]
+fn game_readiness_uses_relay_connection_path_when_p2p_is_missing() {
+    let network = run_cli(&[
+        "network-observe",
+        "--adapter-name",
+        "LocalAreaInterconnection",
+        "--expected-ip",
+        "10.77.12.2",
+        "--assigned-ip",
+        "10.77.12.2",
+        "--subnet",
+        "10.77.12.0/24",
+        "--tunnel-state",
+        "connected",
+        "--connected-peers",
+        "0",
+        "--expected-peers",
+        "1",
+        "--packets",
+        "udp:10.77.12.2:10.77.12.255:27015:broadcast:outbound:8,udp:10.77.12.2:10.77.12.1:27015:unicast:outbound:8",
+        "--broadcast-ports",
+        "27015",
+        "--game-ports",
+        "27015",
+    ]);
+    let network_path = std::env::temp_dir().join(format!(
+        "lai-cli-game-readiness-relay-network-{}.json",
+        std::process::id()
+    ));
+    let netstat_path = std::env::temp_dir().join(format!(
+        "lai-cli-game-readiness-relay-netstat-{}.txt",
+        std::process::id()
+    ));
+    let network_arg = network_path.to_string_lossy().to_string();
+    let netstat_arg = netstat_path.to_string_lossy().to_string();
+    fs::write(
+        &network_path,
+        serde_json::to_string_pretty(&network).unwrap(),
+    )
+    .expect("write network report");
+    fs::write(
+        &netstat_path,
+        r#"
+  Proto  Local Address          Foreign Address        State           PID
+  UDP    0.0.0.0:27015          *:*                                    4242
+"#,
+    )
+    .expect("write netstat output");
+    let local_offer = serde_json::json!({
+        "schema_version": 1,
+        "room_id": "room_test",
+        "peer_id": "peer_a",
+        "nonce": "nonce-a",
+        "created_at_ms": 1,
+        "candidates": [{
+            "candidate_type": "host",
+            "transport": "udp",
+            "endpoint": "10.0.0.2:39090",
+            "priority": 100,
+            "source": "local"
+        }]
+    })
+    .to_string();
+    let remote_offer = serde_json::json!({
+        "schema_version": 1,
+        "room_id": "room_test",
+        "peer_id": "peer_b",
+        "nonce": "nonce-b",
+        "created_at_ms": 1,
+        "candidates": [
+            {
+                "candidate_type": "srflx",
+                "transport": "udp",
+                "endpoint": "198.51.100.20:44000",
+                "priority": 90,
+                "source": "stun"
+            },
+            {
+                "candidate_type": "relay",
+                "transport": "udp",
+                "endpoint": "203.0.113.10:39090",
+                "priority": 10,
+                "source": "relay"
+            }
+        ]
+    })
+    .to_string();
+
+    let value = run_cli(&[
+        "game-readiness",
+        "--network-report",
+        &network_arg,
+        "--game-name",
+        "Relay Game",
+        "--subnet",
+        "10.77.12.0/24",
+        "--discovery",
+        "udp_broadcast",
+        "--ports",
+        "27015",
+        "--compatibility",
+        "A",
+        "--netstat-output",
+        &netstat_arg,
+        "--netstat-scan",
+        "false",
+        "--relay-local-offer",
+        &local_offer,
+        "--relay-remote-offer",
+        &remote_offer,
+        "--relay-p2p-status",
+        "failed",
+    ]);
+    fs::remove_file(&network_path).ok();
+    fs::remove_file(&netstat_path).ok();
+
+    assert_eq!(value["status"], "ready-to-try");
+    assert_eq!(value["connectionPathReport"]["selected_path"], "relay");
+    assert!(value["report"]["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|check| check["key"] == "p2p" && check["status"] == "pending"));
+    assert!(value["report"]["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|check| { check["key"] == "connection-path" && check["status"] == "pending" }));
+}
+
+#[test]
+fn game_readiness_can_use_catalog_profile_ports() {
+    let network = run_cli(&[
+        "network-observe",
+        "--adapter-name",
+        "LocalAreaInterconnection",
+        "--expected-ip",
+        "10.77.12.2",
+        "--assigned-ip",
+        "10.77.12.2",
+        "--subnet",
+        "10.77.12.0/24",
+        "--tunnel-state",
+        "connected",
+        "--connected-peers",
+        "1",
+        "--expected-peers",
+        "1",
+        "--packets",
+        "udp:10.77.12.2:10.77.12.255:27016:broadcast:outbound:8,udp:10.77.12.2:10.77.12.1:27016:unicast:outbound:8",
+        "--broadcast-ports",
+        "27016",
+        "--game-ports",
+        "27016",
+    ]);
+    let network_path = std::env::temp_dir().join(format!(
+        "lai-cli-game-readiness-catalog-network-{}.json",
+        std::process::id()
+    ));
+    let catalog_path = std::env::temp_dir().join(format!(
+        "lai-cli-game-readiness-catalog-{}.json",
+        std::process::id()
+    ));
+    let netstat_path = std::env::temp_dir().join(format!(
+        "lai-cli-game-readiness-catalog-netstat-{}.txt",
+        std::process::id()
+    ));
+    let network_arg = network_path.to_string_lossy().to_string();
+    let catalog_arg = catalog_path.to_string_lossy().to_string();
+    let netstat_arg = netstat_path.to_string_lossy().to_string();
+    fs::write(
+        &network_path,
+        serde_json::to_string_pretty(&network).unwrap(),
+    )
+    .expect("write network report");
+    fs::write(
+        &catalog_path,
+        serde_json::json!({
+            "profiles": [{
+                "game_name": "Catalog Game",
+                "steam_app_id": "424242",
+                "discovery": "udp_broadcast",
+                "ports": [27016],
+                "compatibility": "A"
+            }]
+        })
+        .to_string(),
+    )
+    .expect("write catalog");
+    fs::write(
+        &netstat_path,
+        r#"
+  Proto  Local Address          Foreign Address        State           PID
+  UDP    0.0.0.0:27016          *:*                                    4242
+"#,
+    )
+    .expect("write netstat output");
+
+    let value = run_cli(&[
+        "game-readiness",
+        "--network-report",
+        &network_arg,
+        "--catalog",
+        &catalog_arg,
+        "--game-name",
+        "catalog game",
+        "--subnet",
+        "10.77.12.0/24",
+        "--netstat-output",
+        &netstat_arg,
+        "--netstat-scan",
+        "false",
+    ]);
+    fs::remove_file(&network_path).ok();
+    fs::remove_file(&catalog_path).ok();
+    fs::remove_file(&netstat_path).ok();
+
+    assert_eq!(value["status"], "ready");
+    assert_eq!(value["report"]["game_name"], "Catalog Game");
+    assert_eq!(value["gamePlan"]["game_name"], "Catalog Game");
+    assert_eq!(value["gamePlan"]["firewall_rules"][0]["port"], 27016);
+    assert_eq!(value["matchCount"], 1);
 }
 
 #[test]
@@ -1272,6 +2450,32 @@ fn room_runtime_run_emits_periodic_heartbeats_and_snapshots() {
     assert_eq!(value["status"], "ok");
     assert_eq!(value["stopReason"], "duration");
     assert!(value["heartbeatPacketsSent"].as_u64().unwrap() >= 2);
+    assert!(value["heartbeatAckPackets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|packet| packet["direction"] == "received" && packet["roundTripMs"].is_number()));
+    assert!(
+        value["runtimePeerSummaries"][0]["heartbeatLossWindowSize"]
+            .as_u64()
+            .unwrap()
+            >= 1
+    );
+    assert!(value["runtimePeerSummaries"][0]["heartbeatLossWindowPercent"].is_number());
+    assert!(
+        value["runtimePeerSummaries"][0]["heartbeatRttSampleCount"]
+            .as_u64()
+            .unwrap()
+            >= 1
+    );
+    assert_eq!(value["runtimePeerSummaries"][0]["pathKind"], "direct");
+    assert!(
+        value["runtimePeerSummaries"][0]["directBytesSent"]
+            .as_u64()
+            .unwrap()
+            >= 1
+    );
+    assert_eq!(value["runtimePeerSummaries"][0]["relayBytesSent"], 0);
     assert!(value["snapshotWriteCount"].as_u64().unwrap() >= 1);
     assert!(
         value["tunnelPackets"]
@@ -1281,6 +2485,15 @@ fn room_runtime_run_emits_periodic_heartbeats_and_snapshots() {
             .filter(|packet| packet["kind"] == "runtime-heartbeat")
             .count()
             >= 2
+    );
+    assert!(
+        value["tunnelPackets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|packet| packet["kind"] == "runtime-heartbeat-ack")
+            .count()
+            >= 1
     );
 
     let snapshot = fs::read_to_string(&snapshot_path).expect("runtime snapshot");
@@ -1677,6 +2890,195 @@ fn nat_candidates_and_plan_exchange_endpoints() {
 }
 
 #[test]
+fn relay_fallback_plan_selects_relay_after_p2p_failure() {
+    let local = run_cli(&[
+        "nat-candidates",
+        "--room-id",
+        "room_test",
+        "--peer-id",
+        "peer_a",
+        "--bind",
+        "127.0.0.1:0",
+        "--nonce",
+        "nonce-a",
+    ]);
+    let remote = run_cli(&[
+        "nat-candidates",
+        "--room-id",
+        "room_test",
+        "--peer-id",
+        "peer_b",
+        "--bind",
+        "127.0.0.1:0",
+        "--relay",
+        "203.0.113.10:39090",
+        "--nonce",
+        "nonce-b",
+    ]);
+    let local_offer = serde_json::to_string(&local["offer"]).unwrap();
+    let remote_offer = serde_json::to_string(&remote["offer"]).unwrap();
+
+    let plan = run_cli(&[
+        "relay-fallback-plan",
+        "--local-offer",
+        &local_offer,
+        "--remote-offer",
+        &remote_offer,
+        "--p2p-status",
+        "failed",
+    ]);
+
+    assert_eq!(plan["status"], "relay-available");
+    assert_eq!(plan["local_peer_id"], "peer_a");
+    assert_eq!(plan["remote_peer_id"], "peer_b");
+    assert!(plan["p2p_candidate_count"].as_u64().unwrap() >= 1);
+    assert_eq!(plan["relay_candidate_count"], 1);
+    assert_eq!(plan["selected_relay_endpoints"][0], "203.0.113.10:39090");
+    assert!(plan["recommended_actions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|action| action.as_str().unwrap().contains("relay endpoint")));
+}
+
+#[test]
+fn connection_path_plan_selects_relay_after_p2p_failure() {
+    let local = run_cli(&[
+        "nat-candidates",
+        "--room-id",
+        "room_test",
+        "--peer-id",
+        "peer_a",
+        "--bind",
+        "127.0.0.1:0",
+        "--nonce",
+        "nonce-a",
+    ]);
+    let remote = run_cli(&[
+        "nat-candidates",
+        "--room-id",
+        "room_test",
+        "--peer-id",
+        "peer_b",
+        "--bind",
+        "127.0.0.1:0",
+        "--observed-endpoint",
+        "198.51.100.20:44000",
+        "--relay",
+        "203.0.113.10:39090",
+        "--nonce",
+        "nonce-b",
+    ]);
+    let local_offer = serde_json::to_string(&local["offer"]).unwrap();
+    let remote_offer = serde_json::to_string(&remote["offer"]).unwrap();
+
+    let report = run_cli(&[
+        "connection-path-plan",
+        "--local-offer",
+        &local_offer,
+        "--remote-offer",
+        &remote_offer,
+        "--p2p-status",
+        "failed",
+    ]);
+
+    assert_eq!(report["status"], "relay-ready");
+    assert_eq!(report["selected_path"], "relay");
+    assert_eq!(report["remote_nat_assessment"], "nat-mapped-with-relay");
+    assert_eq!(report["remote_relay_candidate_count"], 1);
+    assert_eq!(report["selected_endpoints"][0], "203.0.113.10:39090");
+    assert_eq!(report["relay_fallback"]["status"], "relay-available");
+}
+
+#[test]
+fn connection_path_plan_prefers_p2p_before_failure() {
+    let local = run_cli(&[
+        "nat-candidates",
+        "--room-id",
+        "room_test",
+        "--peer-id",
+        "peer_a",
+        "--bind",
+        "127.0.0.1:0",
+        "--nonce",
+        "nonce-a",
+    ]);
+    let remote = run_cli(&[
+        "nat-candidates",
+        "--room-id",
+        "room_test",
+        "--peer-id",
+        "peer_b",
+        "--bind",
+        "127.0.0.1:0",
+        "--observed-endpoint",
+        "198.51.100.20:44000",
+        "--nonce",
+        "nonce-b",
+    ]);
+    let local_offer = serde_json::to_string(&local["offer"]).unwrap();
+    let remote_offer = serde_json::to_string(&remote["offer"]).unwrap();
+
+    let report = run_cli(&[
+        "connection-path-plan",
+        "--local-offer",
+        &local_offer,
+        "--remote-offer",
+        &remote_offer,
+    ]);
+
+    assert_eq!(report["status"], "p2p-candidate-ready");
+    assert_eq!(report["selected_path"], "p2p");
+    assert!(report["remote_p2p_candidate_count"].as_u64().unwrap() >= 1);
+    assert!(report["selected_endpoints"].as_array().unwrap().len() >= 1);
+}
+
+#[test]
+fn relay_fallback_plan_requests_relay_without_relay_candidate() {
+    let local = run_cli(&[
+        "nat-candidates",
+        "--room-id",
+        "room_test",
+        "--peer-id",
+        "peer_a",
+        "--bind",
+        "127.0.0.1:0",
+        "--nonce",
+        "nonce-a",
+    ]);
+    let remote = run_cli(&[
+        "nat-candidates",
+        "--room-id",
+        "room_test",
+        "--peer-id",
+        "peer_b",
+        "--bind",
+        "127.0.0.1:0",
+        "--nonce",
+        "nonce-b",
+    ]);
+    let local_offer = serde_json::to_string(&local["offer"]).unwrap();
+    let remote_offer = serde_json::to_string(&remote["offer"]).unwrap();
+
+    let plan = run_cli(&[
+        "relay-fallback-plan",
+        "--local-offer",
+        &local_offer,
+        "--remote-offer",
+        &remote_offer,
+        "--p2p-status",
+        "timeout",
+    ]);
+
+    assert_eq!(plan["status"], "needs-relay");
+    assert_eq!(plan["relay_candidate_count"], 0);
+    assert!(plan["selected_relay_endpoints"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
 fn nat_candidates_can_query_stun_like_server_for_observed_endpoint() {
     let probe = UdpSocket::bind("127.0.0.1:0").expect("free udp port");
     let server_addr = probe.local_addr().unwrap();
@@ -2019,6 +3421,17 @@ fn coordination_store_kicks_peer_from_room() {
         "30000",
     ]);
 
+    let forbidden = run_cli(&[
+        "coordination-kick",
+        "--store",
+        &path_string,
+        "--room-id",
+        "room_test",
+        "--peer-id",
+        "peer_a",
+        "--kicked-by",
+        "peer_b",
+    ]);
     let kick = run_cli(&[
         "coordination-kick",
         "--store",
@@ -2043,9 +3456,13 @@ fn coordination_store_kicks_peer_from_room() {
     ]);
     fs::remove_file(&path).ok();
 
+    assert_eq!(forbidden["status"], "forbidden");
+    assert_eq!(forbidden["peer_removed"], false);
+    assert_eq!(forbidden["host_peer_id"], "peer_a");
     assert_eq!(kick["status"], "ok");
     assert_eq!(kick["peer_removed"], true);
     assert_eq!(kick["kicked_by"], "peer_a");
+    assert_eq!(kick["host_peer_id"], "peer_a");
     assert_eq!(kick["room_removed"], false);
     assert_eq!(kick["remaining_peer_count"], 1);
     assert_eq!(view_after_kick["member_count"], 1);
@@ -2395,14 +3812,227 @@ fn diagnostic_export_writes_bundle_file() {
         serde_json::from_str(&fs::read_to_string(&path).expect("bundle file")).unwrap();
     fs::remove_file(&path).ok();
 
-    assert_eq!(bundle["schema_version"], 2);
+    assert_eq!(bundle["schema_version"], 18);
     assert_eq!(bundle["tool"], "LocalAreaInterconnection Rust CLI");
     assert_eq!(bundle["adapter_scan"]["status"], "ok");
     assert_eq!(bundle["packet_io"]["status"], "ok");
     assert_eq!(bundle["packet_io"]["backend"], "userspace-udp");
     assert_eq!(bundle["packet_io"]["probe"]["status"], "ready");
+    assert_eq!(bundle["route_scan"]["status"], "skipped");
+    assert_eq!(bundle["game_port_scan"]["status"], "skipped");
+    assert!(!bundle["game_readiness"]["status"]
+        .as_str()
+        .unwrap()
+        .is_empty());
+    assert_eq!(bundle["runtime_cleanup"]["status"], "skipped");
+    assert_eq!(bundle["relay_fallback"]["status"], "skipped");
+    assert_eq!(bundle["connection_path"]["status"], "skipped");
     assert_eq!(bundle["packet_observations"]["broadcast_count"], 1);
     assert_eq!(bundle["packet_observations"]["game_traffic_count"], 1);
+}
+
+#[test]
+fn diagnostic_export_can_use_catalog_profile_for_game_readiness() {
+    let bundle_path = std::env::temp_dir().join(format!(
+        "lai-cli-diagnostic-export-catalog-{}.json",
+        std::process::id()
+    ));
+    let catalog_path = std::env::temp_dir().join(format!(
+        "lai-cli-diagnostic-export-catalog-profile-{}.json",
+        std::process::id()
+    ));
+    let netstat_path = std::env::temp_dir().join(format!(
+        "lai-cli-diagnostic-export-catalog-netstat-{}.txt",
+        std::process::id()
+    ));
+    let bundle_arg = bundle_path.to_string_lossy().to_string();
+    let catalog_arg = catalog_path.to_string_lossy().to_string();
+    let netstat_arg = netstat_path.to_string_lossy().to_string();
+    fs::write(
+        &catalog_path,
+        serde_json::json!({
+            "profiles": [{
+                "game_name": "Catalog Export Game",
+                "steam_app_id": "555000",
+                "discovery": "udp_broadcast",
+                "ports": [27016],
+                "compatibility": "A"
+            }]
+        })
+        .to_string(),
+    )
+    .expect("write catalog");
+    fs::write(
+        &netstat_path,
+        r#"
+  Proto  Local Address          Foreign Address        State           PID
+  UDP    0.0.0.0:27016          *:*                                    4242
+"#,
+    )
+    .expect("write netstat output");
+
+    let stdout = run_cli(&[
+        "diagnostic-export",
+        "--out",
+        &bundle_arg,
+        "--adapter-name",
+        "LocalAreaInterconnection",
+        "--expected-ip",
+        "10.77.12.2",
+        "--assigned-ip",
+        "10.77.12.2",
+        "--subnet",
+        "10.77.12.0/24",
+        "--adapter-scan",
+        "false",
+        "--firewall-scan",
+        "false",
+        "--expected-peers",
+        "1",
+        "--packets",
+        "udp:10.77.12.2:10.77.12.255:27016:broadcast:outbound:8,udp:10.77.12.2:10.77.12.1:27016:unicast:outbound:8",
+        "--broadcast-ports",
+        "27016",
+        "--game-ports",
+        "27016",
+        "--catalog",
+        &catalog_arg,
+        "--game-name",
+        "catalog export game",
+        "--netstat-output",
+        &netstat_arg,
+        "--netstat-scan",
+        "false",
+    ]);
+
+    assert_eq!(stdout["status"], "ok");
+    let bundle: Value =
+        serde_json::from_str(&fs::read_to_string(&bundle_path).expect("bundle file")).unwrap();
+    fs::remove_file(&bundle_path).ok();
+    fs::remove_file(&catalog_path).ok();
+    fs::remove_file(&netstat_path).ok();
+
+    assert_eq!(bundle["schema_version"], 18);
+    assert_eq!(bundle["inputs"]["game_name"], "Catalog Export Game");
+    assert_eq!(bundle["inputs"]["ports"][0], 27016);
+    assert_eq!(bundle["game_port_scan"]["expected_ports"][0], 27016);
+    assert_eq!(bundle["game_port_scan"]["match_count"], 1);
+    assert_eq!(bundle["game_readiness"]["game_name"], "Catalog Export Game");
+    assert!(!bundle["game_readiness"]["status"]
+        .as_str()
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
+fn diagnostic_export_can_include_relay_fallback_plan() {
+    let path = std::env::temp_dir().join(format!(
+        "lai-cli-diagnostic-export-relay-{}.json",
+        std::process::id()
+    ));
+    let path_string = path.display().to_string();
+    let local_offer = serde_json::json!({
+        "schema_version": 1,
+        "room_id": "room_test",
+        "peer_id": "peer_a",
+        "nonce": "nonce-a",
+        "created_at_ms": 1,
+        "candidates": [{
+            "candidate_type": "host",
+            "transport": "udp",
+            "endpoint": "127.0.0.1:39090",
+            "priority": 100,
+            "source": "test"
+        }]
+    });
+    let remote_offer = serde_json::json!({
+        "schema_version": 1,
+        "room_id": "room_test",
+        "peer_id": "peer_b",
+        "nonce": "nonce-b",
+        "created_at_ms": 1,
+        "candidates": [
+            {
+                "candidate_type": "host",
+                "transport": "udp",
+                "endpoint": "127.0.0.1:39091",
+                "priority": 100,
+                "source": "test"
+            },
+            {
+                "candidate_type": "relay",
+                "transport": "udp",
+                "endpoint": "203.0.113.10:39090",
+                "priority": 10,
+                "source": "test-relay"
+            }
+        ]
+    });
+    let local_offer = serde_json::to_string(&local_offer).unwrap();
+    let remote_offer = serde_json::to_string(&remote_offer).unwrap();
+
+    let stdout = run_cli(&[
+        "diagnostic-export",
+        "--out",
+        &path_string,
+        "--adapter-name",
+        "LocalAreaInterconnection",
+        "--expected-ip",
+        "10.77.12.2",
+        "--assigned-ip",
+        "10.77.12.2",
+        "--subnet",
+        "10.77.12.0/24",
+        "--adapter-scan",
+        "false",
+        "--firewall-scan",
+        "false",
+        "--expected-peers",
+        "1",
+        "--relay-local-offer",
+        &local_offer,
+        "--relay-remote-offer",
+        &remote_offer,
+        "--relay-p2p-status",
+        "failed",
+    ]);
+
+    assert_eq!(stdout["status"], "ok");
+    let bundle: Value =
+        serde_json::from_str(&fs::read_to_string(&path).expect("bundle file")).unwrap();
+    fs::remove_file(&path).ok();
+
+    assert_eq!(bundle["schema_version"], 18);
+    assert_eq!(bundle["relay_fallback"]["status"], "ok");
+    assert_eq!(bundle["connection_path"]["status"], "ok");
+    assert_eq!(
+        bundle["connection_path"]["report"]["selected_path"],
+        "relay"
+    );
+    assert_eq!(
+        bundle["connection_path"]["report"]["selected_endpoints"][0],
+        "203.0.113.10:39090"
+    );
+    assert!(bundle["game_readiness"]["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|check| check["key"] == "connection-path"));
+    assert_eq!(bundle["route_scan"]["status"], "skipped");
+    assert_eq!(bundle["game_port_scan"]["status"], "skipped");
+    assert!(!bundle["game_readiness"]["status"]
+        .as_str()
+        .unwrap()
+        .is_empty());
+    assert_eq!(bundle["runtime_cleanup"]["status"], "skipped");
+    assert_eq!(
+        bundle["relay_fallback"]["plan"]["status"],
+        "relay-available"
+    );
+    assert_eq!(
+        bundle["relay_fallback"]["plan"]["selected_relay_endpoints"][0],
+        "203.0.113.10:39090"
+    );
 }
 
 #[test]
@@ -2415,12 +4045,89 @@ fn diagnostic_export_merges_runtime_snapshot_packet_io_evidence() {
         "lai-cli-runtime-snapshot-{}.json",
         std::process::id()
     ));
+    let route_path =
+        std::env::temp_dir().join(format!("lai-cli-runtime-routes-{}.txt", std::process::id()));
     let bundle_path_string = bundle_path.display().to_string();
     let snapshot_path_string = snapshot_path.display().to_string();
+    let route_path_string = route_path.display().to_string();
+    let local_offer = serde_json::json!({
+        "schema_version": 1,
+        "room_id": "room_test",
+        "peer_id": "peer_a",
+        "nonce": "nonce-a",
+        "created_at_ms": 1,
+        "candidates": [{
+            "candidate_type": "host",
+            "transport": "udp",
+            "endpoint": "10.0.0.2:39090",
+            "priority": 100,
+            "source": "test"
+        }]
+    });
+    let remote_offer = serde_json::json!({
+        "schema_version": 1,
+        "room_id": "room_test",
+        "peer_id": "peer_b",
+        "nonce": "nonce-b",
+        "created_at_ms": 1,
+        "candidates": [{
+            "candidate_type": "srflx",
+            "transport": "udp",
+            "endpoint": "198.51.100.20:44000",
+            "priority": 90,
+            "source": "test"
+        }]
+    });
+    let connection_path_report = run_cli(&[
+        "connection-path-plan",
+        "--local-offer",
+        &local_offer.to_string(),
+        "--remote-offer",
+        &remote_offer.to_string(),
+        "--p2p-status",
+        "ok",
+    ]);
     fs::write(
         &snapshot_path,
         serde_json::to_string_pretty(&serde_json::json!({
             "status": "ok",
+            "connectionPathReports": [{
+                "source": "nat-bootstrap-remote-peer",
+                "peerId": "peer_b",
+                "bootstrapStatus": "ok",
+                "report": connection_path_report
+            }],
+            "runtimePeerSummaries": [{
+                "peerId": "peer_b",
+                "virtualIp": "10.77.12.3",
+                "endpoint": "198.51.100.20:44000",
+                "selectedPath": "p2p",
+                "pathKind": "direct",
+                "connectionPathStatus": "p2p-candidate-ready",
+                "bootstrapStatus": "ok",
+                "connected": true,
+                "latencyMs": 12,
+                "lastSeenAtMs": 123456,
+                "lastSentAtMs": 123460,
+                "bytesSent": 21,
+                "bytesReceived": 21,
+                "directBytesSent": 21,
+                "directBytesReceived": 21,
+                "relayBytesSent": 0,
+                "relayBytesReceived": 0,
+                "unknownPathBytesSent": 0,
+                "unknownPathBytesReceived": 0,
+                "heartbeatPacketsSent": 1,
+                "heartbeatAckPacketsReceived": 1,
+                "heartbeatAckPacketsSent": 0,
+                "heartbeatLossPercent": 0.0,
+                "heartbeatLossWindowSize": 1,
+                "heartbeatLossWindowPercent": 0.0,
+                "heartbeatRttSampleCount": 1,
+                "heartbeatRttJitterMs": null,
+                "forwardedPacketsSent": 1,
+                "tunnelPacketsReceived": 1
+            }],
             "packetIoPlan": {
                 "backend": "wintun",
                 "adapterName": "LocalAreaInterconnection",
@@ -2446,16 +4153,89 @@ fn diagnostic_export_merges_runtime_snapshot_packet_io_evidence() {
                 "payloadBytes": 21
             }],
             "forwardedPackets": [{"bytes": 21}],
+            "broadcastForwardReport": {
+                "status": "ok",
+                "event_count": 1,
+                "forwarded_event_count": 1,
+                "dropped_event_count": 0,
+                "forwarded_target_count": 1,
+                "rate_limited_count": 0,
+                "allowed_ports": [39078],
+                "max_packets_per_second": 30,
+                "events": [{
+                    "protocol": "udp",
+                    "source_ip": "10.77.12.2",
+                    "destination_ip": "10.77.12.255",
+                    "destination_port": 39078,
+                    "forwarded": true,
+                    "reason": "room-broadcast-allowed",
+                    "target_count": 1,
+                    "packet_io_backend": "wintun"
+                }],
+                "next_action": "Broadcast forwarding decisions look healthy."
+            },
             "injectedPackets": [{"bytes": 21}],
             "wintunRuntime": {
                 "receivedPackets": [{"protocol": "udp"}],
                 "sentPackets": [{"protocol": "udp"}],
-                "errors": []
+                "errors": [],
+                "close": {
+                    "session_ended": true,
+                    "closed": true
+                }
+            },
+            "tunnelServiceSnapshot": {
+                "service_running": true,
+                "connected_peer_count": 1,
+                "connection_path": "p2p",
+                "average_latency_ms": 12,
+                "packet_loss_percent": 0.0,
+                "bytes_sent": 21,
+                "bytes_received": 21,
+                "last_error": null
+            },
+            "runtimeCleanupPlan": {
+                "platform": "windows",
+                "dry_run": true,
+                "room_id": "room_test",
+                "local_peer_id": "peer_a",
+                "local_virtual_ip": "10.77.12.2",
+                "adapter_name": "LocalAreaInterconnection",
+                "packet_io_backend": "wintun",
+                "restore_adapter": true,
+                "requires_elevation": true,
+                "process_cleanup_steps": [{
+                    "key": "close-wintun-session",
+                    "status": "automatic",
+                    "detail": "Close Wintun session."
+                }],
+                "commands": [{
+                    "tool": "netsh",
+                    "args": ["interface", "ipv4", "set", "address", "name=LocalAreaInterconnection", "dhcp"],
+                    "command": "netsh interface ipv4 set address name=LocalAreaInterconnection dhcp",
+                    "purpose": "Restore adapter IPv4 address mode."
+                }],
+                "verification_checks": ["Adapter configuration reviewed."],
+                "warnings": [{
+                    "key": "review-before-restore",
+                    "message": "Review commands before running."
+                }]
             }
         }))
         .unwrap(),
     )
     .expect("write runtime snapshot");
+    fs::write(
+        &route_path,
+        r#"
+IPv4 Route Table
+===========================================================================
+Active Routes:
+Network Destination        Netmask          Gateway       Interface  Metric
+       10.77.12.0    255.255.255.0         On-link       10.77.12.2      5
+"#,
+    )
+    .expect("write route output");
 
     let stdout = run_cli(&[
         "diagnostic-export",
@@ -2477,6 +4257,8 @@ fn diagnostic_export_merges_runtime_snapshot_packet_io_evidence() {
         "1",
         "--runtime-snapshot",
         &snapshot_path_string,
+        "--route-output",
+        &route_path_string,
         "--broadcast-ports",
         "39078",
         "--game-ports",
@@ -2491,6 +4273,7 @@ fn diagnostic_export_merges_runtime_snapshot_packet_io_evidence() {
         serde_json::from_str(&fs::read_to_string(&bundle_path).expect("bundle file")).unwrap();
     fs::remove_file(&bundle_path).ok();
     fs::remove_file(&snapshot_path).ok();
+    fs::remove_file(&route_path).ok();
 
     assert_eq!(bundle["packet_io"]["backend"], "wintun");
     assert_eq!(bundle["packet_io"]["adapter_read_status"], "ready");
@@ -2510,6 +4293,105 @@ fn diagnostic_export_merges_runtime_snapshot_packet_io_evidence() {
         bundle["packet_io"]["runtime"]["wintun_sent_packet_count"],
         1
     );
+    assert_eq!(bundle["schema_version"], 18);
+    assert_eq!(bundle["connection_path"]["status"], "ok");
+    assert_eq!(
+        bundle["connection_path"]["source"],
+        "runtime-snapshot-report"
+    );
+    assert_eq!(bundle["connection_path"]["runtime_path"], "p2p");
+    assert_eq!(bundle["connection_path"]["report"]["selected_path"], "p2p");
+    assert_eq!(bundle["runtime_peers"]["status"], "ok");
+    assert_eq!(bundle["runtime_peers"]["peer_count"], 1);
+    assert_eq!(bundle["runtime_peers"]["connected_peer_count"], 1);
+    assert_eq!(bundle["runtime_peers"]["total_direct_bytes_sent"], 21);
+    assert_eq!(bundle["runtime_peers"]["total_direct_bytes_received"], 21);
+    assert_eq!(bundle["runtime_peers"]["total_relay_bytes_sent"], 0);
+    assert_eq!(bundle["runtime_peers"]["total_relay_bytes_received"], 0);
+    assert_eq!(
+        bundle["runtime_peers"]["summaries"][0]["selectedPath"],
+        "p2p"
+    );
+    assert_eq!(
+        bundle["runtime_peers"]["summaries"][0]["pathKind"],
+        "direct"
+    );
+    assert_eq!(
+        bundle["runtime_peers"]["summaries"][0]["directBytesSent"],
+        21
+    );
+    assert_eq!(bundle["runtime_peers"]["summaries"][0]["relayBytesSent"], 0);
+    assert_eq!(bundle["runtime_peers"]["summaries"][0]["latencyMs"], 12);
+    assert_eq!(
+        bundle["runtime_peers"]["summaries"][0]["lastSeenAtMs"],
+        123456
+    );
+    assert_eq!(
+        bundle["runtime_peers"]["summaries"][0]["lastSentAtMs"],
+        123460
+    );
+    assert_eq!(
+        bundle["runtime_peers"]["summaries"][0]["heartbeatAckPacketsReceived"],
+        1
+    );
+    assert_eq!(
+        bundle["runtime_peers"]["summaries"][0]["heartbeatLossPercent"],
+        0.0
+    );
+    assert_eq!(
+        bundle["runtime_peers"]["summaries"][0]["heartbeatLossWindowPercent"],
+        0.0
+    );
+    assert_eq!(
+        bundle["runtime_peers"]["summaries"][0]["heartbeatRttSampleCount"],
+        1
+    );
+    assert_eq!(
+        bundle["runtime_peers"]["summaries"][0]["health"]["status"],
+        "ok"
+    );
+    assert_eq!(
+        bundle["runtime_peers"]["summaries"][0]["health"]["reason"],
+        "runtime-peer-healthy"
+    );
+    assert_eq!(bundle["broadcast_forward"]["status"], "ok");
+    assert_eq!(bundle["broadcast_forward"]["source"], "runtime-snapshot");
+    assert_eq!(bundle["broadcast_forward"]["event_count"], 1);
+    assert_eq!(bundle["broadcast_forward"]["forwarded_event_count"], 1);
+    assert_eq!(bundle["route_scan"]["status"], "ok");
+    assert_eq!(bundle["game_port_scan"]["status"], "skipped");
+    assert!(!bundle["game_readiness"]["status"]
+        .as_str()
+        .unwrap()
+        .is_empty());
+    assert_eq!(bundle["route_scan"]["route_count"], 1);
+    assert_eq!(bundle["route_scan"]["room_route_count"], 1);
+    assert_eq!(bundle["runtime_cleanup"]["status"], "needs-attention");
+    assert_eq!(bundle["runtime_cleanup"]["requires_elevation"], true);
+    assert_eq!(bundle["runtime_cleanup"]["restore_adapter"], true);
+    assert_eq!(bundle["runtime_cleanup"]["process_step_count"], 1);
+    assert_eq!(bundle["runtime_cleanup"]["command_count"], 1);
+    assert_eq!(bundle["runtime_cleanup"]["check_count"], 5);
+    assert_eq!(bundle["runtime_cleanup"]["next_action_count"], 3);
+    assert_eq!(bundle["runtime_cleanup"]["route_count"], 1);
+    assert_eq!(
+        bundle["runtime_cleanup"]["plan"]["packet_io_backend"],
+        "wintun"
+    );
+    assert_eq!(
+        bundle["runtime_cleanup"]["report"]["status"],
+        "needs-attention"
+    );
+    assert!(bundle["runtime_cleanup"]["report"]["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|check| check["key"] == "adapter-restore" && check["status"] == "needs-attention"));
+    assert!(bundle["runtime_cleanup"]["report"]["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|check| check["key"] == "route-cleanup" && check["status"] == "needs-attention"));
     assert_eq!(bundle["packet_observations"]["broadcast_count"], 1);
     assert_eq!(bundle["packet_observations"]["game_traffic_count"], 1);
 }

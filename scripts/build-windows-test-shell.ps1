@@ -6,9 +6,11 @@ $dist = Join-Path $repoRoot 'dist'
 $icon = Join-Path $repoRoot 'assets\LocalAreaInterconnection.ico'
 $cliSource = Join-Path $repoRoot 'windows-cli\LocalAreaInterconnectionCli.cs'
 $desktopSource = Join-Path $repoRoot 'windows-cli\LocalAreaInterconnectionDesktop.cs'
+$gameProfilesSource = Join-Path $repoRoot 'assets\game-profiles.example.json'
 $cliOut = Join-Path $dist 'LocalAreaInterconnection.Cli.exe'
 $nativeCliOut = Join-Path $dist 'LocalAreaInterconnection.Native.Cli.exe'
 $desktopOut = Join-Path $dist 'LocalAreaInterconnection.exe'
+$gameProfilesOut = Join-Path $dist 'game-profiles.example.json'
 
 if (-not (Test-Path -LiteralPath $csc)) {
     throw "C# compiler not found: $csc"
@@ -51,9 +53,16 @@ else {
     Write-Warning "cargo was not found. Skipped Rust native CLI build: $nativeCliOut"
 }
 
+if (Test-Path -LiteralPath $gameProfilesSource) {
+    Copy-Item -LiteralPath $gameProfilesSource -Destination $gameProfilesOut -Force
+}
+
 Write-Host "Built latest Windows test shell:"
 Write-Host "  $desktopOut"
 Write-Host "  $cliOut"
 if (Test-Path -LiteralPath $nativeCliOut) {
     Write-Host "  $nativeCliOut"
+}
+if (Test-Path -LiteralPath $gameProfilesOut) {
+    Write-Host "  $gameProfilesOut"
 }
