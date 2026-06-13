@@ -52,10 +52,13 @@ public class LocalAreaInterconnectionDesktop : Form
     Panel actionScrollBar;
     Panel actionScrollThumb;
     FlowLayoutPanel actionsPanel;
+    Button moreToolsButton;
+    bool advancedActionsVisible = false;
     int actionScrollOffset = 0;
     bool draggingActionScrollThumb = false;
     int actionScrollDragStartY = 0;
     int actionScrollStartOffset = 0;
+    List<Button> advancedActionButtons = new List<Button>();
     Dictionary<string, Label> labelControls = new Dictionary<string, Label>();
     Dictionary<string, Button> buttonControls = new Dictionary<string, Button>();
     Process runtimeProcess;
@@ -73,7 +76,7 @@ public class LocalAreaInterconnectionDesktop : Form
     const int ActionStartRow = 12;
     const int ActionRowSpan = 4;
     const int OutputRow = 16;
-    const int ResizeGripSize = 8;
+    const int ResizeGripSize = 12;
 
     protected override CreateParams CreateParams
     {
@@ -260,48 +263,54 @@ public class LocalAreaInterconnectionDesktop : Form
         rootLayout.Controls.Add(actionsHost, 2, ActionStartRow);
         rootLayout.SetRowSpan(actionsHost, ActionRowSpan);
 
-        AddButton(actionsPanel, "createRoom", delegate { CreateRoom(); });
-        AddButton(actionsPanel, "copyInvite", delegate { CopyInvite(); });
-        AddButton(actionsPanel, "copyIp", delegate { CopyVirtualIp(); });
-        AddButton(actionsPanel, "decodeInvite", delegate { DecodeInvite(); });
-        AddButton(actionsPanel, "joinRoom", delegate { JoinRoom(); });
-        AddButton(actionsPanel, "adapterPlan", delegate { RunNativeCli("adapter-plan --adapter-name LocalAreaInterconnection --subnet " + subnet.Text + " --ip " + ip.Text); });
-        AddButton(actionsPanel, "adapterScan", delegate { RunNativeAdapterEnsure(); });
-        AddButton(actionsPanel, "nativeAdapterEnsure", delegate { RunNativeAdapterEnsure(); });
-        AddButton(actionsPanel, "gamePlan", delegate { RunNativeCli("game-plan --game-name " + Quote(gameName.Text) + " --subnet " + subnet.Text + " --ports " + ports.Text); });
-        AddButton(actionsPanel, "gameProfileList", delegate { RunGameProfileList(); });
-        AddButton(actionsPanel, "gameProfilePlan", delegate { RunGameProfilePlan(); });
-        AddButton(actionsPanel, "gamePortScan", delegate { RunGamePortScan(); });
-        AddButton(actionsPanel, "gameReadinessCheck", delegate { RunGameReadinessCheck(); });
-        AddButton(actionsPanel, "firewallPlan", delegate { RunNativeCli("firewall-plan --game-name " + Quote(gameName.Text) + GameCatalogArgs() + " --subnet " + subnet.Text + " --ports " + ports.Text); });
-        AddButton(actionsPanel, "firewallDiagnose", delegate { RunNativeCli(FirewallDiagnoseArgs()); });
-        AddButton(actionsPanel, "firewallScan", delegate { RunNativeCli(FirewallDiagnoseArgs()); });
-        AddButton(actionsPanel, "generalDiagnose", delegate { RunNativeCli("diagnose --p2p ok --firewall allowed"); });
-        AddButton(actionsPanel, "networkDiagnose", delegate { RunNetworkDiagnose(); });
-        AddButton(actionsPanel, "exportDiagnostics", delegate { ExportDiagnostics(); });
-        AddButton(actionsPanel, "udpTest", delegate { RunUdpTest(); });
-        AddButton(actionsPanel, "broadcastTest", delegate { RunBroadcastTest(); });
-        AddButton(actionsPanel, "nativeRuntimeSelfTest", delegate { RunNativeRuntimeSelfTest(); });
-        AddButton(actionsPanel, "wintunDetect", delegate { RunWintunDetect(); });
-        AddButton(actionsPanel, "wintunProbe", delegate { RunWintunSessionProbe(); });
-        AddButton(actionsPanel, "nativeOffer", delegate { RunNativeOffer(); });
-        AddButton(actionsPanel, "startCoordination", delegate { StartLocalCoordinationServer(); });
-        AddButton(actionsPanel, "stopCoordination", delegate { StopLocalCoordinationServer(); });
-        AddButton(actionsPanel, "startRuntime", delegate { StartNativeRuntime(); });
-        AddButton(actionsPanel, "stopRuntime", delegate { StopNativeRuntime(); });
-        AddButton(actionsPanel, "runtimeCleanupPlan", delegate { RunRuntimeCleanupPlan(); });
-        AddButton(actionsPanel, "runtimeCleanupApply", delegate { RunRuntimeCleanupApply(); });
-        AddButton(actionsPanel, "routeScan", delegate { RunRouteScan(); });
-        AddButton(actionsPanel, "closeRoom", delegate { CloseCoordinationRoom(); });
-        AddButton(actionsPanel, "kickPeer", delegate { KickCoordinationPeer(); });
-        AddButton(actionsPanel, "nativeNatSelfTest", delegate { RunNativeNatSelfTest(); });
-        AddButton(actionsPanel, "relayFallbackPlan", delegate { RunRelayFallbackPlan(); });
-        AddButton(actionsPanel, "connectionPathPlan", delegate { RunConnectionPathPlan(); });
-        AddButton(actionsPanel, "tcpTest", delegate { RunTcpTest(); });
-        AddButton(actionsPanel, "browseGameCatalog", delegate { BrowseGameCatalog(); });
-        AddButton(actionsPanel, "browseNetsh", delegate { BrowseNetshOutput(); });
-        AddButton(actionsPanel, "browsePackets", delegate { BrowsePacketObservations(); });
-        AddButton(actionsPanel, "copyOutput", delegate { if (output.Text.Length > 0) Clipboard.SetText(output.Text); });
+        AddButton(actionsPanel, "quickHostRoom", delegate { QuickHostRoom(); });
+        AddButton(actionsPanel, "quickJoinRoom", delegate { QuickJoinRoom(); });
+        AddButton(actionsPanel, "startLanSession", delegate { StartLanSession(); });
+        AddButton(actionsPanel, "checkConnection", delegate { RunNetworkDiagnose(); });
+        moreToolsButton = AddButton(actionsPanel, "moreTools", delegate { ToggleAdvancedActions(); });
+        AddButton(actionsPanel, "createRoom", delegate { CreateRoom(); }, true);
+        AddButton(actionsPanel, "copyInvite", delegate { CopyInvite(); }, true);
+        AddButton(actionsPanel, "copyIp", delegate { CopyVirtualIp(); }, true);
+        AddButton(actionsPanel, "decodeInvite", delegate { DecodeInvite(); }, true);
+        AddButton(actionsPanel, "joinRoom", delegate { JoinRoom(); }, true);
+        AddButton(actionsPanel, "adapterPlan", delegate { RunNativeCli("adapter-plan --adapter-name LocalAreaInterconnection --subnet " + subnet.Text + " --ip " + ip.Text); }, true);
+        AddButton(actionsPanel, "adapterScan", delegate { RunNativeAdapterEnsure(); }, true);
+        AddButton(actionsPanel, "nativeAdapterEnsure", delegate { RunNativeAdapterEnsure(); }, true);
+        AddButton(actionsPanel, "gamePlan", delegate { RunNativeCli("game-plan --game-name " + Quote(gameName.Text) + " --subnet " + subnet.Text + " --ports " + ports.Text); }, true);
+        AddButton(actionsPanel, "gameProfileList", delegate { RunGameProfileList(); }, true);
+        AddButton(actionsPanel, "gameProfilePlan", delegate { RunGameProfilePlan(); }, true);
+        AddButton(actionsPanel, "gamePortScan", delegate { RunGamePortScan(); }, true);
+        AddButton(actionsPanel, "gameReadinessCheck", delegate { RunGameReadinessCheck(); }, true);
+        AddButton(actionsPanel, "firewallPlan", delegate { RunNativeCli("firewall-plan --game-name " + Quote(gameName.Text) + GameCatalogArgs() + " --subnet " + subnet.Text + " --ports " + ports.Text); }, true);
+        AddButton(actionsPanel, "firewallDiagnose", delegate { RunNativeCli(FirewallDiagnoseArgs()); }, true);
+        AddButton(actionsPanel, "firewallScan", delegate { RunNativeCli(FirewallDiagnoseArgs()); }, true);
+        AddButton(actionsPanel, "generalDiagnose", delegate { RunNativeCli("diagnose --p2p ok --firewall allowed"); }, true);
+        AddButton(actionsPanel, "networkDiagnose", delegate { RunNetworkDiagnose(); }, true);
+        AddButton(actionsPanel, "exportDiagnostics", delegate { ExportDiagnostics(); }, true);
+        AddButton(actionsPanel, "udpTest", delegate { RunUdpTest(); }, true);
+        AddButton(actionsPanel, "broadcastTest", delegate { RunBroadcastTest(); }, true);
+        AddButton(actionsPanel, "nativeRuntimeSelfTest", delegate { RunNativeRuntimeSelfTest(); }, true);
+        AddButton(actionsPanel, "wintunDetect", delegate { RunWintunDetect(); }, true);
+        AddButton(actionsPanel, "wintunProbe", delegate { RunWintunSessionProbe(); }, true);
+        AddButton(actionsPanel, "nativeOffer", delegate { RunNativeOffer(); }, true);
+        AddButton(actionsPanel, "startCoordination", delegate { StartLocalCoordinationServer(); }, true);
+        AddButton(actionsPanel, "stopCoordination", delegate { StopLocalCoordinationServer(); }, true);
+        AddButton(actionsPanel, "startRuntime", delegate { StartNativeRuntime(); }, true);
+        AddButton(actionsPanel, "stopRuntime", delegate { StopNativeRuntime(); }, true);
+        AddButton(actionsPanel, "runtimeCleanupPlan", delegate { RunRuntimeCleanupPlan(); }, true);
+        AddButton(actionsPanel, "runtimeCleanupApply", delegate { RunRuntimeCleanupApply(); }, true);
+        AddButton(actionsPanel, "routeScan", delegate { RunRouteScan(); }, true);
+        AddButton(actionsPanel, "closeRoom", delegate { CloseCoordinationRoom(); }, true);
+        AddButton(actionsPanel, "kickPeer", delegate { KickCoordinationPeer(); }, true);
+        AddButton(actionsPanel, "nativeNatSelfTest", delegate { RunNativeNatSelfTest(); }, true);
+        AddButton(actionsPanel, "relayFallbackPlan", delegate { RunRelayFallbackPlan(); }, true);
+        AddButton(actionsPanel, "connectionPathPlan", delegate { RunConnectionPathPlan(); }, true);
+        AddButton(actionsPanel, "tcpTest", delegate { RunTcpTest(); }, true);
+        AddButton(actionsPanel, "browseGameCatalog", delegate { BrowseGameCatalog(); }, true);
+        AddButton(actionsPanel, "browseNetsh", delegate { BrowseNetshOutput(); }, true);
+        AddButton(actionsPanel, "browsePackets", delegate { BrowsePacketObservations(); }, true);
+        AddButton(actionsPanel, "copyOutput", delegate { if (output.Text.Length > 0) Clipboard.SetText(output.Text); }, true);
+        UpdateAdvancedActions();
 
         Panel detailsPanel = RoomDetailsPanel();
         rootLayout.Controls.Add(detailsPanel, 2, 0);
@@ -387,6 +396,10 @@ public class LocalAreaInterconnectionDesktop : Form
     {
         grip.Left = (anchor & AnchorStyles.Right) == AnchorStyles.Right ? ClientSize.Width - grip.Width : 0;
         grip.Top = (anchor & AnchorStyles.Bottom) == AnchorStyles.Bottom ? ClientSize.Height - grip.Height : 0;
+        if (grip.Name == "resizeTopRight")
+        {
+            grip.Top = 38;
+        }
         grip.BringToFront();
     }
 
@@ -471,17 +484,20 @@ public class LocalAreaInterconnectionDesktop : Form
         bar.Controls.Add(languageButton);
         ApplyRoundedRegion(languageButton, 6);
 
-        Button closeButton = AddChromeButton(bar, ChromeGlyph.Close, "closeTip", Width - 44, delegate { Close(); });
-        Button maximizeButton = AddChromeButton(bar, ChromeGlyph.Maximize, "maximizeTip", Width - 88, delegate { WindowState = WindowState == FormWindowState.Maximized ? FormWindowState.Normal : FormWindowState.Maximized; });
-        Button minimizeButton = AddChromeButton(bar, ChromeGlyph.Minimize, "minimizeTip", Width - 132, delegate { WindowState = FormWindowState.Minimized; });
+        Button closeButton = AddChromeButton(bar, ChromeGlyph.Close, "closeTip", 0, delegate { Close(); });
+        Button maximizeButton = AddChromeButton(bar, ChromeGlyph.Maximize, "maximizeTip", 0, delegate { WindowState = WindowState == FormWindowState.Maximized ? FormWindowState.Normal : FormWindowState.Maximized; });
+        Button minimizeButton = AddChromeButton(bar, ChromeGlyph.Minimize, "minimizeTip", 0, delegate { WindowState = FormWindowState.Minimized; });
         bar.Resize += delegate
         {
-            languageButton.Left = bar.Width - 238;
-            closeButton.Left = bar.Width - 44;
-            maximizeButton.Left = bar.Width - 88;
-            minimizeButton.Left = bar.Width - 132;
+            languageButton.Left = bar.Width - 230;
+            closeButton.Left = bar.Width - 46;
+            maximizeButton.Left = bar.Width - 86;
+            minimizeButton.Left = bar.Width - 126;
         };
-        languageButton.Left = bar.Width - 238;
+        languageButton.Left = bar.Width - 230;
+        closeButton.Left = bar.Width - 46;
+        maximizeButton.Left = bar.Width - 86;
+        minimizeButton.Left = bar.Width - 126;
         return bar;
     }
 
@@ -489,18 +505,17 @@ public class LocalAreaInterconnectionDesktop : Form
     {
         Button button = new Button();
         button.Left = left;
-        button.Top = 0;
-        button.Width = 44;
-        button.Height = 38;
+        button.Top = 5;
+        button.Width = 34;
+        button.Height = 28;
         button.FlatStyle = FlatStyle.Flat;
         button.FlatAppearance.BorderSize = 0;
         button.BackColor = Color.FromArgb(5, 18, 32);
         button.ForeColor = Color.FromArgb(220, 244, 255);
         button.TabStop = false;
         button.UseVisualStyleBackColor = false;
-        button.Resize += delegate { ApplyRoundedRegion(button, 6); };
-        button.FlatAppearance.MouseOverBackColor = glyph == ChromeGlyph.Close ? Color.FromArgb(184, 54, 54) : Color.FromArgb(22, 65, 94);
-        button.FlatAppearance.MouseDownBackColor = glyph == ChromeGlyph.Close ? Color.FromArgb(138, 36, 36) : Color.FromArgb(12, 43, 65);
+        button.FlatAppearance.MouseOverBackColor = Color.FromArgb(5, 18, 32);
+        button.FlatAppearance.MouseDownBackColor = Color.FromArgb(5, 18, 32);
         button.Click += handler;
         button.Paint += delegate(object sender, PaintEventArgs e)
         {
@@ -509,7 +524,6 @@ public class LocalAreaInterconnectionDesktop : Form
         chromeTips.SetToolTip(button, T(tipKey));
         button.Tag = tipKey;
         bar.Controls.Add(button);
-        ApplyRoundedRegion(button, 6);
         return button;
     }
 
@@ -590,16 +604,17 @@ public class LocalAreaInterconnectionDesktop : Form
         bool hover = button.ClientRectangle.Contains(button.PointToClient(Cursor.Position));
         Color background = glyph == ChromeGlyph.Close && hover
             ? Color.FromArgb(184, 54, 54)
-            : hover ? Color.FromArgb(22, 65, 94) : Color.FromArgb(5, 18, 32);
+            : hover ? Color.FromArgb(22, 65, 94) : Color.FromArgb(11, 32, 49);
+        using (GraphicsPath path = RoundedRectPath(new Rectangle(0, 0, button.Width - 1, button.Height - 1), 8))
         using (SolidBrush brush = new SolidBrush(background))
         {
-            e.Graphics.FillRectangle(brush, button.ClientRectangle);
+            e.Graphics.FillPath(brush, path);
         }
 
         Color glyphColor = glyph == ChromeGlyph.Close && hover
             ? Color.White
             : Color.FromArgb(218, 242, 252);
-        using (Pen pen = new Pen(glyphColor, 1.7f))
+        using (Pen pen = new Pen(glyphColor, 1.9f))
         {
             pen.StartCap = LineCap.Round;
             pen.EndCap = LineCap.Round;
@@ -607,16 +622,16 @@ public class LocalAreaInterconnectionDesktop : Form
             int centerY = button.Height / 2;
             if (glyph == ChromeGlyph.Minimize)
             {
-                e.Graphics.DrawLine(pen, centerX - 6, centerY + 5, centerX + 6, centerY + 5);
+                e.Graphics.DrawLine(pen, centerX - 5, centerY + 5, centerX + 5, centerY + 5);
             }
             else if (glyph == ChromeGlyph.Maximize)
             {
-                e.Graphics.DrawRectangle(pen, centerX - 6, centerY - 6, 12, 12);
+                e.Graphics.DrawRectangle(pen, centerX - 5, centerY - 5, 10, 10);
             }
             else
             {
-                e.Graphics.DrawLine(pen, centerX - 6, centerY - 6, centerX + 6, centerY + 6);
-                e.Graphics.DrawLine(pen, centerX + 6, centerY - 6, centerX - 6, centerY + 6);
+                e.Graphics.DrawLine(pen, centerX - 5, centerY - 5, centerX + 5, centerY + 5);
+                e.Graphics.DrawLine(pen, centerX + 5, centerY - 5, centerX - 5, centerY + 5);
             }
         }
     }
@@ -645,25 +660,57 @@ public class LocalAreaInterconnectionDesktop : Form
         return label;
     }
 
-    void AddButton(FlowLayoutPanel panel, string key, EventHandler handler)
+    Button AddButton(FlowLayoutPanel panel, string key, EventHandler handler)
+    {
+        return AddButton(panel, key, handler, false);
+    }
+
+    Button AddButton(FlowLayoutPanel panel, string key, EventHandler handler, bool advanced)
     {
         Button button = new Button();
         button.Text = T(key);
         button.Width = Math.Min(184, Math.Max(116, TextRenderer.MeasureText(button.Text, Font).Width + 24));
-        button.Height = 28;
+        button.Height = advanced ? 28 : 32;
         button.Margin = new Padding(0, 0, 8, 8);
         button.FlatStyle = FlatStyle.Flat;
-        button.BackColor = Color.FromArgb(34, 95, 132);
+        button.BackColor = advanced ? Color.FromArgb(27, 78, 111) : Color.FromArgb(38, 112, 152);
         button.ForeColor = Color.FromArgb(236, 250, 255);
-        button.FlatAppearance.BorderColor = Color.FromArgb(120, 203, 255);
-        button.FlatAppearance.MouseOverBackColor = Color.FromArgb(54, 132, 175);
+        button.Font = new Font(Font, advanced ? FontStyle.Regular : FontStyle.Bold);
+        button.FlatAppearance.BorderColor = advanced ? Color.FromArgb(76, 151, 191) : Color.FromArgb(127, 218, 255);
+        button.FlatAppearance.MouseOverBackColor = advanced ? Color.FromArgb(41, 103, 140) : Color.FromArgb(54, 137, 180);
         button.FlatAppearance.MouseDownBackColor = Color.FromArgb(21, 72, 110);
         button.Click += handler;
         button.MouseWheel += ScrollActionsWheel;
         button.Resize += delegate { ApplyRoundedRegion(button, 8); };
         ApplyRoundedRegion(button, 8);
         buttonControls[key] = button;
+        if (advanced)
+        {
+            advancedActionButtons.Add(button);
+            button.Visible = advancedActionsVisible;
+        }
         panel.Controls.Add(button);
+        return button;
+    }
+
+    void ToggleAdvancedActions()
+    {
+        advancedActionsVisible = !advancedActionsVisible;
+        UpdateAdvancedActions();
+    }
+
+    void UpdateAdvancedActions()
+    {
+        foreach (Button button in advancedActionButtons)
+        {
+            button.Visible = advancedActionsVisible;
+        }
+        if (moreToolsButton != null)
+        {
+            moreToolsButton.Text = T(advancedActionsVisible ? "hideTools" : "moreTools");
+        }
+        actionScrollOffset = 0;
+        AdjustActionLayout();
     }
 
     void AdjustActionLayout()
@@ -672,14 +719,17 @@ public class LocalAreaInterconnectionDesktop : Form
         int available = Math.Max(220, actionsViewport.ClientSize.Width - 2);
         int columns = Math.Max(2, Math.Min(3, available / 136));
         int width = Math.Max(112, (available / columns) - 8);
+        int visibleControls = 0;
         foreach (Control control in actionsPanel.Controls)
         {
+            if (!control.Visible) continue;
             control.Width = width;
-            control.Height = 30;
+            control.Height = advancedActionButtons.Contains((Button)control) ? 28 : 32;
+            visibleControls++;
         }
 
-        int rows = (int)Math.Ceiling(actionsPanel.Controls.Count / (double)columns);
-        int contentHeight = Math.Max(actionsViewport.ClientSize.Height, rows * 38);
+        int rows = (int)Math.Ceiling(visibleControls / (double)columns);
+        int contentHeight = Math.Max(actionsViewport.ClientSize.Height, rows * 40);
         actionsPanel.SetBounds(0, -actionScrollOffset, available, contentHeight);
         ClampActionScroll();
         UpdateActionScrollBar();
@@ -943,6 +993,40 @@ public class LocalAreaInterconnectionDesktop : Form
             pingTarget.Text = generatedHostIp;
         }
         UpdateRoomDetails("created");
+    }
+
+    void QuickHostRoom()
+    {
+        CreateRoom();
+        if (invite.Text.Trim().Length > 0)
+        {
+            Clipboard.SetText(invite.Text.Trim());
+            output.Text += Environment.NewLine
+                + Environment.NewLine
+                + T("quickInviteCopied")
+                + Environment.NewLine
+                + T("quickNextHost");
+        }
+    }
+
+    void QuickJoinRoom()
+    {
+        DecodeInvite();
+        JoinRoom();
+        output.Text += Environment.NewLine
+            + Environment.NewLine
+            + T("quickJoinedNext");
+    }
+
+    void StartLanSession()
+    {
+        StartLocalCoordinationServer();
+        RunNativeOffer();
+        StartNativeRuntime();
+        RunNetworkDiagnose();
+        output.Text += Environment.NewLine
+            + Environment.NewLine
+            + T("quickLanStarted");
     }
 
     void DecodeInvite()
@@ -3196,6 +3280,10 @@ public class LocalAreaInterconnectionDesktop : Form
         {
             item.Value.Text = T(item.Key);
         }
+        if (moreToolsButton != null)
+        {
+            moreToolsButton.Text = T(advancedActionsVisible ? "hideTools" : "moreTools");
+        }
         UpdateChromeTooltips();
         if (output != null && output.Text.Length == 0)
         {
@@ -3283,6 +3371,16 @@ public class LocalAreaInterconnectionDesktop : Form
             if (key == "invite") return "邀请码";
             if (key == "output") return "命令输出 / 诊断结果";
             if (key == "outputHelp") return "点击上方按钮后，这里会显示命令输出、计划 JSON 或诊断结果。创建房间会自动填入邀请码，计划类操作默认不会修改系统。";
+            if (key == "quickHostRoom") return "一键开房";
+            if (key == "quickJoinRoom") return "加入朋友";
+            if (key == "startLanSession") return "启动联机";
+            if (key == "checkConnection") return "检查连接";
+            if (key == "moreTools") return "更多工具";
+            if (key == "hideTools") return "收起工具";
+            if (key == "quickInviteCopied") return "邀请码已复制，直接发给朋友。";
+            if (key == "quickNextHost") return "下一步：点击“启动联机”，然后进游戏创建 LAN 房间。";
+            if (key == "quickJoinedNext") return "已读取邀请并加入房间。下一步：点击“启动联机”，然后进游戏找 LAN 房间。";
+            if (key == "quickLanStarted") return "联机组件已启动。进游戏试试 LAN 房间；如果看不到，再点“检查连接”。";
             if (key == "createRoom") return "创建房间";
             if (key == "copyInvite") return "复制邀请";
             if (key == "copyIp") return "复制我的 IP";
@@ -3452,6 +3550,16 @@ public class LocalAreaInterconnectionDesktop : Form
             if (key == "invite") return "Invite";
             if (key == "output") return "Command output / diagnostics";
             if (key == "outputHelp") return "Click a button above to show command output, plan JSON, or diagnostics here. Create room fills the invite automatically. Plan commands do not modify the system by default.";
+            if (key == "quickHostRoom") return "Host room";
+            if (key == "quickJoinRoom") return "Join friend";
+            if (key == "startLanSession") return "Start LAN";
+            if (key == "checkConnection") return "Check connection";
+            if (key == "moreTools") return "More tools";
+            if (key == "hideTools") return "Hide tools";
+            if (key == "quickInviteCopied") return "Invite copied. Send it to your friend.";
+            if (key == "quickNextHost") return "Next: click Start LAN, then create a LAN room in the game.";
+            if (key == "quickJoinedNext") return "Invite decoded and room joined. Next: click Start LAN, then find the LAN room in the game.";
+            if (key == "quickLanStarted") return "LAN components started. Try the game LAN room; click Check connection if it does not appear.";
             if (key == "createRoom") return "Create room";
             if (key == "copyInvite") return "Copy invite";
             if (key == "copyIp") return "Copy my IP";
