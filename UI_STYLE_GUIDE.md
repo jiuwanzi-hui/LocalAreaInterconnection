@@ -14,6 +14,8 @@ This project uses a dark desktop shell with a cyan accent language: a near-black
 - Window chrome should remain custom-painted: dark title bar, compact language switcher, and line-based minimize/maximize/close icons. The chrome should be quiet, not glossy or game-like.
 - Use rounded corners throughout the desktop shell: the borderless window, input frames, action buttons, room detail panels, nav items, and custom scroll thumbs should all use soft rounded geometry while keeping the compact layout.
 - Single-line inputs must stay flat and clean: borderless text over a dark rounded frame, vertically centered, with no native TextBox lower block, white focus box, or mismatched bottom strip.
+- Window resize hit testing should not use visible or pseudo-transparent overlay panels on the four corners; WinForms transparent panels still paint over content and create square corner blocks. Keep resize behavior in window hit testing so rounded corners stay clean.
+- The app icon must be a multi-size `.ico` containing at least 16/24/32/48/64/128/256 px entries. Small title-bar and taskbar sizes should use simplified, high-contrast shapes instead of relying on a scaled-down single bitmap.
 
 ## Current Layout Notes
 

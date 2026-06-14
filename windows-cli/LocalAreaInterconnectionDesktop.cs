@@ -248,7 +248,8 @@ public class LocalAreaInterconnectionDesktop : Form
         chromeTips = new ToolTip();
         chromeTips.BackColor = CardDark;
         chromeTips.ForeColor = TextBright;
-        Resize += delegate { ApplyRoundedRegion(this, 14); };
+        Resize += delegate { UpdateWindowRegion(); };
+        UpdateWindowRegion();
 
         particles = new Particle[ParticleCount];
         for (int i = 0; i < particles.Length; i++)
@@ -266,7 +267,6 @@ public class LocalAreaInterconnectionDesktop : Form
         shell.RowStyles.Add(new RowStyle(SizeType.Absolute, 38));
         shell.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
         Controls.Add(shell);
-        AddResizeGripOverlays();
 
         Control titleBar = TitleBar();
         shell.Controls.Add(titleBar, 0, 0);
@@ -1018,92 +1018,6 @@ public class LocalAreaInterconnectionDesktop : Form
         pageAbout.Controls.Add(card);
     }
 
-    void AddResizeGripOverlays()
-    {
-        AddResizeGrip("resizeTop", AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right, Cursors.SizeNS, 12);
-        AddResizeGrip("resizeBottom", AnchorStyles.Bottom | AnchorStyles.Left | AnchorStyles.Right, Cursors.SizeNS, 15);
-        AddResizeGrip("resizeLeft", AnchorStyles.Top | AnchorStyles.Bottom | AnchorStyles.Left, Cursors.SizeWE, 10);
-        AddResizeGrip("resizeRight", AnchorStyles.Top | AnchorStyles.Bottom | AnchorStyles.Right, Cursors.SizeWE, 11);
-        AddResizeCornerGrip("resizeTopLeft", AnchorStyles.Top | AnchorStyles.Left, Cursors.SizeNWSE, 13);
-        AddResizeCornerGrip("resizeTopRight", AnchorStyles.Top | AnchorStyles.Right, Cursors.SizeNESW, 14);
-        AddResizeCornerGrip("resizeBottomLeft", AnchorStyles.Bottom | AnchorStyles.Left, Cursors.SizeNESW, 16);
-        AddResizeCornerGrip("resizeBottomRight", AnchorStyles.Bottom | AnchorStyles.Right, Cursors.SizeNWSE, 17);
-    }
-
-    Panel AddResizeGrip(string name, AnchorStyles anchor, Cursor cursor, int hitTest)
-    {
-        Panel grip = ResizeGripPanel(name, cursor, hitTest);
-        grip.Anchor = anchor;
-        Controls.Add(grip);
-        grip.BringToFront();
-        Resize += delegate { PositionResizeEdgeGrip(grip, anchor); };
-        PositionResizeEdgeGrip(grip, anchor);
-        return grip;
-    }
-
-    Panel AddResizeCornerGrip(string name, AnchorStyles anchor, Cursor cursor, int hitTest)
-    {
-        Panel grip = ResizeGripPanel(name, cursor, hitTest);
-        grip.Anchor = anchor;
-        grip.Width = ResizeGripSize * 2;
-        grip.Height = ResizeGripSize * 2;
-        Controls.Add(grip);
-        grip.BringToFront();
-        Resize += delegate { PositionResizeCornerGrip(grip, anchor); };
-        PositionResizeCornerGrip(grip, anchor);
-        return grip;
-    }
-
-    Panel ResizeGripPanel(string name, Cursor cursor, int hitTest)
-    {
-        Panel grip = new Panel();
-        grip.Name = name;
-        grip.BackColor = Color.Transparent;
-        grip.Cursor = cursor;
-        grip.Tag = hitTest;
-        grip.MouseDown += BeginResizeFromGrip;
-        return grip;
-    }
-
-    void PositionResizeCornerGrip(Control grip, AnchorStyles anchor)
-    {
-        grip.Left = (anchor & AnchorStyles.Right) == AnchorStyles.Right ? ClientSize.Width - grip.Width : 0;
-        grip.Top = (anchor & AnchorStyles.Bottom) == AnchorStyles.Bottom ? ClientSize.Height - grip.Height : 0;
-        if (grip.Name == "resizeTopRight")
-        {
-            grip.Top = 38;
-        }
-        grip.BringToFront();
-    }
-
-    void PositionResizeEdgeGrip(Control grip, AnchorStyles anchor)
-    {
-        bool horizontal = (anchor & AnchorStyles.Left) == AnchorStyles.Left && (anchor & AnchorStyles.Right) == AnchorStyles.Right;
-        if (horizontal)
-        {
-            grip.Left = ResizeGripSize;
-            grip.Width = Math.Max(1, ClientSize.Width - ResizeGripSize * 2);
-            grip.Height = ResizeGripSize;
-            grip.Top = (anchor & AnchorStyles.Bottom) == AnchorStyles.Bottom ? ClientSize.Height - ResizeGripSize : 0;
-        }
-        else
-        {
-            grip.Top = ResizeGripSize;
-            grip.Height = Math.Max(1, ClientSize.Height - ResizeGripSize * 2);
-            grip.Width = ResizeGripSize;
-            grip.Left = (anchor & AnchorStyles.Right) == AnchorStyles.Right ? ClientSize.Width - ResizeGripSize : 0;
-        }
-        grip.BringToFront();
-    }
-
-    void BeginResizeFromGrip(object sender, MouseEventArgs e)
-    {
-        if (e.Button != MouseButtons.Left || WindowState == FormWindowState.Maximized) return;
-        Control grip = (Control)sender;
-        Native.ReleaseCapture();
-        Native.SendMessage(Handle, 0xA1, new IntPtr((int)grip.Tag), IntPtr.Zero);
-    }
-
     Control TitleBar()
     {
         Panel bar = new Panel();
@@ -1256,6 +1170,20 @@ public class LocalAreaInterconnectionDesktop : Form
         {
             control.Region = new Region(path);
         }
+    }
+
+    void UpdateWindowRegion()
+    {
+        if (WindowState == FormWindowState.Maximized)
+        {
+            if (Region != null)
+            {
+                Region.Dispose();
+                Region = null;
+            }
+            return;
+        }
+        ApplyRoundedRegion(this, 14);
     }
 
     GraphicsPath RoundedRectPath(Rectangle bounds, int radius)
