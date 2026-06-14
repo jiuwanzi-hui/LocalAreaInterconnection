@@ -12,18 +12,21 @@ using System.Windows.Forms;
 
 public class LocalAreaInterconnectionDesktop : Form
 {
-    static readonly Color ShellDark = Color.FromArgb(23, 23, 23);
-    static readonly Color TitleDark = Color.FromArgb(21, 21, 21);
-    static readonly Color SidebarDark = Color.FromArgb(26, 74, 85);
-    static readonly Color SidebarDeep = Color.FromArgb(35, 58, 78);
-    static readonly Color CardDark = Color.FromArgb(47, 47, 47);
-    static readonly Color CardBorder = Color.FromArgb(64, 64, 64);
-    static readonly Color FieldDark = Color.FromArgb(42, 42, 42);
-    static readonly Color TextBright = Color.FromArgb(244, 244, 244);
-    static readonly Color TextMuted = Color.FromArgb(176, 184, 186);
-    static readonly Color WeChatGreen = Color.FromArgb(39, 201, 145);
-    static readonly Color WeChatGreenHover = Color.FromArgb(52, 214, 157);
-    static readonly Color WeChatGreenDown = Color.FromArgb(24, 174, 121);
+    static readonly Color ShellDark = Color.FromArgb(20, 22, 26);
+    static readonly Color TitleDark = Color.FromArgb(16, 18, 22);
+    static readonly Color SidebarDark = Color.FromArgb(15, 69, 78);
+    static readonly Color SidebarMid = Color.FromArgb(30, 76, 86);
+    static readonly Color SidebarDeep = Color.FromArgb(40, 65, 86);
+    static readonly Color CardDark = Color.FromArgb(30, 34, 40);
+    static readonly Color CardBorder = Color.FromArgb(42, 48, 56);
+    static readonly Color FieldDark = Color.FromArgb(26, 30, 36);
+    static readonly Color TextBright = Color.FromArgb(240, 244, 246);
+    static readonly Color TextMuted = Color.FromArgb(138, 148, 156);
+    static readonly Color AccentCyan = Color.FromArgb(0, 212, 216);
+    static readonly Color AccentCyanHover = Color.FromArgb(31, 222, 218);
+    static readonly Color AccentCyanDown = Color.FromArgb(0, 176, 184);
+    static readonly Color ParticleCyan = Color.FromArgb(0, 212, 216);
+    static readonly Color ParticleCyan2 = Color.FromArgb(31, 222, 218);
 
     enum ChromeGlyph
     {
@@ -51,9 +54,23 @@ public class LocalAreaInterconnectionDesktop : Form
     TextBox invite;
     TextBox output;
     Timer runtimeStatusTimer;
+    Timer particleTimer;
+    const int ParticleCount = 90;
+    const int ParticleLinkDistance = 92;
+    const int ParticleLinkAlphaMax = 26;
     Random random = new Random();
     Particle[] particles;
     string language;
+    Panel sidebarPanel;
+    Panel contentArea;
+    Panel pageHome;
+    Panel pageDiagnose;
+    Panel pageGames;
+    Panel pageTools;
+    Panel pageAbout;
+    List<Panel> contentPages = new List<Panel>();
+    List<Button> navButtons = new List<Button>();
+    string activePage = "home";
     Label titleLabel;
     Label roomSummary;
     Label connectionSummary;
@@ -62,7 +79,6 @@ public class LocalAreaInterconnectionDesktop : Form
     Label nextActionSummary;
     Button languageButton;
     ToolTip chromeTips;
-    TableLayoutPanel rootLayout;
     Panel actionsHost;
     Panel actionsViewport;
     Panel actionScrollBar;
@@ -90,9 +106,6 @@ public class LocalAreaInterconnectionDesktop : Form
     string lastRuntimeSnapshotText = "";
     int lastRuntimeLogLength = 0;
     DateTime lastCoordinationRefreshUtc = DateTime.MinValue;
-    const int ActionStartRow = 12;
-    const int ActionRowSpan = 4;
-    const int OutputRow = 16;
     const int ResizeGripSize = 12;
 
     protected override CreateParams CreateParams
@@ -218,7 +231,7 @@ public class LocalAreaInterconnectionDesktop : Form
         chromeTips.ForeColor = TextBright;
         Resize += delegate { ApplyRoundedRegion(this, 14); };
 
-        particles = new Particle[42];
+        particles = new Particle[ParticleCount];
         for (int i = 0; i < particles.Length; i++)
         {
             particles[i] = NewParticle();
@@ -227,55 +240,619 @@ public class LocalAreaInterconnectionDesktop : Form
         TableLayoutPanel shell = new TableLayoutPanel();
         shell.Dock = DockStyle.Fill;
         shell.BackColor = Color.Transparent;
-        shell.ColumnCount = 1;
+        shell.ColumnCount = 2;
         shell.RowCount = 2;
+        shell.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 200));
+        shell.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
         shell.RowStyles.Add(new RowStyle(SizeType.Absolute, 38));
         shell.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
         Controls.Add(shell);
         AddResizeGripOverlays();
 
-        shell.Controls.Add(TitleBar(), 0, 0);
+        Control titleBar = TitleBar();
+        shell.Controls.Add(titleBar, 0, 0);
+        shell.SetColumnSpan(titleBar, 2);
 
-        rootLayout = new TableLayoutPanel();
-        rootLayout.Dock = DockStyle.Fill;
-        rootLayout.BackColor = Color.Transparent;
-        rootLayout.ColumnCount = 3;
-        rootLayout.RowCount = 17;
-        rootLayout.Padding = new Padding(20, 18, 20, 18);
-        rootLayout.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 230));
-        rootLayout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 57));
-        rootLayout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 43));
-        for (int i = 0; i < 15; i++)
+        // ===== Sidebar (navigation rail) =====
+        sidebarPanel = BuildSidebar();
+        shell.Controls.Add(sidebarPanel, 0, 1);
+
+        // ===== Content area: pages share the output console =====
+        contentArea = new Panel();
+        contentArea.Dock = DockStyle.Fill;
+        contentArea.BackColor = Color.Transparent;
+        contentArea.Padding = new Padding(0);
+        shell.Controls.Add(contentArea, 1, 1);
+
+        BuildPages();
+
+        ApplyLanguage();
+        UpdateRoomDetails("idle");
+        Resize += delegate { AdjustActionLayout(); };
+        AdjustActionLayout();
+        SelectPage("home");
+
+        runtimeStatusTimer = new Timer();
+        runtimeStatusTimer.Interval = 1500;
+        runtimeStatusTimer.Tick += delegate { RefreshRuntimeStatus(); };
+        runtimeStatusTimer.Start();
+
+        particleTimer = new Timer();
+        particleTimer.Interval = 30;
+        particleTimer.Tick += TickParticles;
+        particleTimer.Start();
+        VisibleChanged += delegate { if (particleTimer != null) { if (Visible) particleTimer.Start(); else particleTimer.Stop(); } };
+        FormClosing += delegate
         {
-            rootLayout.RowStyles.Add(new RowStyle(SizeType.Absolute, 36));
+            StopRuntimeProcess(1500);
+            StopCoordinationProcess(1500);
+        };
+        FormClosed += delegate
+        {
+            if (activeWindow == this) activeWindow = null;
+        };
+    }
+
+    // ===== Sidebar navigation rail =====
+    Panel BuildSidebar()
+    {
+        Panel rail = new Panel();
+        rail.Dock = DockStyle.Fill;
+        rail.BackColor = SidebarDark;
+        rail.Paint += PaintSidebarBackground;
+        rail.Padding = new Padding(0);
+        rail.MouseDown += BeginDrag;
+
+        // Brand block at top: circular logo + app name.
+        Panel brand = new Panel();
+        brand.Width = 200;
+        brand.Height = 70;
+        brand.Top = 14;
+        brand.Left = 0;
+        brand.BackColor = Color.Transparent;
+        brand.Paint += PaintSidebarBrand;
+        brand.MouseDown += BeginDrag;
+        rail.Controls.Add(brand);
+
+        AddNavButton(rail, "home", "navHome", 96);
+        AddNavButton(rail, "diagnose", "navDiagnose", 140);
+        AddNavButton(rail, "games", "navGames", 184);
+        AddNavButton(rail, "tools", "navTools", 228);
+        AddNavButton(rail, "about", "navAbout", 272);
+
+        return rail;
+    }
+
+    void PaintSidebarBackground(object sender, PaintEventArgs e)
+    {
+        Control c = (Control)sender;
+        Rectangle r = new Rectangle(0, 0, c.Width, c.Height);
+        if (r.Width <= 0 || r.Height <= 0) return;
+        Rectangle top = new Rectangle(0, 0, c.Width, Math.Max(1, c.Height / 2));
+        Rectangle bottom = new Rectangle(0, top.Bottom, c.Width, Math.Max(1, c.Height - top.Height));
+        using (LinearGradientBrush brush = new LinearGradientBrush(top, SidebarDark, SidebarMid, LinearGradientMode.Vertical))
+        {
+            e.Graphics.FillRectangle(brush, top);
         }
-        rootLayout.RowStyles.Add(new RowStyle(SizeType.Absolute, 36));
-        rootLayout.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
-        shell.Controls.Add(rootLayout, 0, 1);
+        using (LinearGradientBrush brush = new LinearGradientBrush(bottom, SidebarMid, SidebarDeep, LinearGradientMode.Vertical))
+        {
+            e.Graphics.FillRectangle(brush, bottom);
+        }
+    }
 
-        roomName = AddField(rootLayout, 0, "roomName", "Friday LAN");
-        hostName = AddField(rootLayout, 1, "host", "Alice");
-        subnet = AddField(rootLayout, 2, "virtualSubnet", "10.77.12.0/24");
-        ip = AddField(rootLayout, 3, "myVirtualIp", "10.77.12.2");
-        gameName = AddField(rootLayout, 4, "gameName", "Generic UDP Broadcast LAN Game");
-        gameCatalog = AddField(rootLayout, 5, "gameCatalog", DefaultGameCatalogPath());
-        ports = AddField(rootLayout, 6, "gamePorts", "27015");
-        observed = AddField(rootLayout, 7, "observedRules", "udp:27015");
-        netshOutput = AddField(rootLayout, 8, "netshOutputFile", "");
-        pingTarget = AddField(rootLayout, 9, "pingTarget", "127.0.0.1");
-        packetObservations = AddField(rootLayout, 10, "packetObservations", "");
-        coordinationServer = AddField(rootLayout, 11, "coordinationServer", "");
-        stunServer = AddField(rootLayout, 12, "stunServer", "");
-        remotePeer = AddField(rootLayout, 13, "remotePeer", "");
-        invite = AddField(rootLayout, 14, "invite", "");
+    void PaintSidebarBrand(object sender, PaintEventArgs e)
+    {
+        Control c = (Control)sender;
+        e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
+        // circular logo disc with cyan ring
+        int size = 38;
+        int x = 16;
+        int y = 6;
+        using (GraphicsPath disc = new GraphicsPath())
+        {
+            disc.AddEllipse(x, y, size, size);
+            using (PathGradientBrush fill = new PathGradientBrush(disc))
+            {
+                fill.CenterColor = Color.FromArgb(60, AccentCyan);
+                fill.SurroundColors = new Color[] { Color.FromArgb(16, AccentCyan) };
+                e.Graphics.FillPath(fill, disc);
+            }
+            using (Pen ring = new Pen(AccentCyan, 1.6f))
+            {
+                e.Graphics.DrawEllipse(ring, x + 1, y + 1, size - 2, size - 2);
+            }
+        }
+        if (Icon != null)
+        {
+            try
+            {
+                using (Bitmap ico = new Bitmap(Icon.ToBitmap(), 22, 22))
+                {
+                    using (GraphicsPath clip = new GraphicsPath())
+                    {
+                        clip.AddEllipse(x + 8, y + 8, 22, 22);
+                        e.Graphics.SetClip(clip);
+                        e.Graphics.DrawImage(ico, x + 8, y + 8, 22, 22);
+                        e.Graphics.ResetClip();
+                    }
+                }
+            }
+            catch { }
+        }
+        string title = T("appTitle");
+        string tag = T("appTagline");
+        using (Font titleFont = new Font(Font.FontFamily, 10.5f, FontStyle.Bold))
+        {
+            TextRenderer.DrawText(e.Graphics, title, titleFont, new Point(x + size + 8, y + 0), TextBright, TextFormatFlags.Left | TextFormatFlags.Top);
+        }
+        using (Font tagFont = new Font(Font.FontFamily, 8f, FontStyle.Regular))
+        {
+            TextRenderer.DrawText(e.Graphics, tag, tagFont, new Point(x + size + 8, y + 20), TextMuted, TextFormatFlags.Left | TextFormatFlags.Top);
+        }
+    }
 
+    void AddNavButton(Panel parent, string page, string key, int top)
+    {
+        Button button = new Button();
+        button.Left = 8;
+        button.Top = top;
+        button.Width = 184;
+        button.Height = 36;
+        button.FlatStyle = FlatStyle.Flat;
+        button.FlatAppearance.BorderSize = 0;
+        button.BackColor = Color.Transparent;
+        button.ForeColor = TextMuted;
+        button.Font = new Font(Font.FontFamily, 9.5f, FontStyle.Regular);
+        button.TextAlign = ContentAlignment.MiddleLeft;
+        button.Padding = new Padding(16, 0, 0, 0);
+        button.TabStop = false;
+        button.UseVisualStyleBackColor = false;
+        button.FlatAppearance.MouseOverBackColor = Color.FromArgb(27, 82, 91);
+        button.FlatAppearance.MouseDownBackColor = Color.FromArgb(20, 66, 75);
+        button.Tag = page;
+        button.Paint += delegate(object sender, PaintEventArgs e) { PaintNavButton((Button)sender, e); };
+        button.Click += delegate { SelectPage(page); };
+        button.MouseDown += BeginDrag;
+        parent.Controls.Add(button);
+        navButtons.Add(button);
+        buttonControls["nav_" + page] = button;
+    }
+
+    void PaintNavButton(Button button, PaintEventArgs e)
+    {
+        e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
+        string page = button.Tag as string;
+        bool selected = activePage == page;
+        bool hover = button.ClientRectangle.Contains(button.PointToClient(Cursor.Position));
+
+        Rectangle r = new Rectangle(0, 0, button.Width - 1, button.Height - 1);
+        using (GraphicsPath path = RoundedRectPath(r, 9))
+        {
+            Color bg = selected ? Color.FromArgb(18, 96, 106) : hover ? Color.FromArgb(27, 82, 91) : SidebarMid;
+            using (SolidBrush brush = new SolidBrush(bg))
+            {
+                e.Graphics.FillPath(brush, path);
+            }
+        }
+        // selected: left cyan accent bar + soft glow
+        if (selected)
+        {
+            using (GraphicsPath bar = new GraphicsPath())
+            {
+                bar.AddArc(new Rectangle(2, button.Height / 2 - 9, 4, 4), 180, 90);
+                bar.AddArc(new Rectangle(2, button.Height / 2 + 5, 4, 4), 90, 90);
+                bar.AddLine(4, button.Height / 2 + 7, 4, button.Height / 2 - 7);
+                bar.CloseFigure();
+                using (SolidBrush b = new SolidBrush(AccentCyan))
+                {
+                    e.Graphics.FillPath(b, bar);
+                }
+            }
+        }
+
+        Color text = selected ? AccentCyan : hover ? TextBright : TextMuted;
+        string page2 = page;
+        string key = page2 == "home" ? "navHome"
+            : page2 == "diagnose" ? "navDiagnose"
+            : page2 == "games" ? "navGames"
+            : page2 == "tools" ? "navTools"
+            : "navAbout";
+        DrawNavIcon(e.Graphics, page2, 18, button.Height / 2 - 9, selected ? AccentCyan : (hover ? TextBright : TextMuted));
+        TextRenderer.DrawText(e.Graphics, T(key), button.Font, new Rectangle(40, 0, button.Width - 44, button.Height), text, TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis);
+    }
+
+    void DrawNavIcon(Graphics g, string page, int x, int y, Color color)
+    {
+        using (Pen pen = new Pen(color, 1.6f))
+        {
+            pen.StartCap = LineCap.Round;
+            pen.EndCap = LineCap.Round;
+            if (page == "home")
+            {
+                g.DrawLine(pen, x, y + 8, x + 9, y);
+                g.DrawLine(pen, x + 9, y, x + 18, y + 8);
+                g.DrawRectangle(pen, x + 4, y + 7, 10, 8);
+            }
+            else if (page == "diagnose")
+            {
+                g.DrawEllipse(pen, x + 1, y + 1, 16, 16);
+                g.DrawLine(pen, x + 9, y + 9, x + 15, y + 15);
+            }
+            else if (page == "games")
+            {
+                g.DrawRectangle(pen, x, y + 1, 18, 14);
+                g.DrawLine(pen, x + 4, y + 1, x + 4, y + 15);
+                g.DrawLine(pen, x + 10, y + 1, x + 10, y + 15);
+            }
+            else if (page == "tools")
+            {
+                g.DrawEllipse(pen, x + 3, y + 3, 6, 6);
+                g.DrawEllipse(pen, x + 11, y + 9, 6, 6);
+                g.DrawLine(pen, x + 7, y + 7, x + 13, y + 11);
+            }
+            else // about
+            {
+                g.DrawEllipse(pen, x + 8, y, 2, 2);
+                g.DrawLine(pen, x + 9, y + 5, x + 9, y + 15);
+            }
+        }
+    }
+
+    void SelectPage(string page)
+    {
+        activePage = page;
+        foreach (Panel p in contentPages)
+        {
+            p.Visible = false;
+        }
+        Panel target = page == "home" ? pageHome
+            : page == "diagnose" ? pageDiagnose
+            : page == "games" ? pageGames
+            : page == "tools" ? pageTools
+            : pageAbout;
+        if (target != null)
+        {
+            target.Visible = true;
+            target.BringToFront();
+        }
+        // make sure shared output console is visible on top of nothing
+        foreach (Button b in navButtons) b.Invalidate();
+    }
+
+    // ===== Pages =====
+    void BuildPages()
+    {
+        BuildHomePage();
+        BuildDiagnosePage();
+        BuildGamesPage();
+        BuildToolsPage();
+        BuildAboutPage();
+        EnsureHiddenRuntimeFields();
+
+        output = new TextBox();
+        output.Multiline = true;
+        output.ScrollBars = ScrollBars.None;
+        output.WordWrap = true;
+        output.Dock = DockStyle.Fill;
+        output.Font = new System.Drawing.Font("Consolas", 10);
+        StyleTextBox(output);
+
+        // Shared output console docked at the bottom of every page via a wrapper.
+        // We attach a copy reference so each page can show it, but only one
+        // instance exists (output). Pages each get their own frame container.
+        // Simpler: a single shared output frame added to contentArea on top.
+        Panel outputHost = new Panel();
+        outputHost.Dock = DockStyle.Bottom;
+        outputHost.Height = 190;
+        outputHost.Padding = new Padding(16, 2, 16, 12);
+        outputHost.BackColor = Color.Transparent;
+        Label outputLabel = Label("output");
+        outputLabel.Dock = DockStyle.Top;
+        outputLabel.Height = 18;
+        Panel outputFrame = Framed(output);
+        outputFrame.Dock = DockStyle.Fill;
+        outputFrame.BackColor = CardDark;
+        outputFrame.Margin = new Padding(0, 2, 0, 0);
+        outputHost.Controls.Add(outputFrame);
+        outputHost.Controls.Add(outputLabel);
+        contentArea.Controls.Add(outputHost);
+        outputHost.BringToFront();
+    }
+
+    void EnsureHiddenRuntimeFields()
+    {
+        if (subnet == null) subnet = HiddenTextBox("10.77.12.0/24");
+        if (ip == null) ip = HiddenTextBox("10.77.12.2");
+        if (gameName == null) gameName = HiddenTextBox("Generic UDP Broadcast LAN Game");
+        if (gameCatalog == null) gameCatalog = HiddenTextBox(DefaultGameCatalogPath());
+        if (ports == null) ports = HiddenTextBox("27015");
+        if (observed == null) observed = HiddenTextBox("udp:27015");
+        if (netshOutput == null) netshOutput = HiddenTextBox("");
+        if (pingTarget == null) pingTarget = HiddenTextBox("127.0.0.1");
+        if (packetObservations == null) packetObservations = HiddenTextBox("");
+        if (coordinationServer == null) coordinationServer = HiddenTextBox("");
+        if (stunServer == null) stunServer = HiddenTextBox("");
+        if (remotePeer == null) remotePeer = HiddenTextBox("");
+    }
+
+    TextBox HiddenTextBox(string value)
+    {
+        TextBox box = new TextBox();
+        box.Text = value;
+        box.Visible = false;
+        Controls.Add(box);
+        return box;
+    }
+
+    TableLayoutPanel NewFieldTable()
+    {
+        TableLayoutPanel t = new TableLayoutPanel();
+        t.Dock = DockStyle.Fill;
+        t.BackColor = Color.Transparent;
+        t.ColumnCount = 3;
+        t.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 200));
+        t.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+        t.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 8));
+        return t;
+    }
+
+    void AddFieldRow(TableLayoutPanel t, int row, string key, string value)
+    {
+        while (t.RowCount <= row + 1)
+        {
+            t.RowCount++;
+            t.RowStyles.Add(new RowStyle(SizeType.Absolute, 34));
+        }
+        t.Controls.Add(Label(key), 0, row);
+        TextBox box = new TextBox();
+        box.Dock = DockStyle.Fill;
+        box.Text = value;
+        StyleTextBox(box);
+        Panel frame = Framed(box);
+        t.Controls.Add(frame, 1, row);
+        // keep field references aligned with the old field members
+        switch (key)
+        {
+            case "roomName": roomName = box; break;
+            case "host": hostName = box; break;
+            case "virtualSubnet": subnet = box; break;
+            case "myVirtualIp": ip = box; break;
+            case "gameName": gameName = box; break;
+            case "gameCatalog": gameCatalog = box; break;
+            case "gamePorts": ports = box; break;
+            case "observedRules": observed = box; break;
+            case "netshOutputFile": netshOutput = box; break;
+            case "pingTarget": pingTarget = box; break;
+            case "packetObservations": packetObservations = box; break;
+            case "coordinationServer": coordinationServer = box; break;
+            case "stunServer": stunServer = box; break;
+            case "remotePeer": remotePeer = box; break;
+            case "invite": invite = box; break;
+        }
+    }
+
+    Panel CardPanel()
+    {
+        Panel outer = new Panel();
+        outer.Dock = DockStyle.Fill;
+        outer.BackColor = CardBorder;
+        outer.Padding = new Padding(1);
+        outer.Margin = new Padding(16, 12, 16, 8);
+        Panel inner = new Panel();
+        inner.Dock = DockStyle.Fill;
+        inner.BackColor = CardDark;
+        outer.Controls.Add(inner);
+        outer.Resize += delegate { ApplyRoundedRegion(outer, 12); };
+        ApplyRoundedRegion(outer, 12);
+        outer.Tag = inner;
+        return outer;
+    }
+
+    Label PageTitle(string key)
+    {
+        Label title = new Label();
+        title.Text = T(key);
+        title.Font = new Font(Font.FontFamily, 13f, FontStyle.Bold);
+        title.ForeColor = TextBright;
+        title.BackColor = Color.Transparent;
+        title.Height = 30;
+        title.TextAlign = ContentAlignment.BottomLeft;
+        labelControls[key] = title;
+        return title;
+    }
+
+    void BuildHomePage()
+    {
+        pageHome = new Panel();
+        pageHome.Dock = DockStyle.Fill;
+        pageHome.BackColor = Color.Transparent;
+        pageHome.Padding = new Padding(0, 0, 0, 202);
+        contentArea.Controls.Add(pageHome);
+        contentPages.Add(pageHome);
+
+        Label title = PageTitle("navHome");
+        title.Dock = DockStyle.Top;
+        title.Height = 40;
+        title.Padding = new Padding(16, 8, 0, 0);
+        pageHome.Controls.Add(title);
+
+        TableLayoutPanel body = new TableLayoutPanel();
+        body.Dock = DockStyle.Fill;
+        body.ColumnCount = 2;
+        body.RowCount = 1;
+        body.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 58));
+        body.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 42));
+        body.Padding = new Padding(16, 0, 16, 12);
+        pageHome.Controls.Add(body);
+        body.BringToFront();
+
+        // Left: quick-flow card (fields + main actions)
+        Panel leftCard = CardPanel();
+        Panel leftInner = (Panel)leftCard.Tag;
+
+        TableLayoutPanel quickLayout = new TableLayoutPanel();
+        quickLayout.Dock = DockStyle.Fill;
+        quickLayout.BackColor = Color.Transparent;
+        quickLayout.ColumnCount = 1;
+        quickLayout.RowCount = 3;
+        quickLayout.RowStyles.Add(new RowStyle(SizeType.Absolute, 130));
+        quickLayout.RowStyles.Add(new RowStyle(SizeType.Absolute, 136));
+        quickLayout.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+        leftInner.Controls.Add(quickLayout);
+
+        TableLayoutPanel leftTable = NewFieldTable();
+        leftTable.RowCount = 0;
+        leftTable.Padding = new Padding(18, 14, 18, 14);
+        leftTable.Dock = DockStyle.Fill;
+        leftTable.Margin = new Padding(0);
+        AddFieldRow(leftTable, 0, "roomName", "Friday LAN");
+        AddFieldRow(leftTable, 1, "host", "Alice");
+        AddFieldRow(leftTable, 2, "invite", "");
+        leftTable.RowCount = 3;
+        leftTable.RowStyles.Add(new RowStyle(SizeType.Absolute, 34));
+        leftTable.RowStyles.Add(new RowStyle(SizeType.Absolute, 34));
+        leftTable.RowStyles.Add(new RowStyle(SizeType.Absolute, 34));
+        leftTable.GrowStyle = TableLayoutPanelGrowStyle.AddRows;
+        quickLayout.Controls.Add(leftTable, 0, 0);
+
+        // quick action row inside left card
+        FlowLayoutPanel quickActions = new FlowLayoutPanel();
+        quickActions.BackColor = Color.Transparent;
+        quickActions.WrapContents = true;
+        quickActions.Dock = DockStyle.Fill;
+        quickActions.Padding = new Padding(18, 0, 18, 14);
+        AddButton(quickActions, "quickHostRoom", delegate { QuickHostRoom(); });
+        AddButton(quickActions, "quickJoinRoom", delegate { QuickJoinRoom(); });
+        AddButton(quickActions, "startLanSession", delegate { StartLanSession(); });
+        AddButton(quickActions, "checkConnection", delegate { RunNetworkDiagnose(); });
+        moreToolsButton = AddButton(quickActions, "moreTools", delegate { SelectPage("tools"); });
+        quickLayout.Controls.Add(quickActions, 0, 1);
+
+        body.Controls.Add(leftCard, 0, 0);
+
+        // Right: room details card
+        Panel details = RoomDetailsPanel();
+        details.Margin = new Padding(8, 12, 16, 8);
+        body.Controls.Add(details, 1, 0);
+    }
+
+    void BuildDiagnosePage()
+    {
+        pageDiagnose = new Panel();
+        pageDiagnose.Dock = DockStyle.Fill;
+        pageDiagnose.BackColor = Color.Transparent;
+        pageDiagnose.Padding = new Padding(0, 0, 0, 202);
+        contentArea.Controls.Add(pageDiagnose);
+        contentPages.Add(pageDiagnose);
+
+        Label title = PageTitle("navDiagnose");
+        title.Dock = DockStyle.Top;
+        title.Height = 40;
+        title.Padding = new Padding(16, 8, 0, 0);
+        pageDiagnose.Controls.Add(title);
+
+        Panel card = CardPanel();
+        Panel inner = (Panel)card.Tag;
+        TableLayoutPanel fields = NewFieldTable();
+        fields.Padding = new Padding(18, 14, 18, 14);
+        AddFieldRow(fields, 0, "myVirtualIp", "10.77.12.2");
+        AddFieldRow(fields, 1, "pingTarget", "127.0.0.1");
+        AddFieldRow(fields, 2, "netshOutputFile", "");
+        AddFieldRow(fields, 3, "packetObservations", "");
+        AddFieldRow(fields, 4, "remotePeer", "");
+        inner.Controls.Add(fields);
+
+        FlowLayoutPanel actions = new FlowLayoutPanel();
+        actions.BackColor = Color.Transparent;
+        actions.WrapContents = true;
+        actions.Dock = DockStyle.Bottom;
+        actions.Height = 150;
+        actions.Padding = new Padding(18, 0, 18, 14);
+        AddButton(actions, "checkConnection", delegate { RunNetworkDiagnose(); });
+        AddButton(actions, "networkDiagnose", delegate { RunNetworkDiagnose(); }, true);
+        AddButton(actions, "generalDiagnose", delegate { RunNativeCli("diagnose --p2p ok --firewall allowed"); }, true);
+        AddButton(actions, "firewallDiagnose", delegate { RunNativeCli(FirewallDiagnoseArgs()); }, true);
+        AddButton(actions, "firewallScan", delegate { RunNativeCli(FirewallDiagnoseArgs()); }, true);
+        AddButton(actions, "udpTest", delegate { RunUdpTest(); }, true);
+        AddButton(actions, "tcpTest", delegate { RunTcpTest(); }, true);
+        AddButton(actions, "broadcastTest", delegate { RunBroadcastTest(); }, true);
+        AddButton(actions, "exportDiagnostics", delegate { ExportDiagnostics(); }, true);
+        AddButton(actions, "browseNetsh", delegate { BrowseNetshOutput(); }, true);
+        AddButton(actions, "browsePackets", delegate { BrowsePacketObservations(); }, true);
+        inner.Controls.Add(actions);
+
+        pageDiagnose.Controls.Add(card);
+    }
+
+    void BuildGamesPage()
+    {
+        pageGames = new Panel();
+        pageGames.Dock = DockStyle.Fill;
+        pageGames.BackColor = Color.Transparent;
+        pageGames.Padding = new Padding(0, 0, 0, 202);
+        contentArea.Controls.Add(pageGames);
+        contentPages.Add(pageGames);
+
+        Label title = PageTitle("navGames");
+        title.Dock = DockStyle.Top;
+        title.Height = 40;
+        title.Padding = new Padding(16, 8, 0, 0);
+        pageGames.Controls.Add(title);
+
+        Panel card = CardPanel();
+        Panel inner = (Panel)card.Tag;
+        TableLayoutPanel fields = NewFieldTable();
+        fields.Padding = new Padding(18, 14, 18, 14);
+        AddFieldRow(fields, 0, "gameName", "Generic UDP Broadcast LAN Game");
+        AddFieldRow(fields, 1, "gameCatalog", DefaultGameCatalogPath());
+        AddFieldRow(fields, 2, "gamePorts", "27015");
+        AddFieldRow(fields, 3, "virtualSubnet", "10.77.12.0/24");
+        AddFieldRow(fields, 4, "observedRules", "udp:27015");
+        inner.Controls.Add(fields);
+
+        FlowLayoutPanel actions = new FlowLayoutPanel();
+        actions.BackColor = Color.Transparent;
+        actions.WrapContents = true;
+        actions.Dock = DockStyle.Bottom;
+        actions.Height = 150;
+        actions.Padding = new Padding(18, 0, 18, 14);
+        AddButton(actions, "gamePlan", delegate { RunNativeCli("game-plan --game-name " + Quote(gameName.Text) + " --subnet " + subnet.Text + " --ports " + ports.Text); });
+        AddButton(actions, "gameProfileList", delegate { RunGameProfileList(); }, true);
+        AddButton(actions, "gameProfilePlan", delegate { RunGameProfilePlan(); }, true);
+        AddButton(actions, "gamePortScan", delegate { RunGamePortScan(); }, true);
+        AddButton(actions, "gameReadinessCheck", delegate { RunGameReadinessCheck(); }, true);
+        AddButton(actions, "firewallPlan", delegate { RunNativeCli("firewall-plan --game-name " + Quote(gameName.Text) + GameCatalogArgs() + " --subnet " + subnet.Text + " --ports " + ports.Text); }, true);
+        AddButton(actions, "browseGameCatalog", delegate { BrowseGameCatalog(); }, true);
+        inner.Controls.Add(actions);
+
+        pageGames.Controls.Add(card);
+    }
+
+    void BuildToolsPage()
+    {
+        pageTools = new Panel();
+        pageTools.Dock = DockStyle.Fill;
+        pageTools.BackColor = Color.Transparent;
+        pageTools.Padding = new Padding(0, 0, 0, 202);
+        contentArea.Controls.Add(pageTools);
+        contentPages.Add(pageTools);
+
+        Label title = PageTitle("navTools");
+        title.Dock = DockStyle.Top;
+        title.Height = 40;
+        title.Padding = new Padding(16, 8, 0, 0);
+        pageTools.Controls.Add(title);
+
+        Panel card = CardPanel();
+        Panel inner = (Panel)card.Tag;
+
+        // action host with scroll (reuse existing scroll machinery)
         actionsHost = new Panel();
         actionsHost.Dock = DockStyle.Fill;
         actionsHost.BackColor = CardDark;
-        actionsHost.Padding = new Padding(10);
-        actionsHost.Margin = new Padding(14, 8, 0, 8);
+        actionsHost.Padding = new Padding(12);
+        actionsHost.Margin = new Padding(0);
         actionsHost.MouseWheel += ScrollActionsWheel;
-        actionsHost.Resize += delegate { ApplyRoundedRegion(actionsHost, 12); };
 
         actionsViewport = new Panel();
         actionsViewport.Dock = DockStyle.Fill;
@@ -302,7 +879,7 @@ public class LocalAreaInterconnectionDesktop : Form
         actionScrollThumb = new Panel();
         actionScrollThumb.Left = 2;
         actionScrollThumb.Width = 6;
-        actionScrollThumb.BackColor = Color.FromArgb(92, 92, 92);
+        actionScrollThumb.BackColor = AccentCyan;
         actionScrollThumb.Cursor = Cursors.Hand;
         actionScrollThumb.Resize += delegate { ApplyRoundedRegion(actionScrollThumb, 4); };
         actionScrollThumb.MouseDown += BeginActionScrollThumbDrag;
@@ -312,93 +889,114 @@ public class LocalAreaInterconnectionDesktop : Form
 
         actionsHost.Controls.Add(actionsViewport);
         actionsHost.Controls.Add(actionScrollBar);
-        rootLayout.Controls.Add(actionsHost, 2, ActionStartRow);
-        rootLayout.SetRowSpan(actionsHost, ActionRowSpan);
+        inner.Controls.Add(actionsHost);
 
-        AddButton(actionsPanel, "quickHostRoom", delegate { QuickHostRoom(); });
-        AddButton(actionsPanel, "quickJoinRoom", delegate { QuickJoinRoom(); });
-        AddButton(actionsPanel, "startLanSession", delegate { StartLanSession(); });
-        AddButton(actionsPanel, "checkConnection", delegate { RunNetworkDiagnose(); });
-        moreToolsButton = AddButton(actionsPanel, "moreTools", delegate { ToggleAdvancedActions(); });
-        AddButton(actionsPanel, "createRoom", delegate { CreateRoom(); }, true);
-        AddButton(actionsPanel, "copyInvite", delegate { CopyInvite(); }, true);
-        AddButton(actionsPanel, "copyIp", delegate { CopyVirtualIp(); }, true);
-        AddButton(actionsPanel, "decodeInvite", delegate { DecodeInvite(); }, true);
-        AddButton(actionsPanel, "joinRoom", delegate { JoinRoom(); }, true);
-        AddButton(actionsPanel, "adapterPlan", delegate { RunNativeCli("adapter-plan --adapter-name LocalAreaInterconnection --subnet " + subnet.Text + " --ip " + ip.Text); }, true);
-        AddButton(actionsPanel, "adapterScan", delegate { RunNativeAdapterEnsure(); }, true);
-        AddButton(actionsPanel, "nativeAdapterEnsure", delegate { RunNativeAdapterEnsure(); }, true);
-        AddButton(actionsPanel, "gamePlan", delegate { RunNativeCli("game-plan --game-name " + Quote(gameName.Text) + " --subnet " + subnet.Text + " --ports " + ports.Text); }, true);
-        AddButton(actionsPanel, "gameProfileList", delegate { RunGameProfileList(); }, true);
-        AddButton(actionsPanel, "gameProfilePlan", delegate { RunGameProfilePlan(); }, true);
-        AddButton(actionsPanel, "gamePortScan", delegate { RunGamePortScan(); }, true);
-        AddButton(actionsPanel, "gameReadinessCheck", delegate { RunGameReadinessCheck(); }, true);
-        AddButton(actionsPanel, "firewallPlan", delegate { RunNativeCli("firewall-plan --game-name " + Quote(gameName.Text) + GameCatalogArgs() + " --subnet " + subnet.Text + " --ports " + ports.Text); }, true);
-        AddButton(actionsPanel, "firewallDiagnose", delegate { RunNativeCli(FirewallDiagnoseArgs()); }, true);
-        AddButton(actionsPanel, "firewallScan", delegate { RunNativeCli(FirewallDiagnoseArgs()); }, true);
-        AddButton(actionsPanel, "generalDiagnose", delegate { RunNativeCli("diagnose --p2p ok --firewall allowed"); }, true);
-        AddButton(actionsPanel, "networkDiagnose", delegate { RunNetworkDiagnose(); }, true);
-        AddButton(actionsPanel, "exportDiagnostics", delegate { ExportDiagnostics(); }, true);
-        AddButton(actionsPanel, "udpTest", delegate { RunUdpTest(); }, true);
-        AddButton(actionsPanel, "broadcastTest", delegate { RunBroadcastTest(); }, true);
-        AddButton(actionsPanel, "nativeRuntimeSelfTest", delegate { RunNativeRuntimeSelfTest(); }, true);
-        AddButton(actionsPanel, "wintunDetect", delegate { RunWintunDetect(); }, true);
-        AddButton(actionsPanel, "wintunProbe", delegate { RunWintunSessionProbe(); }, true);
-        AddButton(actionsPanel, "nativeOffer", delegate { RunNativeOffer(); }, true);
-        AddButton(actionsPanel, "startCoordination", delegate { StartLocalCoordinationServer(); }, true);
-        AddButton(actionsPanel, "stopCoordination", delegate { StopLocalCoordinationServer(); }, true);
-        AddButton(actionsPanel, "startRuntime", delegate { StartNativeRuntime(); }, true);
-        AddButton(actionsPanel, "stopRuntime", delegate { StopNativeRuntime(); }, true);
-        AddButton(actionsPanel, "runtimeCleanupPlan", delegate { RunRuntimeCleanupPlan(); }, true);
-        AddButton(actionsPanel, "runtimeCleanupApply", delegate { RunRuntimeCleanupApply(); }, true);
-        AddButton(actionsPanel, "routeScan", delegate { RunRouteScan(); }, true);
-        AddButton(actionsPanel, "closeRoom", delegate { CloseCoordinationRoom(); }, true);
-        AddButton(actionsPanel, "kickPeer", delegate { KickCoordinationPeer(); }, true);
-        AddButton(actionsPanel, "nativeNatSelfTest", delegate { RunNativeNatSelfTest(); }, true);
-        AddButton(actionsPanel, "relayFallbackPlan", delegate { RunRelayFallbackPlan(); }, true);
-        AddButton(actionsPanel, "connectionPathPlan", delegate { RunConnectionPathPlan(); }, true);
-        AddButton(actionsPanel, "tcpTest", delegate { RunTcpTest(); }, true);
-        AddButton(actionsPanel, "browseGameCatalog", delegate { BrowseGameCatalog(); }, true);
-        AddButton(actionsPanel, "browseNetsh", delegate { BrowseNetshOutput(); }, true);
-        AddButton(actionsPanel, "browsePackets", delegate { BrowsePacketObservations(); }, true);
-        AddButton(actionsPanel, "copyOutput", delegate { if (output.Text.Length > 0) Clipboard.SetText(output.Text); }, true);
-        UpdateAdvancedActions();
+        // All tools here, fully visible (advanced = false so they are not
+        // hidden by the old "more tools" toggle, but styled as secondary).
+        AddToolButton("createRoom", delegate { CreateRoom(); });
+        AddToolButton("copyInvite", delegate { CopyInvite(); });
+        AddToolButton("copyIp", delegate { CopyVirtualIp(); });
+        AddToolButton("decodeInvite", delegate { DecodeInvite(); });
+        AddToolButton("joinRoom", delegate { JoinRoom(); });
+        AddToolButton("adapterPlan", delegate { RunNativeCli("adapter-plan --adapter-name LocalAreaInterconnection --subnet " + subnet.Text + " --ip " + ip.Text); });
+        AddToolButton("adapterScan", delegate { RunNativeAdapterEnsure(); });
+        AddToolButton("nativeAdapterEnsure", delegate { RunNativeAdapterEnsure(); });
+        AddToolButton("nativeRuntimeSelfTest", delegate { RunNativeRuntimeSelfTest(); });
+        AddToolButton("wintunDetect", delegate { RunWintunDetect(); });
+        AddToolButton("wintunProbe", delegate { RunWintunSessionProbe(); });
+        AddToolButton("nativeOffer", delegate { RunNativeOffer(); });
+        AddToolButton("startCoordination", delegate { StartLocalCoordinationServer(); });
+        AddToolButton("stopCoordination", delegate { StopLocalCoordinationServer(); });
+        AddToolButton("startRuntime", delegate { StartNativeRuntime(); });
+        AddToolButton("stopRuntime", delegate { StopNativeRuntime(); });
+        AddToolButton("runtimeCleanupPlan", delegate { RunRuntimeCleanupPlan(); });
+        AddToolButton("runtimeCleanupApply", delegate { RunRuntimeCleanupApply(); });
+        AddToolButton("routeScan", delegate { RunRouteScan(); });
+        AddToolButton("closeRoom", delegate { CloseCoordinationRoom(); });
+        AddToolButton("kickPeer", delegate { KickCoordinationPeer(); });
+        AddToolButton("nativeNatSelfTest", delegate { RunNativeNatSelfTest(); });
+        AddToolButton("relayFallbackPlan", delegate { RunRelayFallbackPlan(); });
+        AddToolButton("connectionPathPlan", delegate { RunConnectionPathPlan(); });
+        AddToolButton("copyOutput", delegate { if (output.Text.Length > 0) Clipboard.SetText(output.Text); });
 
-        Panel detailsPanel = RoomDetailsPanel();
-        rootLayout.Controls.Add(detailsPanel, 2, 0);
-        rootLayout.SetRowSpan(detailsPanel, 12);
+        // Tools page buttons are secondary styled but always visible.
+        advancedActionsVisible = true;
 
-        output = new TextBox();
-        output.Multiline = true;
-        output.ScrollBars = ScrollBars.None;
-        output.WordWrap = true;
-        output.Dock = DockStyle.Fill;
-        output.Font = new System.Drawing.Font("Consolas", 10);
-        StyleTextBox(output);
-        Label outputLabel = Label("output");
-        rootLayout.Controls.Add(outputLabel, 0, OutputRow);
-        Panel outputFrame = Framed(output);
-        rootLayout.Controls.Add(outputFrame, 1, OutputRow);
-        rootLayout.SetColumnSpan(outputFrame, 2);
+        pageTools.Controls.Add(card);
+    }
 
-        ApplyLanguage();
-        UpdateRoomDetails("idle");
-        Resize += delegate { AdjustActionLayout(); };
-        AdjustActionLayout();
+    void AddToolButton(string key, EventHandler handler)
+    {
+        Button button = new Button();
+        button.Text = T(key);
+        button.Width = Math.Min(184, Math.Max(116, TextRenderer.MeasureText(button.Text, Font).Width + 24));
+        button.Height = 30;
+        button.Margin = new Padding(0, 0, 8, 8);
+        button.FlatStyle = FlatStyle.Flat;
+        button.BackColor = Color.FromArgb(34, 38, 44);
+        button.ForeColor = Color.FromArgb(224, 224, 224);
+        button.Font = new Font(Font, FontStyle.Regular);
+        button.FlatAppearance.BorderColor = AccentCyan;
+        button.FlatAppearance.MouseOverBackColor = Color.FromArgb(44, 52, 60);
+        button.FlatAppearance.MouseDownBackColor = Color.FromArgb(26, 30, 36);
+        button.Click += delegate(object sender, EventArgs e) { RunUserAction(key, handler, sender, e); };
+        button.MouseWheel += ScrollActionsWheel;
+        button.Resize += delegate { ApplyRoundedRegion(button, 8); };
+        ApplyRoundedRegion(button, 8);
+        buttonControls[key] = button;
+        actionsPanel.Controls.Add(button);
+    }
 
-        runtimeStatusTimer = new Timer();
-        runtimeStatusTimer.Interval = 1500;
-        runtimeStatusTimer.Tick += delegate { RefreshRuntimeStatus(); };
-        runtimeStatusTimer.Start();
-        FormClosing += delegate
-        {
-            StopRuntimeProcess(1500);
-            StopCoordinationProcess(1500);
-        };
-        FormClosed += delegate
-        {
-            if (activeWindow == this) activeWindow = null;
-        };
+    void BuildAboutPage()
+    {
+        pageAbout = new Panel();
+        pageAbout.Dock = DockStyle.Fill;
+        pageAbout.BackColor = Color.Transparent;
+        pageAbout.Padding = new Padding(0, 0, 0, 202);
+        contentArea.Controls.Add(pageAbout);
+        contentPages.Add(pageAbout);
+
+        Label title = PageTitle("navAbout");
+        title.Dock = DockStyle.Top;
+        title.Height = 40;
+        title.Padding = new Padding(16, 8, 0, 0);
+        pageAbout.Controls.Add(title);
+
+        Panel card = CardPanel();
+        Panel inner = (Panel)card.Tag;
+        TableLayoutPanel layout = new TableLayoutPanel();
+        layout.Dock = DockStyle.Fill;
+        layout.ColumnCount = 1;
+        layout.RowCount = 3;
+        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 36));
+        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 80));
+        layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+        layout.Padding = new Padding(20, 14, 20, 14);
+        Label appName = new Label();
+        appName.Text = T("appTitle");
+        appName.Font = new Font(Font.FontFamily, 14f, FontStyle.Bold);
+        appName.ForeColor = AccentCyan;
+        appName.BackColor = Color.Transparent;
+        appName.Dock = DockStyle.Fill;
+        appName.TextAlign = ContentAlignment.MiddleLeft;
+        layout.Controls.Add(appName, 0, 0);
+        Label version = new Label();
+        version.Text = T("aboutVersion");
+        version.ForeColor = TextMuted;
+        version.BackColor = Color.Transparent;
+        version.Dock = DockStyle.Fill;
+        version.TextAlign = ContentAlignment.TopLeft;
+        layout.Controls.Add(version, 0, 1);
+        Label desc = new Label();
+        desc.Text = T("aboutDesc");
+        desc.ForeColor = TextBright;
+        desc.BackColor = Color.Transparent;
+        desc.Dock = DockStyle.Fill;
+        desc.TextAlign = ContentAlignment.TopLeft;
+        layout.Controls.Add(desc, 0, 2);
+        inner.Controls.Add(layout);
+
+        pageAbout.Controls.Add(card);
     }
 
     void AddResizeGripOverlays()
@@ -734,12 +1332,12 @@ public class LocalAreaInterconnectionDesktop : Form
         button.Height = advanced ? 28 : 32;
         button.Margin = new Padding(0, 0, 8, 8);
         button.FlatStyle = FlatStyle.Flat;
-        button.BackColor = advanced ? Color.FromArgb(58, 58, 58) : WeChatGreen;
-        button.ForeColor = advanced ? Color.FromArgb(224, 224, 224) : Color.White;
+        button.BackColor = advanced ? Color.FromArgb(34, 38, 44) : AccentCyan;
+        button.ForeColor = advanced ? Color.FromArgb(224, 224, 224) : Color.FromArgb(8, 30, 34);
         button.Font = new Font(Font, advanced ? FontStyle.Regular : FontStyle.Bold);
-        button.FlatAppearance.BorderColor = advanced ? Color.FromArgb(86, 86, 86) : WeChatGreen;
-        button.FlatAppearance.MouseOverBackColor = advanced ? Color.FromArgb(70, 70, 70) : WeChatGreenHover;
-        button.FlatAppearance.MouseDownBackColor = advanced ? Color.FromArgb(46, 46, 46) : WeChatGreenDown;
+        button.FlatAppearance.BorderColor = advanced ? AccentCyan : AccentCyan;
+        button.FlatAppearance.MouseOverBackColor = advanced ? Color.FromArgb(44, 52, 60) : AccentCyanHover;
+        button.FlatAppearance.MouseDownBackColor = advanced ? Color.FromArgb(26, 30, 36) : AccentCyanDown;
         button.Click += delegate(object sender, EventArgs e)
         {
             RunUserAction(key, handler, sender, e);
@@ -834,7 +1432,7 @@ public class LocalAreaInterconnectionDesktop : Form
 
     void AdjustActionLayout()
     {
-        if (actionsPanel == null || actionsViewport == null || rootLayout == null) return;
+        if (actionsPanel == null || actionsViewport == null) return;
         int available = Math.Max(220, actionsViewport.ClientSize.Width - 2);
         int columns = Math.Max(2, Math.Min(3, available / 136));
         int width = Math.Max(112, (available / columns) - 8);
@@ -843,7 +1441,11 @@ public class LocalAreaInterconnectionDesktop : Form
         {
             if (!control.Visible) continue;
             control.Width = width;
-            control.Height = advancedActionButtons.Contains((Button)control) ? 28 : 32;
+            Button btn = control as Button;
+            if (btn != null)
+            {
+                btn.Height = advancedActionButtons.Contains(btn) ? 28 : 30;
+            }
             visibleControls++;
         }
 
@@ -956,6 +1558,19 @@ public class LocalAreaInterconnectionDesktop : Form
         return panel;
     }
 
+    Panel Framed(Control control, Color border)
+    {
+        Panel panel = new Panel();
+        panel.Dock = DockStyle.Fill;
+        panel.BackColor = border;
+        panel.Padding = new Padding(1);
+        panel.Margin = new Padding(0, 3, 10, 3);
+        panel.Resize += delegate { ApplyRoundedRegion(panel, 10); };
+        control.Dock = DockStyle.Fill;
+        panel.Controls.Add(control);
+        return panel;
+    }
+
     Panel RoomDetailsPanel()
     {
         Panel outer = new Panel();
@@ -1023,32 +1638,74 @@ public class LocalAreaInterconnectionDesktop : Form
     protected override void OnPaintBackground(PaintEventArgs e)
     {
         e.Graphics.Clear(ShellDark);
-        Rectangle sidebar = new Rectangle(0, 38, 275, Math.Max(0, Height - 38));
-        using (LinearGradientBrush sidebarBrush = new LinearGradientBrush(
-            sidebar,
-            SidebarDark,
-            SidebarDeep,
-            LinearGradientMode.Vertical))
-        {
-            if (sidebar.Width > 0 && sidebar.Height > 0)
-            {
-                e.Graphics.FillRectangle(sidebarBrush, sidebar);
-            }
-        }
+        // Particles are now drawn on the form background by OnPaint so they
+        // render as a subtle cyan layer behind docked content panels.
     }
 
     protected override void OnPaint(PaintEventArgs e)
     {
         base.OnPaint(e);
         e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
+        // Paint the cyan particle field on the form surface. Docked panels
+        // (sidebar + content pages) sit above this, so particles only show in
+        // the title bar and any unoccupied padding.
+        DrawParticles(e.Graphics);
     }
 
     void DrawParticles(Graphics graphics)
     {
+        if (particles == null) return;
+        int w = Math.Max(1, ClientSize.Width);
+        int h = Math.Max(1, ClientSize.Height);
+        int linkDistSq = ParticleLinkDistance * ParticleLinkDistance;
+
+        // 1) connection lines between close particles (drawn first, behind dots)
+        for (int i = 0; i < particles.Length; i++)
+        {
+            Particle a = particles[i];
+            for (int j = i + 1; j < particles.Length; j++)
+            {
+                Particle b = particles[j];
+                float dx = a.X - b.X;
+                float dy = a.Y - b.Y;
+                float distSq = dx * dx + dy * dy;
+                if (distSq < linkDistSq)
+                {
+                    float t = 1f - (distSq / linkDistSq);
+                    int lineAlpha = (int)(ParticleLinkAlphaMax * t);
+                    if (lineAlpha <= 0) continue;
+                    using (Pen pen = new Pen(Color.FromArgb(lineAlpha, ParticleCyan)))
+                    {
+                        pen.Width = 0.8f;
+                        graphics.DrawLine(pen, a.X + a.Size / 2f, a.Y + a.Size / 2f, b.X + b.Size / 2f, b.Y + b.Size / 2f);
+                    }
+                }
+            }
+        }
+
+        // 2) glow halo + solid dot per particle
         for (int i = 0; i < particles.Length; i++)
         {
             Particle p = particles[i];
-            using (SolidBrush brush = new SolidBrush(Color.FromArgb(p.Alpha, 204, 242, 255)))
+            float cx = p.X + p.Size / 2f;
+            float cy = p.Y + p.Size / 2f;
+            float glowRadius = p.Size * 2.6f;
+            if (glowRadius > 0.5f)
+            {
+                RectangleF glowRect = new RectangleF(cx - glowRadius, cy - glowRadius, glowRadius * 2f, glowRadius * 2f);
+                using (GraphicsPath glowPath = new GraphicsPath())
+                {
+                    glowPath.AddEllipse(glowRect);
+                    using (PathGradientBrush glowBrush = new PathGradientBrush(glowPath))
+                    {
+                        glowBrush.CenterColor = Color.FromArgb(Math.Max(8, p.Alpha / 3), p.UseAlt ? ParticleCyan2 : ParticleCyan);
+                        glowBrush.SurroundColors = new Color[] { Color.FromArgb(0, ParticleCyan) };
+                        graphics.FillPath(glowBrush, glowPath);
+                    }
+                }
+            }
+            Color dotColor = Color.FromArgb(p.Alpha, p.UseAlt ? ParticleCyan2 : ParticleCyan);
+            using (SolidBrush brush = new SolidBrush(dotColor))
             {
                 graphics.FillEllipse(brush, p.X, p.Y, p.Size, p.Size);
             }
@@ -1057,28 +1714,43 @@ public class LocalAreaInterconnectionDesktop : Form
 
     void MoveParticles()
     {
+        if (particles == null) return;
+        int w = Math.Max(1, ClientSize.Width);
+        int h = Math.Max(1, ClientSize.Height);
         for (int i = 0; i < particles.Length; i++)
         {
-            particles[i].X += particles[i].Vx;
-            particles[i].Y += particles[i].Vy;
-            if (particles[i].X > Width + 20 || particles[i].Y < -20)
-            {
-                particles[i] = NewParticle();
-                particles[i].X = -20;
-                particles[i].Y = random.Next(Height + 1);
-            }
+            Particle p = particles[i];
+            p.Phase += 0.015f;
+            p.X += p.Vx + (float)Math.Sin(p.Phase) * 0.12f;
+            p.Y += p.Vy + (float)Math.Cos(p.Phase * 0.8f) * 0.10f;
+            if (p.X > w + 20) { p.X = -20f; p.Y = random.Next(h); }
+            else if (p.X < -30) { p.X = w + 10f; p.Y = random.Next(h); }
+            if (p.Y < -30) { p.Y = h + 10f; p.X = random.Next(w); }
+            else if (p.Y > h + 30) { p.Y = -20f; p.X = random.Next(w); }
         }
+    }
+
+    void TickParticles(object sender, EventArgs e)
+    {
+        if (!IsHandleCreated || WindowState == FormWindowState.Minimized) return;
+        MoveParticles();
+        Invalidate();
     }
 
     Particle NewParticle()
     {
         Particle particle = new Particle();
-        particle.X = random.Next(1000);
-        particle.Y = random.Next(700);
-        particle.Vx = 0.18f + (float)random.NextDouble() * 0.55f;
-        particle.Vy = -0.16f - (float)random.NextDouble() * 0.26f;
-        particle.Size = 1.8f + (float)random.NextDouble() * 3.2f;
-        particle.Alpha = 55 + random.Next(115);
+        int w = Math.Max(1, ClientSize.Width);
+        int h = Math.Max(1, ClientSize.Height);
+        particle.X = random.Next(w);
+        particle.Y = random.Next(h);
+        // slow, gentle drift instead of a hard horizontal sweep
+        particle.Vx = -0.12f + (float)random.NextDouble() * 0.24f;
+        particle.Vy = -0.10f - (float)random.NextDouble() * 0.18f;
+        particle.Size = 1.2f + (float)random.NextDouble() * 1.8f;
+        particle.Alpha = 30 + random.Next(80);
+        particle.Phase = (float)(random.NextDouble() * Math.PI * 2);
+        particle.UseAlt = random.Next(3) == 0;
         return particle;
     }
 
@@ -1090,6 +1762,8 @@ public class LocalAreaInterconnectionDesktop : Form
         public float Vy;
         public float Size;
         public int Alpha;
+        public float Phase;
+        public bool UseAlt;
     }
 
     void CreateRoom()
@@ -3566,6 +4240,11 @@ public class LocalAreaInterconnectionDesktop : Form
         {
             output.Text = T("outputHelp");
         }
+        foreach (Button nav in navButtons)
+        {
+            nav.Invalidate();
+        }
+        if (sidebarPanel != null) sidebarPanel.Invalidate();
         AdjustActionLayout();
     }
 
@@ -3633,7 +4312,15 @@ public class LocalAreaInterconnectionDesktop : Form
     {
         if (language == "zh")
         {
-            if (key == "appTitle") return "LocalAreaInterconnection";
+            if (key == "appTitle") return "局域网互联";
+            if (key == "appTagline") return "异地玩家虚拟局域网";
+            if (key == "navHome") return "首页 / 房间";
+            if (key == "navDiagnose") return "联机诊断";
+            if (key == "navGames") return "游戏模板";
+            if (key == "navTools") return "更多工具";
+            if (key == "navAbout") return "关于";
+            if (key == "aboutVersion") return "版本 0.1.0  ·  Rust 原生核心 + Wintun";
+            if (key == "aboutDesc") return "为只支持局域网联机的 PC 游戏创建一个低延迟、可诊断的虚拟局域网。优先 P2P，P2P 失败自动中继，房间隔离、端到端加密。";
             if (key == "roomName") return "房间名称";
             if (key == "host") return "主机名";
             if (key == "virtualSubnet") return "虚拟网段";
@@ -3836,6 +4523,14 @@ public class LocalAreaInterconnectionDesktop : Form
         else
         {
             if (key == "appTitle") return "LocalAreaInterconnection";
+            if (key == "appTagline") return "Virtual LAN for remote players";
+            if (key == "navHome") return "Home / Room";
+            if (key == "navDiagnose") return "Diagnostics";
+            if (key == "navGames") return "Game profiles";
+            if (key == "navTools") return "More tools";
+            if (key == "navAbout") return "About";
+            if (key == "aboutVersion") return "Version 0.1.0  ·  Rust core + Wintun";
+            if (key == "aboutDesc") return "Creates a low-latency, diagnosable virtual LAN for PC games that only support LAN multiplayer. Prefers P2P, falls back to relay, room-isolated and end-to-end encrypted.";
             if (key == "roomName") return "Room name";
             if (key == "host") return "Host";
             if (key == "virtualSubnet") return "Virtual subnet";

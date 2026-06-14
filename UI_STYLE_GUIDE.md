@@ -1,22 +1,24 @@
 # Desktop UI Style Guide
 
-This project currently uses a compact native Windows desktop shell inspired by the WeChat IME settings panel: a dark charcoal content area, a teal left rail, rounded dark cards, and bright green primary actions.
+This project uses a dark desktop shell with a cyan accent language: a near-black charcoal content area, a deep teal-black navigation rail on the left with brand block and nav items, rounded dark cards, cyan primary actions, and a subtle cyan particle field animating in the background.
 
 ## Required Style Rules
 
-- Keep the main palette in dark charcoal, teal side rail, muted gray cards, and WeChat-style green primary actions. Avoid returning to the older blue LAN-console look, white system control backgrounds, white scroll tracks, or unrelated bright panels.
+- Keep the main palette in dark charcoal (#14161A), sampled WeChat-IME-like sidebar gradient (#0F454E -> #1E4C56 -> #284156), muted dark cards (#1E2228), and **cyan** (#00D4D8) primary actions. Avoid returning to the older blue LAN-console look, the WeChat-green primary, white system control backgrounds, white scroll tracks, or unrelated bright panels.
 - Prefer custom-painted or theme-colored controls when WinForms defaults would create white borders, white focus boxes, or system-colored scrollbars.
-- Keep the animated background subtle. Do not continuously repaint the full window for decorative particles unless flicker is eliminated by a dedicated buffered surface.
-- Keep dense tool actions grouped on the right side below room details. The left rail should stay visually calm and teal; the main content area should use dark rounded cards and field rows.
-- Keep the default customer workflow simple and player-facing: show only the main LAN path actions first, keep labels plain, and hide diagnostics/developer tools behind a "More tools" disclosure. The first-screen goal is to help two players host, join, start LAN, and verify connection with as few choices as possible.
-- Avoid exposing duplicate buttons in the default action area. If an action is already handled automatically by a quick flow, keep the manual version in "More tools".
+- Keep the animated background subtle. The cyan particle field uses the form's OptimizedDoubleBuffer surface; do not repaint full opaque panels for decorative particles. Particles show only behind controls and in the title bar, never competing with content.
+- The left navigation rail is brand-block + 5 nav items mapped to the product workflow (Home/Room, Diagnostics, Game profiles, More tools, About). The active item uses a cyan left bar and cyan text; inactive items stay muted. Nav must not be replaced by decorative gradients.
+- The right content area is multi-page; switching nav items swaps the visible page (BringToFront). The shared output console is docked at the bottom of the content area and stays available on every page.
+- Keep the default customer workflow simple and player-facing: the Home page shows only the main LAN path actions (host, join, start, check) plus the room details card. Diagnostics, game profiles, runtime/Wintun/coordination/relay tools live on their own pages, accessed from the nav rail.
 - When a section needs scrolling, use an in-theme dark track and cyan thumb, or another custom treatment that matches the existing title bar and input frames.
-- Window chrome should remain custom-painted: dark title bar, compact language switcher, and line-based minimize/maximize/close icons. The chrome should be quiet and close to the WeChat IME settings reference, not glossy or game-like.
-- Use rounded corners throughout the desktop shell: the borderless window, input frames, action buttons, room detail panels, and custom scroll thumbs should all use soft rounded geometry while keeping the compact layout.
+- Window chrome should remain custom-painted: dark title bar, compact language switcher, and line-based minimize/maximize/close icons. The chrome should be quiet, not glossy or game-like.
+- Use rounded corners throughout the desktop shell: the borderless window, input frames, action buttons, room detail panels, nav items, and custom scroll thumbs should all use soft rounded geometry while keeping the compact layout.
 
 ## Current Layout Notes
 
-- Left column: labels and room/network input fields.
-- Center column: primary editable fields and command output.
-- Right column: room details at the top, action buttons below.
+- Left rail (200 px): circular brand logo + app name + tagline at top, then 5 navigation buttons.
+- Right content area: page title at top, a dark rounded card with fields/actions, and the shared output console docked at the bottom.
+- Home page: quick-flow fields (room name, host, invite) + 4 main action buttons + room details card on the right.
+- Diagnostics / Game profiles / More tools pages: dedicated field sets and their action groups, each in its own card.
+- About page: app name, version and description.
 - The desktop shell is borderless, but edge and corner resize hit testing must continue to work without exposing a white system frame.
