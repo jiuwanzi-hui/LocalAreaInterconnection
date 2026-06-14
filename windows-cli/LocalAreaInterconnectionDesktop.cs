@@ -106,9 +106,26 @@ public class LocalAreaInterconnectionDesktop : Form
     DateTime lastCoordinationRefreshUtc = DateTime.MinValue;
     const int ResizeGripSize = 12;
 
+    protected override CreateParams CreateParams
+    {
+        get
+        {
+            const int wsCaption = 0x00C00000;
+            const int wsThickFrame = 0x00040000;
+            const int wsMinimizeBox = 0x00020000;
+            const int wsMaximizeBox = 0x00010000;
+            const int wsSysMenu = 0x00080000;
+            CreateParams cp = base.CreateParams;
+            cp.Style &= ~(wsCaption | wsThickFrame | wsMinimizeBox | wsMaximizeBox | wsSysMenu);
+            return cp;
+        }
+    }
+
     protected override void WndProc(ref Message m)
     {
         const int wmNcCalcSize = 0x83;
+        const int wmNcPaint = 0x85;
+        const int wmNcActivate = 0x86;
         const int wmNcHitTest = 0x84;
         const int htLeft = 10;
         const int htRight = 11;
@@ -122,6 +139,18 @@ public class LocalAreaInterconnectionDesktop : Form
         if (m.Msg == wmNcCalcSize && m.WParam != IntPtr.Zero)
         {
             m.Result = IntPtr.Zero;
+            return;
+        }
+
+        if (m.Msg == wmNcPaint)
+        {
+            m.Result = IntPtr.Zero;
+            return;
+        }
+
+        if (m.Msg == wmNcActivate)
+        {
+            m.Result = new IntPtr(1);
             return;
         }
 
@@ -228,6 +257,11 @@ public class LocalAreaInterconnectionDesktop : Form
         Height = 720;
         StartPosition = FormStartPosition.CenterScreen;
         FormBorderStyle = FormBorderStyle.None;
+        ControlBox = false;
+        MinimizeBox = false;
+        MaximizeBox = false;
+        ShowIcon = true;
+        ShowInTaskbar = true;
         MinimumSize = new Size(980, 640);
         DoubleBuffered = true;
         SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.UserPaint | ControlStyles.OptimizedDoubleBuffer, true);
