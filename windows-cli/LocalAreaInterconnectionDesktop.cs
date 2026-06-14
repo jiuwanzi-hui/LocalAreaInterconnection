@@ -106,16 +106,6 @@ public class LocalAreaInterconnectionDesktop : Form
     DateTime lastCoordinationRefreshUtc = DateTime.MinValue;
     const int ResizeGripSize = 12;
 
-    protected override CreateParams CreateParams
-    {
-        get
-        {
-            CreateParams cp = base.CreateParams;
-            cp.Style |= 0x00040000 | 0x00020000 | 0x00010000;
-            return cp;
-        }
-    }
-
     protected override void WndProc(ref Message m)
     {
         const int wmNcCalcSize = 0x83;
@@ -946,22 +936,15 @@ public class LocalAreaInterconnectionDesktop : Form
 
     void AddToolButton(string key, EventHandler handler)
     {
-        Button button = new Button();
+        Button button = new ClearTextButton();
         button.Text = T(key);
         button.Width = Math.Min(184, Math.Max(116, TextRenderer.MeasureText(button.Text, Font).Width + 24));
         button.Height = 30;
         button.Margin = new Padding(0, 0, 8, 8);
-        button.FlatStyle = FlatStyle.Flat;
-        button.BackColor = Color.FromArgb(34, 38, 44);
-        button.ForeColor = Color.FromArgb(224, 224, 224);
         button.Font = new Font(Font, FontStyle.Regular);
-        button.FlatAppearance.BorderColor = AccentCyan;
-        button.FlatAppearance.MouseOverBackColor = Color.FromArgb(44, 52, 60);
-        button.FlatAppearance.MouseDownBackColor = Color.FromArgb(26, 30, 36);
+        StyleClearButton((ClearTextButton)button, true);
         button.Click += delegate(object sender, EventArgs e) { RunUserAction(key, handler, sender, e); };
         button.MouseWheel += ScrollActionsWheel;
-        button.Resize += delegate { ApplyRoundedRegion(button, 8); };
-        ApplyRoundedRegion(button, 8);
         buttonControls[key] = button;
         actionsPanel.Controls.Add(button);
     }
@@ -1273,25 +1256,18 @@ public class LocalAreaInterconnectionDesktop : Form
 
     Button AddButton(FlowLayoutPanel panel, string key, EventHandler handler, bool advanced)
     {
-        Button button = new Button();
+        Button button = new ClearTextButton();
         button.Text = T(key);
         button.Width = Math.Min(184, Math.Max(116, TextRenderer.MeasureText(button.Text, Font).Width + 24));
         button.Height = advanced ? 28 : 32;
         button.Margin = new Padding(0, 0, 8, 8);
-        button.FlatStyle = FlatStyle.Flat;
-        button.BackColor = advanced ? Color.FromArgb(34, 38, 44) : AccentCyan;
-        button.ForeColor = advanced ? Color.FromArgb(224, 224, 224) : Color.FromArgb(8, 30, 34);
         button.Font = new Font(Font, advanced ? FontStyle.Regular : FontStyle.Bold);
-        button.FlatAppearance.BorderColor = advanced ? AccentCyan : AccentCyan;
-        button.FlatAppearance.MouseOverBackColor = advanced ? Color.FromArgb(44, 52, 60) : AccentCyanHover;
-        button.FlatAppearance.MouseDownBackColor = advanced ? Color.FromArgb(26, 30, 36) : AccentCyanDown;
+        StyleClearButton((ClearTextButton)button, advanced);
         button.Click += delegate(object sender, EventArgs e)
         {
             RunUserAction(key, handler, sender, e);
         };
         button.MouseWheel += ScrollActionsWheel;
-        button.Resize += delegate { ApplyRoundedRegion(button, 8); };
-        ApplyRoundedRegion(button, 8);
         buttonControls[key] = button;
         if (advanced)
         {
@@ -1300,6 +1276,23 @@ public class LocalAreaInterconnectionDesktop : Form
         }
         panel.Controls.Add(button);
         return button;
+    }
+
+    void StyleClearButton(ClearTextButton button, bool secondary)
+    {
+        button.FlatStyle = FlatStyle.Flat;
+        button.FlatAppearance.BorderSize = 0;
+        button.UseVisualStyleBackColor = false;
+        button.TabStop = false;
+        button.Radius = 8;
+        button.NormalBack = secondary ? Color.FromArgb(34, 38, 44) : AccentCyan;
+        button.HoverBack = secondary ? Color.FromArgb(44, 52, 60) : AccentCyanHover;
+        button.DownBack = secondary ? Color.FromArgb(26, 30, 36) : AccentCyanDown;
+        button.Border = secondary ? Color.FromArgb(62, 102, 110) : AccentCyan;
+        button.TextNormal = secondary ? Color.FromArgb(224, 224, 224) : Color.FromArgb(8, 30, 34);
+        button.TextDisabled = Color.FromArgb(118, 128, 136);
+        button.BackColor = button.NormalBack;
+        button.ForeColor = button.TextNormal;
     }
 
     void ToggleAdvancedActions()
@@ -4670,6 +4663,108 @@ public class LocalAreaInterconnectionDesktop : Form
     string Quote(string value)
     {
         return "\"" + value.Replace("\"", "\\\"") + "\"";
+    }
+
+    class ClearTextButton : Button
+    {
+        bool hovering;
+        bool pressing;
+
+        public int Radius = 8;
+        public Color NormalBack = AccentCyan;
+        public Color HoverBack = AccentCyanHover;
+        public Color DownBack = AccentCyanDown;
+        public Color Border = AccentCyan;
+        public Color TextNormal = Color.FromArgb(8, 30, 34);
+        public Color TextDisabled = Color.FromArgb(118, 128, 136);
+
+        public ClearTextButton()
+        {
+            SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
+            FlatStyle = FlatStyle.Flat;
+            FlatAppearance.BorderSize = 0;
+            UseVisualStyleBackColor = false;
+            TabStop = false;
+        }
+
+        protected override void OnMouseEnter(EventArgs e)
+        {
+            hovering = true;
+            Invalidate();
+            base.OnMouseEnter(e);
+        }
+
+        protected override void OnMouseLeave(EventArgs e)
+        {
+            hovering = false;
+            pressing = false;
+            Invalidate();
+            base.OnMouseLeave(e);
+        }
+
+        protected override void OnMouseDown(MouseEventArgs e)
+        {
+            if (e.Button == MouseButtons.Left)
+            {
+                pressing = true;
+                Invalidate();
+            }
+            base.OnMouseDown(e);
+        }
+
+        protected override void OnMouseUp(MouseEventArgs e)
+        {
+            pressing = false;
+            Invalidate();
+            base.OnMouseUp(e);
+        }
+
+        protected override void OnEnabledChanged(EventArgs e)
+        {
+            Invalidate();
+            base.OnEnabledChanged(e);
+        }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
+            e.Graphics.PixelOffsetMode = PixelOffsetMode.HighQuality;
+            Rectangle bounds = new Rectangle(0, 0, Width - 1, Height - 1);
+            Color fill = !Enabled ? Color.FromArgb(28, 32, 38) : pressing ? DownBack : hovering ? HoverBack : NormalBack;
+            using (GraphicsPath path = ButtonRoundRect(bounds, Radius))
+            using (SolidBrush brush = new SolidBrush(fill))
+            {
+                e.Graphics.FillPath(brush, path);
+                using (Pen pen = new Pen(!Enabled ? Color.FromArgb(52, 58, 66) : Border))
+                {
+                    e.Graphics.DrawPath(pen, path);
+                }
+            }
+
+            TextRenderer.DrawText(
+                e.Graphics,
+                Text,
+                Font,
+                ClientRectangle,
+                Enabled ? TextNormal : TextDisabled,
+                TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix);
+        }
+
+        static GraphicsPath ButtonRoundRect(Rectangle bounds, int radius)
+        {
+            int diameter = Math.Max(1, radius * 2);
+            GraphicsPath path = new GraphicsPath();
+            Rectangle arc = new Rectangle(bounds.Left, bounds.Top, diameter, diameter);
+            path.AddArc(arc, 180, 90);
+            arc.X = bounds.Right - diameter;
+            path.AddArc(arc, 270, 90);
+            arc.Y = bounds.Bottom - diameter;
+            path.AddArc(arc, 0, 90);
+            arc.X = bounds.Left;
+            path.AddArc(arc, 90, 90);
+            path.CloseFigure();
+            return path;
+        }
     }
 
     static class Native
