@@ -55,9 +55,7 @@ public class LocalAreaInterconnectionDesktop : Form
     TextBox output;
     Timer runtimeStatusTimer;
     Timer particleTimer;
-    const int ParticleCount = 90;
-    const int ParticleLinkDistance = 92;
-    const int ParticleLinkAlphaMax = 26;
+    const int ParticleCount = 34;
     Random random = new Random();
     Particle[] particles;
     string language;
@@ -114,7 +112,6 @@ public class LocalAreaInterconnectionDesktop : Form
         {
             CreateParams cp = base.CreateParams;
             cp.Style |= 0x00040000 | 0x00020000 | 0x00010000;
-            cp.ExStyle |= 0x02000000;
             return cp;
         }
     }
@@ -174,7 +171,9 @@ public class LocalAreaInterconnectionDesktop : Form
     [STAThread]
     public static void Main()
     {
+        EnableProcessDpiAwareness();
         Application.EnableVisualStyles();
+        Application.SetCompatibleTextRenderingDefault(false);
         Application.SetUnhandledExceptionMode(UnhandledExceptionMode.CatchException);
         Application.ThreadException += delegate(object sender, System.Threading.ThreadExceptionEventArgs e)
         {
@@ -189,6 +188,26 @@ public class LocalAreaInterconnectionDesktop : Form
             }
         };
         Application.Run(new LocalAreaInterconnectionDesktop());
+    }
+
+    static void EnableProcessDpiAwareness()
+    {
+        try
+        {
+            Native.SetProcessDpiAwareness(2);
+            return;
+        }
+        catch
+        {
+        }
+
+        try
+        {
+            Native.SetProcessDPIAware();
+        }
+        catch
+        {
+        }
     }
 
     static void HandleUnhandledException(Exception exception)
@@ -278,7 +297,7 @@ public class LocalAreaInterconnectionDesktop : Form
         runtimeStatusTimer.Start();
 
         particleTimer = new Timer();
-        particleTimer.Interval = 30;
+        particleTimer.Interval = 120;
         particleTimer.Tick += TickParticles;
         particleTimer.Start();
         VisibleChanged += delegate { if (particleTimer != null) { if (Visible) particleTimer.Start(); else particleTimer.Stop(); } };
@@ -343,7 +362,7 @@ public class LocalAreaInterconnectionDesktop : Form
     void PaintSidebarBrand(object sender, PaintEventArgs e)
     {
         Control c = (Control)sender;
-        e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
+        UseCrispGraphics(e.Graphics);
         // circular logo disc with cyan ring
         int size = 38;
         int x = 16;
@@ -420,7 +439,7 @@ public class LocalAreaInterconnectionDesktop : Form
 
     void PaintNavButton(Button button, PaintEventArgs e)
     {
-        e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
+        UseCrispGraphics(e.Graphics);
         string page = button.Tag as string;
         bool selected = activePage == page;
         bool hover = button.ClientRectangle.Contains(button.PointToClient(Cursor.Position));
@@ -1194,7 +1213,7 @@ public class LocalAreaInterconnectionDesktop : Form
     void PaintLanguageButton(object sender, PaintEventArgs e)
     {
         Button button = (Button)sender;
-        e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
+        UseCrispGraphics(e.Graphics);
         using (GraphicsPath path = RoundedRectPath(new Rectangle(0, 0, button.Width - 1, button.Height - 1), 6))
         using (SolidBrush background = new SolidBrush(button.BackColor))
         {
@@ -1257,7 +1276,7 @@ public class LocalAreaInterconnectionDesktop : Form
 
     void PaintChromeGlyph(Button button, PaintEventArgs e, ChromeGlyph glyph)
     {
-        e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
+        UseCrispGraphics(e.Graphics);
         bool hover = button.ClientRectangle.Contains(button.PointToClient(Cursor.Position));
         Color background = glyph == ChromeGlyph.Close && hover
             ? Color.FromArgb(184, 54, 54)
@@ -1538,24 +1557,20 @@ public class LocalAreaInterconnectionDesktop : Form
 
     void StyleTextBox(TextBox box)
     {
-        box.BorderStyle = BorderStyle.FixedSingle;
         box.BackColor = FieldDark;
         box.ForeColor = TextBright;
         box.BorderStyle = BorderStyle.None;
         box.Margin = new Padding(0);
+        if (!box.Multiline)
+        {
+            box.AutoSize = false;
+            box.Height = Math.Max(20, TextRenderer.MeasureText("Ag", box.Font).Height + 2);
+        }
     }
 
     Panel Framed(Control control)
     {
-        Panel panel = new Panel();
-        panel.Dock = DockStyle.Fill;
-        panel.BackColor = CardBorder;
-        panel.Padding = new Padding(1);
-        panel.Margin = new Padding(0, 3, 10, 3);
-        panel.Resize += delegate { ApplyRoundedRegion(panel, 10); };
-        control.Dock = DockStyle.Fill;
-        panel.Controls.Add(control);
-        return panel;
+        return Framed(control, CardBorder);
     }
 
     Panel Framed(Control control, Color border)
@@ -1566,9 +1581,34 @@ public class LocalAreaInterconnectionDesktop : Form
         panel.Padding = new Padding(1);
         panel.Margin = new Padding(0, 3, 10, 3);
         panel.Resize += delegate { ApplyRoundedRegion(panel, 10); };
-        control.Dock = DockStyle.Fill;
-        panel.Controls.Add(control);
+        TextBox textBox = control as TextBox;
+        if (textBox != null && !textBox.Multiline)
+        {
+            Panel field = new Panel();
+            field.Dock = DockStyle.Fill;
+            field.BackColor = FieldDark;
+            field.Padding = new Padding(9, 0, 9, 0);
+            field.Resize += delegate { LayoutSingleLineTextBox(field, textBox); };
+            textBox.Dock = DockStyle.None;
+            field.Controls.Add(textBox);
+            panel.Controls.Add(field);
+            LayoutSingleLineTextBox(field, textBox);
+        }
+        else
+        {
+            control.Dock = DockStyle.Fill;
+            panel.Controls.Add(control);
+        }
         return panel;
+    }
+
+    void LayoutSingleLineTextBox(Panel field, TextBox box)
+    {
+        if (field.ClientSize.Width <= 0 || field.ClientSize.Height <= 0) return;
+        int left = field.Padding.Left;
+        int width = Math.Max(1, field.ClientSize.Width - field.Padding.Left - field.Padding.Right);
+        int top = Math.Max(1, (field.ClientSize.Height - box.Height) / 2);
+        box.SetBounds(left, top, width, box.Height);
     }
 
     Panel RoomDetailsPanel()
@@ -1645,7 +1685,7 @@ public class LocalAreaInterconnectionDesktop : Form
     protected override void OnPaint(PaintEventArgs e)
     {
         base.OnPaint(e);
-        e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
+        UseCrispGraphics(e.Graphics);
         // Paint the cyan particle field on the form surface. Docked panels
         // (sidebar + content pages) sit above this, so particles only show in
         // the title bar and any unoccupied padding.
@@ -1655,56 +1695,14 @@ public class LocalAreaInterconnectionDesktop : Form
     void DrawParticles(Graphics graphics)
     {
         if (particles == null) return;
-        int w = Math.Max(1, ClientSize.Width);
-        int h = Math.Max(1, ClientSize.Height);
-        int linkDistSq = ParticleLinkDistance * ParticleLinkDistance;
-
-        // 1) connection lines between close particles (drawn first, behind dots)
-        for (int i = 0; i < particles.Length; i++)
-        {
-            Particle a = particles[i];
-            for (int j = i + 1; j < particles.Length; j++)
-            {
-                Particle b = particles[j];
-                float dx = a.X - b.X;
-                float dy = a.Y - b.Y;
-                float distSq = dx * dx + dy * dy;
-                if (distSq < linkDistSq)
-                {
-                    float t = 1f - (distSq / linkDistSq);
-                    int lineAlpha = (int)(ParticleLinkAlphaMax * t);
-                    if (lineAlpha <= 0) continue;
-                    using (Pen pen = new Pen(Color.FromArgb(lineAlpha, ParticleCyan)))
-                    {
-                        pen.Width = 0.8f;
-                        graphics.DrawLine(pen, a.X + a.Size / 2f, a.Y + a.Size / 2f, b.X + b.Size / 2f, b.Y + b.Size / 2f);
-                    }
-                }
-            }
-        }
-
-        // 2) glow halo + solid dot per particle
         for (int i = 0; i < particles.Length; i++)
         {
             Particle p = particles[i];
-            float cx = p.X + p.Size / 2f;
-            float cy = p.Y + p.Size / 2f;
-            float glowRadius = p.Size * 2.6f;
-            if (glowRadius > 0.5f)
+            Color dotColor = Color.FromArgb(Math.Min(60, p.Alpha), p.UseAlt ? ParticleCyan2 : ParticleCyan);
+            using (SolidBrush glow = new SolidBrush(Color.FromArgb(10, p.UseAlt ? ParticleCyan2 : ParticleCyan)))
             {
-                RectangleF glowRect = new RectangleF(cx - glowRadius, cy - glowRadius, glowRadius * 2f, glowRadius * 2f);
-                using (GraphicsPath glowPath = new GraphicsPath())
-                {
-                    glowPath.AddEllipse(glowRect);
-                    using (PathGradientBrush glowBrush = new PathGradientBrush(glowPath))
-                    {
-                        glowBrush.CenterColor = Color.FromArgb(Math.Max(8, p.Alpha / 3), p.UseAlt ? ParticleCyan2 : ParticleCyan);
-                        glowBrush.SurroundColors = new Color[] { Color.FromArgb(0, ParticleCyan) };
-                        graphics.FillPath(glowBrush, glowPath);
-                    }
-                }
+                graphics.FillEllipse(glow, p.X - 1.2f, p.Y - 1.2f, p.Size + 2.4f, p.Size + 2.4f);
             }
-            Color dotColor = Color.FromArgb(p.Alpha, p.UseAlt ? ParticleCyan2 : ParticleCyan);
             using (SolidBrush brush = new SolidBrush(dotColor))
             {
                 graphics.FillEllipse(brush, p.X, p.Y, p.Size, p.Size);
@@ -1752,6 +1750,14 @@ public class LocalAreaInterconnectionDesktop : Form
         particle.Phase = (float)(random.NextDouble() * Math.PI * 2);
         particle.UseAlt = random.Next(3) == 0;
         return particle;
+    }
+
+    void UseCrispGraphics(Graphics graphics)
+    {
+        graphics.SmoothingMode = SmoothingMode.AntiAlias;
+        graphics.PixelOffsetMode = PixelOffsetMode.HighQuality;
+        graphics.CompositingQuality = CompositingQuality.HighQuality;
+        graphics.InterpolationMode = InterpolationMode.HighQualityBicubic;
     }
 
     class Particle
@@ -4740,6 +4746,12 @@ public class LocalAreaInterconnectionDesktop : Form
 
     static class Native
     {
+        [DllImport("shcore.dll")]
+        public static extern int SetProcessDpiAwareness(int awareness);
+
+        [DllImport("user32.dll")]
+        public static extern bool SetProcessDPIAware();
+
         [DllImport("user32.dll")]
         public static extern bool ReleaseCapture();
 
