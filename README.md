@@ -39,7 +39,7 @@ Implemented code already includes the Windows desktop test shell, Rust native CL
 
 Recent native builds also include STUN endpoint discovery, optional UPnP port mapping, routable-first NAT candidate ordering, repeated encrypted P2P handshakes, and diagnostic export support for `room-runtime-run` snapshot files. This lets a troubleshooting bundle include runtime packet I/O evidence such as raw virtual packet counts, Wintun send/receive summaries, packet observation lines, and per-peer runtime path and traffic summaries captured during a run.
 
-The desktop test shell can generate direct offers on the same UDP port used by the runtime, start and stop a controlled native runtime, and show whether the NAT bootstrap was confirmed by an encrypted acknowledgement. Runtime snapshots and packet observation files are written under the user's application data folder, and the diagnostic export button automatically includes the latest runtime snapshot when one exists.
+The desktop test shell can generate direct offers on the same UDP port used by the runtime, run a direct self-test that performs a real NAT/P2P bootstrap probe, start and stop a controlled native runtime, and show whether the NAT bootstrap was confirmed by an encrypted acknowledgement. Runtime snapshots and packet observation files are written under the user's application data folder, and the diagnostic export button automatically includes the latest runtime snapshot when one exists.
 
 Real cross-network gameplay still needs validation on two Windows machines with:
 
@@ -162,7 +162,7 @@ LocalAreaInterconnection 是一个面向仅支持局域网联机的 PC 游戏的
 
 最近的原生构建还加入了 STUN 端点发现、可选 UPnP 端口映射、优先使用公网可路由候选的 NAT 排序、重复加密 P2P 握手，以及把 `room-runtime-run` 的 snapshot 文件导入诊断导出的能力。这样故障包里就能包含运行时的 packet I/O 证据，例如原始虚拟包计数、Wintun 收发摘要、运行期间记录的包观测行，以及每个 peer 的运行时路径和流量摘要。
 
-桌面测试壳可以在与运行时相同的 UDP 端口上生成直连 Offer，启动和停止一个受控的 native runtime，并显示 NAT bootstrap 是否收到了加密 ACK 确认。runtime snapshot 和包观测文件会写到用户的应用数据目录，诊断导出按钮在存在最近 snapshot 时会自动合并进去。
+桌面测试壳可以在与运行时相同的 UDP 端口上生成直连 Offer，通过直连自检执行一次真实 NAT/P2P bootstrap 探测，启动和停止一个受控的 native runtime，并显示 NAT bootstrap 是否收到了加密 ACK 确认。runtime snapshot 和包观测文件会写到用户的应用数据目录，诊断导出按钮在存在最近 snapshot 时会自动合并进去。
 
 真实跨网络联机仍需要在两台 Windows 机器上验证，并满足以下条件：
 

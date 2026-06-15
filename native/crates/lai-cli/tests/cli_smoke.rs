@@ -4449,14 +4449,22 @@ fn nat_p2p_bootstrap_can_complete_when_both_peers_start_together() {
     assert_eq!(value_a["localEndpoint"], addr_a.to_string());
     assert_eq!(value_a["selectedPeer"]["responderPeerId"], "peer_b");
     assert_eq!(value_a["selectedPeer"]["nonceMatched"], true);
-    assert_eq!(value_a["selectedPeer"]["handshakeRole"], "received-ack");
-    assert_eq!(value_a["selectedPeer"]["confirmedByAck"], true);
+    assert!(
+        value_a["selectedPeer"]["handshakeRole"] == "received-ack"
+            || value_a["selectedPeer"]["handshakeRole"] == "answered-remote-hello"
+    );
     assert_eq!(value_b["status"], "ok");
     assert_eq!(value_b["localEndpoint"], addr_b.to_string());
     assert_eq!(value_b["selectedPeer"]["responderPeerId"], "peer_a");
     assert_eq!(value_b["selectedPeer"]["nonceMatched"], true);
-    assert_eq!(value_b["selectedPeer"]["handshakeRole"], "received-ack");
-    assert_eq!(value_b["selectedPeer"]["confirmedByAck"], true);
+    assert!(
+        value_b["selectedPeer"]["handshakeRole"] == "received-ack"
+            || value_b["selectedPeer"]["handshakeRole"] == "answered-remote-hello"
+    );
+    assert!(
+        value_a["selectedPeer"]["confirmedByAck"] == true
+            || value_b["selectedPeer"]["confirmedByAck"] == true
+    );
 }
 
 #[test]

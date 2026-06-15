@@ -553,6 +553,17 @@ public partial class LocalAreaInterconnectionDesktop
         return "";
     }
 
+    string JsonStringLiteral(string value)
+    {
+        if (value == null) return "\"\"";
+        return "\"" + value
+            .Replace("\\", "\\\\")
+            .Replace("\"", "\\\"")
+            .Replace("\r", "\\r")
+            .Replace("\n", "\\n")
+            .Replace("\t", "\\t") + "\"";
+    }
+
     int JsonObjectCount(string array)
     {
         if (array.Length == 0) return 0;

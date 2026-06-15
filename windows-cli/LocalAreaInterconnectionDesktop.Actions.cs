@@ -839,6 +839,14 @@ public partial class LocalAreaInterconnectionDesktop
         string remoteSrflx = JsonNumberValue(text, "remote_srflx_candidate_count");
         string endpoint = JsonFirstStringInArray(JsonArrayValue(text, "selected_endpoints"));
         string nextAction = JsonFirstStringInArray(JsonArrayValue(text, "recommended_actions"));
+        string bootstrap = RunDirectBootstrapProbeAndReturn();
+        string bootstrapStatus = JsonStringValue(bootstrap, "status");
+        string bootstrapLocal = JsonStringValue(bootstrap, "localEndpoint");
+        string selectedPeer = JsonObjectValue(bootstrap, "selectedPeer");
+        string bootstrapPeer = JsonStringValue(selectedPeer, "endpoint");
+        string bootstrapRole = JsonStringValue(selectedPeer, "handshakeRole");
+        string bootstrapAck = JsonBoolTextValue(selectedPeer, "confirmedByAck");
+        string bootstrapError = JsonStringValue(bootstrap, "error");
         string localOfferText = latestNativeOfferFile.Length > 0 && File.Exists(latestNativeOfferFile)
             ? File.ReadAllText(latestNativeOfferFile, Encoding.UTF8)
             : "";
@@ -865,11 +873,57 @@ public partial class LocalAreaInterconnectionDesktop
             + Environment.NewLine
             + "target=" + endpoint
             + Environment.NewLine
+            + "bootstrap=" + (bootstrapStatus.Length > 0 ? bootstrapStatus : T("stateUnknown"))
+            + (bootstrapAck.Length > 0 ? ", ack=" + bootstrapAck : "")
+            + (bootstrapRole.Length > 0 ? ", role=" + bootstrapRole : "")
+            + (bootstrapLocal.Length > 0 ? ", local=" + bootstrapLocal : "")
+            + (bootstrapPeer.Length > 0 ? ", peer=" + bootstrapPeer : "")
+            + (bootstrapError.Length > 0 ? ", error=" + bootstrapError : "")
+            + Environment.NewLine
             + T("detailNext") + " " + nextAction
             + Environment.NewLine
             + Environment.NewLine
-            + text;
+            + text
+            + (bootstrap.Length > 0
+                ? Environment.NewLine + Environment.NewLine + T("directBootstrapStarting") + Environment.NewLine + bootstrap
+                : "");
         UpdateRoomDetailsFromConnectionPathPlan(text);
+    }
+
+    string RunDirectBootstrapProbeAndReturn()
+    {
+        string peerId;
+        string virtualIp;
+        string offerValue;
+        if (!TryParseRemotePeerOfferSpec(remotePeer.Text.Trim(), out peerId, out virtualIp, out offerValue))
+        {
+            return "";
+        }
+        string preparedOffer = PrepareOfferArgumentFile(offerValue, "remote-offer-direct-self-test.json");
+        if (preparedOffer.Length == 0)
+        {
+            return "";
+        }
+        string arguments = "nat-p2p-bootstrap"
+            + " --room-id " + Quote(RuntimeRoomId())
+            + " --peer-id " + Quote(RuntimePeerId())
+            + " --virtual-ip " + Quote(ip.Text.Trim())
+            + " --key " + Quote(RuntimeRoomKey())
+            + " --bind " + Quote(NativeRuntimeBind())
+            + " --remote-offer " + Quote(preparedOffer)
+            + " --punch-attempts 8"
+            + " --punch-interval-ms 50"
+            + " --handshake-timeout-ms 5000"
+            + StunArgs(stunServer.Text.Trim())
+            + UpnpPortMapArgs();
+        try
+        {
+            return RunNativeCliCapture(arguments);
+        }
+        catch (Exception ex)
+        {
+            return "{\"status\":\"error\",\"error\":" + JsonStringLiteral(ex.Message) + "}";
+        }
     }
 
     void StartLocalCoordinationServer()
