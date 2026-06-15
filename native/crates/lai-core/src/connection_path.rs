@@ -13,6 +13,16 @@ pub struct ConnectionPathReport {
     pub remote_nat_assessment: String,
     pub local_udp_candidate_count: usize,
     pub remote_udp_candidate_count: usize,
+    #[serde(default)]
+    pub local_host_candidate_count: usize,
+    #[serde(default)]
+    pub local_srflx_candidate_count: usize,
+    #[serde(default)]
+    pub local_relay_candidate_count: usize,
+    #[serde(default)]
+    pub remote_host_candidate_count: usize,
+    #[serde(default)]
+    pub remote_srflx_candidate_count: usize,
     pub remote_p2p_candidate_count: usize,
     pub remote_relay_candidate_count: usize,
     pub selected_endpoints: Vec<String>,
@@ -30,6 +40,11 @@ pub fn evaluate_connection_path(
     let relay_fallback = create_relay_fallback_plan(local_offer, remote_offer, p2p_status.clone());
     let local_udp_candidate_count = udp_candidate_count(local_offer);
     let remote_udp_candidate_count = udp_candidate_count(remote_offer);
+    let local_host_candidate_count = candidate_type_count(local_offer, "host");
+    let local_srflx_candidate_count = candidate_type_count(local_offer, "srflx");
+    let local_relay_candidate_count = candidate_type_count(local_offer, "relay");
+    let remote_host_candidate_count = candidate_type_count(remote_offer, "host");
+    let remote_srflx_candidate_count = candidate_type_count(remote_offer, "srflx");
     let remote_p2p_candidates = candidate_endpoints(remote_offer, |candidate_type| {
         !candidate_type.eq_ignore_ascii_case("relay")
     });
@@ -94,6 +109,11 @@ pub fn evaluate_connection_path(
         remote_nat_assessment,
         local_udp_candidate_count,
         remote_udp_candidate_count,
+        local_host_candidate_count,
+        local_srflx_candidate_count,
+        local_relay_candidate_count,
+        remote_host_candidate_count,
+        remote_srflx_candidate_count,
         remote_p2p_candidate_count: remote_p2p_candidates.len(),
         remote_relay_candidate_count: remote_relay_candidates.len(),
         selected_endpoints,
@@ -111,6 +131,15 @@ fn udp_candidate_count(offer: &NatTraversalOffer) -> usize {
         .count()
 }
 
+fn candidate_type_count(offer: &NatTraversalOffer, expected_type: &str) -> usize {
+    offer
+        .candidates
+        .iter()
+        .filter(|candidate| candidate.transport.eq_ignore_ascii_case("udp"))
+        .filter(|candidate| candidate.candidate_type.eq_ignore_ascii_case(expected_type))
+        .count()
+}
+
 fn candidate_endpoints(
     offer: &NatTraversalOffer,
     include_candidate_type: impl Fn(&str) -> bool,
@@ -120,14 +149,42 @@ fn candidate_endpoints(
         .iter()
         .filter(|candidate| candidate.transport.eq_ignore_ascii_case("udp"))
         .filter(|candidate| include_candidate_type(&candidate.candidate_type))
-        .map(|candidate| (candidate.priority, candidate.endpoint.clone()))
+        .map(|candidate| {
+            (
+                p2p_candidate_rank(&candidate.candidate_type, &candidate.source),
+                candidate.priority,
+                candidate.endpoint.clone(),
+            )
+        })
         .collect::<Vec<_>>();
-    endpoints.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
-    endpoints.dedup_by(|left, right| left.1 == right.1);
+    endpoints.sort_by(|left, right| {
+        right
+            .0
+            .cmp(&left.0)
+            .then_with(|| right.1.cmp(&left.1))
+            .then_with(|| left.2.cmp(&right.2))
+    });
+    endpoints.dedup_by(|left, right| left.2 == right.2);
     endpoints
         .into_iter()
-        .map(|(_, endpoint)| endpoint)
+        .map(|(_, _, endpoint)| endpoint)
         .collect()
+}
+
+fn p2p_candidate_rank(candidate_type: &str, source: &str) -> u8 {
+    if candidate_type.eq_ignore_ascii_case("srflx") {
+        if source.eq_ignore_ascii_case("upnp-port-mapping") {
+            4
+        } else {
+            3
+        }
+    } else if candidate_type.eq_ignore_ascii_case("host") {
+        2
+    } else if candidate_type.eq_ignore_ascii_case("relay") {
+        1
+    } else {
+        0
+    }
 }
 
 fn nat_assessment(offer: &NatTraversalOffer) -> String {
@@ -180,6 +237,7 @@ mod tests {
             schema_version: 1,
             room_id: "room_test".to_owned(),
             peer_id: peer_id.to_owned(),
+            virtual_ip: None,
             nonce: format!("nonce-{peer_id}"),
             created_at_ms: 1,
             candidates,
@@ -187,12 +245,21 @@ mod tests {
     }
 
     fn candidate(candidate_type: &str, endpoint: &str, priority: u32) -> NatCandidate {
+        candidate_from_source(candidate_type, endpoint, priority, "test")
+    }
+
+    fn candidate_from_source(
+        candidate_type: &str,
+        endpoint: &str,
+        priority: u32,
+        source: &str,
+    ) -> NatCandidate {
         NatCandidate {
             candidate_type: candidate_type.to_owned(),
             transport: "udp".to_owned(),
             endpoint: endpoint.to_owned(),
             priority,
-            source: "test".to_owned(),
+            source: source.to_owned(),
         }
     }
 
@@ -210,6 +277,32 @@ mod tests {
         assert_eq!(report.selected_path, "p2p");
         assert_eq!(report.remote_nat_assessment, "nat-mapped");
         assert_eq!(report.selected_endpoints, vec!["198.51.100.20:44000"]);
+    }
+
+    #[test]
+    fn connection_path_orders_routable_p2p_candidates_before_host() {
+        let local = offer("peer_a", vec![candidate("host", "10.0.0.2:39090", 100)]);
+        let remote = offer(
+            "peer_b",
+            vec![
+                candidate("host", "192.168.1.20:39090", 100),
+                candidate("srflx", "198.51.100.20:44000", 90),
+                candidate_from_source("srflx", "198.51.100.20:39090", 90, "upnp-port-mapping"),
+                candidate("relay", "203.0.113.10:39091", 10),
+            ],
+        );
+
+        let report = evaluate_connection_path(&local, &remote, "unknown");
+
+        assert_eq!(report.selected_path, "p2p");
+        assert_eq!(
+            report.selected_endpoints,
+            vec![
+                "198.51.100.20:39090",
+                "198.51.100.20:44000",
+                "192.168.1.20:39090",
+            ]
+        );
     }
 
     #[test]

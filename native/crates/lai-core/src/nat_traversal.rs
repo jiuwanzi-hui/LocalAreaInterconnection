@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, SocketAddr};
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct NatCandidate {
@@ -16,6 +16,8 @@ pub struct NatTraversalOffer {
     pub schema_version: u16,
     pub room_id: String,
     pub peer_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub virtual_ip: Option<Ipv4Addr>,
     pub nonce: String,
     pub created_at_ms: u128,
     pub candidates: Vec<NatCandidate>,
@@ -72,6 +74,7 @@ pub fn create_nat_traversal_offer(
         schema_version: 1,
         room_id: room_id.into(),
         peer_id: peer_id.into(),
+        virtual_ip: None,
         nonce: nonce.into(),
         created_at_ms,
         candidates,
@@ -107,10 +110,26 @@ pub fn create_nat_punch_plan(
         .candidates
         .iter()
         .filter(|candidate| candidate.transport.eq_ignore_ascii_case("udp"))
-        .map(|candidate| candidate.endpoint.clone())
+        .map(|candidate| {
+            (
+                punch_candidate_rank(candidate),
+                candidate.priority,
+                candidate.endpoint.clone(),
+            )
+        })
         .collect::<Vec<_>>();
-    targets.sort();
-    targets.dedup();
+    targets.sort_by(|left, right| {
+        right
+            .0
+            .cmp(&left.0)
+            .then_with(|| right.1.cmp(&left.1))
+            .then_with(|| left.2.cmp(&right.2))
+    });
+    targets.dedup_by(|left, right| left.2 == right.2);
+    let targets = targets
+        .into_iter()
+        .map(|(_, _, endpoint)| endpoint)
+        .collect::<Vec<_>>();
 
     let status = if local_offer.room_id != remote_offer.room_id {
         "room-mismatch"
@@ -153,6 +172,22 @@ fn candidate(
         endpoint: endpoint.to_string(),
         priority,
         source: source.into(),
+    }
+}
+
+fn punch_candidate_rank(candidate: &NatCandidate) -> u8 {
+    if candidate.candidate_type.eq_ignore_ascii_case("srflx") {
+        if candidate.source.eq_ignore_ascii_case("upnp-port-mapping") {
+            4
+        } else {
+            3
+        }
+    } else if candidate.candidate_type.eq_ignore_ascii_case("host") {
+        2
+    } else if candidate.candidate_type.eq_ignore_ascii_case("relay") {
+        1
+    } else {
+        0
     }
 }
 
@@ -215,6 +250,69 @@ mod tests {
         assert_eq!(plan.status, "ready");
         assert_eq!(plan.target_endpoints.len(), 2);
         assert_eq!(plan.attempt_count, 3);
+    }
+
+    #[test]
+    fn punch_plan_prefers_routable_candidates_before_host_and_relay() {
+        let local = create_nat_traversal_offer(
+            "room",
+            "peer_a",
+            "a",
+            1,
+            "10.0.0.2:10000".parse().unwrap(),
+            None,
+            vec![],
+        );
+        let remote = NatTraversalOffer {
+            schema_version: 1,
+            room_id: "room".to_owned(),
+            peer_id: "peer_b".to_owned(),
+            virtual_ip: None,
+            nonce: "b".to_owned(),
+            created_at_ms: 1,
+            candidates: vec![
+                NatCandidate {
+                    candidate_type: "host".to_owned(),
+                    transport: "udp".to_owned(),
+                    endpoint: "192.168.1.20:39090".to_owned(),
+                    priority: 100,
+                    source: "local-socket".to_owned(),
+                },
+                NatCandidate {
+                    candidate_type: "relay".to_owned(),
+                    transport: "udp".to_owned(),
+                    endpoint: "203.0.113.10:39091".to_owned(),
+                    priority: 10,
+                    source: "relay".to_owned(),
+                },
+                NatCandidate {
+                    candidate_type: "srflx".to_owned(),
+                    transport: "udp".to_owned(),
+                    endpoint: "198.51.100.20:44000".to_owned(),
+                    priority: 90,
+                    source: "observed-endpoint".to_owned(),
+                },
+                NatCandidate {
+                    candidate_type: "srflx".to_owned(),
+                    transport: "udp".to_owned(),
+                    endpoint: "198.51.100.20:39090".to_owned(),
+                    priority: 90,
+                    source: "upnp-port-mapping".to_owned(),
+                },
+            ],
+        };
+
+        let plan = create_nat_punch_plan(&local, &remote, 3, 25);
+
+        assert_eq!(
+            plan.target_endpoints,
+            vec![
+                "198.51.100.20:39090",
+                "198.51.100.20:44000",
+                "192.168.1.20:39090",
+                "203.0.113.10:39091",
+            ]
+        );
     }
 
     #[test]

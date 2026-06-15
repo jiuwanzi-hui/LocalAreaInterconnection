@@ -124,7 +124,7 @@ public static class LocalAreaInterconnectionCli
     {
         Console.WriteLine("LocalAreaInterconnection Windows CLI");
         Console.WriteLine("Usage:");
-        Console.WriteLine("  LocalAreaInterconnection.Cli.exe init --room-name \"Friday LAN\" --host Alice");
+        Console.WriteLine("  LocalAreaInterconnection.Cli.exe init --room-name \"Friday LAN\" --host Alice [--coordination-endpoint http://192.168.1.10:39110]");
         Console.WriteLine("  LocalAreaInterconnection.Cli.exe decode --invite <code>");
         Console.WriteLine("  LocalAreaInterconnection.Cli.exe join --invite <code> [--peer Bob]");
         Console.WriteLine("  LocalAreaInterconnection.Cli.exe diagnose --virtual-adapter ok --firewall allowed --p2p ok --broadcast missing");
@@ -185,20 +185,22 @@ public static class LocalAreaInterconnectionCli
     {
         string roomName = Arg(args, "room-name", "LAN Room");
         string host = Arg(args, "host", "Host");
+        string coordinationEndpoint = Arg(args, "coordination-endpoint", "");
         string roomId = RandomToken(8);
         string roomKey = RandomToken(32);
         string subnet = SubnetForRoom(roomId);
         string hostIp = HostIp(subnet);
         string broadcastIp = BroadcastIp(subnet);
+        string hostPeerId = "peer_" + RandomToken(6);
         string payload = Obj(
             Prop("version", "1"),
             Prop("room_id", Q(roomId)),
             Prop("room_name", Q(roomName)),
             Prop("mode", Q("p2p")),
             Prop("virtual_subnet", Q(subnet)),
-            Prop("host_peer_id", Q("peer_" + RandomToken(6))),
+            Prop("host_peer_id", Q(hostPeerId)),
             Prop("host_endpoint", "null"),
-            Prop("coordination_endpoint", "null"),
+            Prop("coordination_endpoint", coordinationEndpoint.Length > 0 ? Q(coordinationEndpoint) : "null"),
             Prop("join_token", Q(RandomToken(18)))
         );
         string invite = Base64Url(Encoding.UTF8.GetBytes(payload)) + "." + Base64Url(SHA256.Create().ComputeHash(Encoding.UTF8.GetBytes(payload + roomKey)));
@@ -206,6 +208,7 @@ public static class LocalAreaInterconnectionCli
             Prop("roomId", Q(roomId)),
             Prop("roomName", Q(roomName)),
             Prop("hostName", Q(host)),
+            Prop("hostPeerId", Q(hostPeerId)),
             Prop("virtualSubnet", Q(subnet)),
             Prop("hostIp", Q(hostIp)),
             Prop("broadcastAddress", Q(broadcastIp)),
@@ -229,13 +232,17 @@ public static class LocalAreaInterconnectionCli
         string subnet = JsonStringValue(payload, "virtual_subnet");
         string roomId = JsonStringValue(payload, "room_id");
         string roomName = JsonStringValue(payload, "room_name");
+        string hostPeerId = JsonStringValue(payload, "host_peer_id");
+        string coordinationEndpoint = JsonStringValue(payload, "coordination_endpoint");
         Console.WriteLine(Obj(
             Prop("roomId", Q(roomId)),
             Prop("roomName", Q(roomName)),
             Prop("peerName", Q(peer)),
             Prop("virtualSubnet", Q(subnet)),
+            Prop("hostPeerId", Q(hostPeerId)),
             Prop("hostIp", Q(HostIp(subnet))),
             Prop("suggestedLocalIp", Q(PeerIp(subnet, 0))),
+            Prop("coordinationEndpoint", coordinationEndpoint.Length > 0 ? Q(coordinationEndpoint) : "null"),
             Prop("nextAction", Q("Enable the virtual adapter, assign the suggested IP, then test connectivity with the host."))
         ));
     }
@@ -1860,8 +1867,9 @@ public static class LocalAreaInterconnectionCli
         string marker = "\"" + key + "\":";
         int start = json.IndexOf(marker, StringComparison.Ordinal);
         if (start < 0) return "";
-        start = json.IndexOf('"', start + marker.Length);
-        if (start < 0) return "";
+        start += marker.Length;
+        while (start < json.Length && Char.IsWhiteSpace(json[start])) start++;
+        if (start >= json.Length || json[start] != '"') return "";
         int end = json.IndexOf('"', start + 1);
         if (end < 0) return "";
         return json.Substring(start + 1, end - start - 1);

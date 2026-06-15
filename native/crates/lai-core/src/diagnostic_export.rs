@@ -1482,6 +1482,7 @@ mod tests {
             schema_version: 1,
             room_id: "room_test".to_owned(),
             peer_id: peer_id.to_owned(),
+            virtual_ip: None,
             nonce: format!("nonce-{peer_id}"),
             created_at_ms: 1,
             candidates,

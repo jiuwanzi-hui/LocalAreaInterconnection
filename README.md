@@ -37,9 +37,9 @@ The project is still under active MVP development.
 
 Implemented code already includes the Windows desktop test shell, Rust native CLI, room and invite models, diagnostics, encrypted tunnel envelope, NAT/P2P bootstrap, local JSON coordination store, lightweight HTTP coordination service, UDP forwarding, raw IPv4 UDP/TCP packet handling, connection path assessment, relay fallback planning, and Wintun runtime probes.
 
-Recent native builds also include a small STUN-like UDP observer for endpoint discovery and diagnostic export support for `room-runtime-run` snapshot files. This lets a troubleshooting bundle include runtime packet I/O evidence such as raw virtual packet counts, Wintun send/receive summaries, packet observation lines, and per-peer runtime path and traffic summaries captured during a run.
+Recent native builds also include STUN endpoint discovery, optional UPnP port mapping, routable-first NAT candidate ordering, repeated encrypted P2P handshakes, and diagnostic export support for `room-runtime-run` snapshot files. This lets a troubleshooting bundle include runtime packet I/O evidence such as raw virtual packet counts, Wintun send/receive summaries, packet observation lines, and per-peer runtime path and traffic summaries captured during a run.
 
-The desktop test shell can start and stop a controlled native runtime. Runtime snapshots and packet observation files are written under the user's application data folder, and the diagnostic export button automatically includes the latest runtime snapshot when one exists.
+The desktop test shell can generate direct offers on the same UDP port used by the runtime, start and stop a controlled native runtime, and show whether the NAT bootstrap was confirmed by an encrypted acknowledgement. Runtime snapshots and packet observation files are written under the user's application data folder, and the diagnostic export button automatically includes the latest runtime snapshot when one exists.
 
 Real cross-network gameplay still needs validation on two Windows machines with:
 
@@ -47,6 +47,7 @@ Real cross-network gameplay still needs validation on two Windows machines with:
 - `wintun.dll`.
 - A created and openable Wintun adapter.
 - Real game traffic on different NAT networks.
+- NAT behavior that allows direct UDP hole punching, or a successful UPnP/manual port mapping; CGNAT or symmetric/endpoint-dependent NAT can still block serverless direct mode.
 
 ### Which EXE To Run
 
@@ -159,9 +160,9 @@ LocalAreaInterconnection 是一个面向仅支持局域网联机的 PC 游戏的
 
 当前已实现 Windows 桌面测试壳、Rust 原生 CLI、房间与邀请模型、诊断、加密隧道封装、NAT/P2P bootstrap、本地 JSON coordination store、轻量 HTTP 协调服务、UDP 转发、原始 IPv4 UDP/TCP 包处理、连接路径评估、中继兜底计划和 Wintun 运行时探测。
 
-最近的原生构建还加入了一个轻量 STUN-like UDP 观测器，用于端点发现，并支持把 `room-runtime-run` 的 snapshot 文件导入诊断导出。这样故障包里就能包含运行时的 packet I/O 证据，例如原始虚拟包计数、Wintun 收发摘要、运行期间记录的包观测行，以及每个 peer 的运行时路径和流量摘要。
+最近的原生构建还加入了 STUN 端点发现、可选 UPnP 端口映射、优先使用公网可路由候选的 NAT 排序、重复加密 P2P 握手，以及把 `room-runtime-run` 的 snapshot 文件导入诊断导出的能力。这样故障包里就能包含运行时的 packet I/O 证据，例如原始虚拟包计数、Wintun 收发摘要、运行期间记录的包观测行，以及每个 peer 的运行时路径和流量摘要。
 
-桌面测试壳可以启动和停止一个受控的 native runtime。runtime snapshot 和包观测文件会写到用户的应用数据目录，诊断导出按钮在存在最近 snapshot 时会自动合并进去。
+桌面测试壳可以在与运行时相同的 UDP 端口上生成直连 Offer，启动和停止一个受控的 native runtime，并显示 NAT bootstrap 是否收到了加密 ACK 确认。runtime snapshot 和包观测文件会写到用户的应用数据目录，诊断导出按钮在存在最近 snapshot 时会自动合并进去。
 
 真实跨网络联机仍需要在两台 Windows 机器上验证，并满足以下条件：
 
@@ -169,6 +170,7 @@ LocalAreaInterconnection 是一个面向仅支持局域网联机的 PC 游戏的
 - `wintun.dll`。
 - 已创建且可打开的 Wintun 网卡。
 - 不同 NAT 网络下的真实游戏流量。
+- NAT 行为允许 UDP 打洞，或 UPnP/手动端口映射成功；CGNAT 或对称/endpoint-dependent NAT 仍可能阻止无服务器直连。
 
 ### 运行哪个 EXE
 

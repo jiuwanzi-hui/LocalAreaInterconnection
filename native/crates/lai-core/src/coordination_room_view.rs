@@ -65,7 +65,11 @@ pub fn coordination_room_view(
                     });
                     CoordinationRoomMemberView {
                         peer_id: peer.peer_id.clone(),
-                        virtual_ip: peer_virtual_ip(virtual_subnet, &peer.peer_id),
+                        virtual_ip: peer
+                            .offer
+                            .as_ref()
+                            .and_then(|offer| offer.virtual_ip)
+                            .or_else(|| peer_virtual_ip(virtual_subnet, &peer.peer_id)),
                         status: if online { "online" } else { "expired" }.to_owned(),
                         is_host: host_peer_id.as_deref() == Some(peer.peer_id.as_str()),
                         candidate_count,

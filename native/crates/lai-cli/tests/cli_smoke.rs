@@ -1,8 +1,10 @@
 use serde_json::Value;
 use std::fs;
-use std::net::{TcpListener, UdpSocket};
+use std::io::{Read, Write};
+use std::net::{SocketAddr, TcpListener, UdpSocket};
 use std::process::Command;
 use std::process::Stdio;
+use std::thread::JoinHandle;
 use std::time::Duration;
 
 fn run_cli(args: &[&str]) -> Value {
@@ -18,6 +20,42 @@ fn run_cli(args: &[&str]) -> Value {
         String::from_utf8_lossy(&output.stderr)
     );
     serde_json::from_slice(&output.stdout).expect("valid json stdout")
+}
+
+fn spawn_fake_standard_stun(response_port_delta: u16) -> (SocketAddr, JoinHandle<()>) {
+    let server = UdpSocket::bind("127.0.0.1:0").expect("bind fake stun server");
+    let server_addr = server.local_addr().unwrap();
+    let handle = std::thread::spawn(move || {
+        let mut buffer = [0u8; 1500];
+        let (received, peer) = server.recv_from(&mut buffer).expect("receive stun request");
+        assert!(received >= 20, "short STUN request");
+        let transaction_id = &buffer[8..20];
+        let magic_cookie = 0x2112A442u32;
+        let cookie_bytes = magic_cookie.to_be_bytes();
+        let peer_ip = match peer.ip() {
+            std::net::IpAddr::V4(ip) => ip.octets(),
+            std::net::IpAddr::V6(_) => panic!("expected IPv4 peer"),
+        };
+        let mapped_port = peer.port().saturating_add(response_port_delta);
+        let xport = mapped_port ^ ((magic_cookie >> 16) as u16);
+
+        let mut response = Vec::new();
+        response.extend_from_slice(&0x0101u16.to_be_bytes());
+        response.extend_from_slice(&12u16.to_be_bytes());
+        response.extend_from_slice(&magic_cookie.to_be_bytes());
+        response.extend_from_slice(transaction_id);
+        response.extend_from_slice(&0x0020u16.to_be_bytes());
+        response.extend_from_slice(&8u16.to_be_bytes());
+        response.push(0);
+        response.push(0x01);
+        response.extend_from_slice(&xport.to_be_bytes());
+        response.push(peer_ip[0] ^ cookie_bytes[0]);
+        response.push(peer_ip[1] ^ cookie_bytes[1]);
+        response.push(peer_ip[2] ^ cookie_bytes[2]);
+        response.push(peer_ip[3] ^ cookie_bytes[3]);
+        server.send_to(&response, peer).expect("send stun response");
+    });
+    (server_addr, handle)
 }
 
 #[test]
@@ -491,14 +529,33 @@ fn room_runtime_run_can_bootstrap_nat_remote_peer_before_starting() {
         listener_addr.to_string()
     );
     assert_eq!(value["natBootstrapResults"][0]["status"], "ok");
+    assert!(value["natBootstrapResults"][0]["localEndpoint"].is_string());
     assert_eq!(
         value["natBootstrapResults"][0]["selectedPeer"]["responderPeerId"],
         "peer_b"
     );
     assert_eq!(
+        value["natBootstrapResults"][0]["selectedPeer"]["handshakeRole"],
+        "received-ack"
+    );
+    assert_eq!(
+        value["natBootstrapResults"][0]["selectedPeer"]["confirmedByAck"],
+        true
+    );
+    assert_eq!(
         value["connectionPathReports"][0]["report"]["selected_path"],
         "p2p"
     );
+    assert!(value["connectionPathReports"][0]["localEndpoint"].is_string());
+    assert_eq!(
+        value["connectionPathReports"][0]["selectedPeerEndpoint"],
+        listener_addr.to_string()
+    );
+    assert_eq!(
+        value["connectionPathReports"][0]["handshakeRole"],
+        "received-ack"
+    );
+    assert_eq!(value["connectionPathReports"][0]["confirmedByAck"], true);
     assert_eq!(value["runtimePeerSummaries"][0]["peerId"], "peer_b");
     assert_eq!(value["runtimePeerSummaries"][0]["selectedPath"], "p2p");
     assert_eq!(
@@ -516,9 +573,151 @@ fn room_runtime_run_can_bootstrap_nat_remote_peer_before_starting() {
         snapshot["connectionPathReports"][0]["report"]["selected_path"],
         "p2p"
     );
+    assert_eq!(
+        snapshot["connectionPathReports"][0]["handshakeRole"],
+        "received-ack"
+    );
+    assert_eq!(snapshot["connectionPathReports"][0]["confirmedByAck"], true);
     assert_eq!(snapshot["runtimePeerSummaries"][0]["peerId"], "peer_b");
     assert_eq!(snapshot["runtimePeerSummaries"][0]["selectedPath"], "p2p");
     assert!(snapshot["runtimePeerSummaries"][0]["latencyMs"].is_number());
+    assert!(
+        listener_output.status.success(),
+        "listener failed\nstatus: {}\nstdout: {}\nstderr: {}",
+        listener_output.status,
+        String::from_utf8_lossy(&listener_output.stdout),
+        String::from_utf8_lossy(&listener_output.stderr)
+    );
+}
+
+#[test]
+fn room_runtime_run_can_use_stun_for_nat_bootstrap_remote_peer() {
+    let stun_server = UdpSocket::bind("127.0.0.1:0").expect("bind fake stun server");
+    let stun_addr = stun_server.local_addr().unwrap();
+    let stun_handle = std::thread::spawn(move || {
+        let mut buffer = [0u8; 1500];
+        let (received, peer) = stun_server
+            .recv_from(&mut buffer)
+            .expect("receive stun request");
+        assert!(received >= 20, "short STUN request");
+        let transaction_id = &buffer[8..20];
+        let magic_cookie = 0x2112A442u32;
+        let cookie_bytes = magic_cookie.to_be_bytes();
+        let peer_ip = match peer.ip() {
+            std::net::IpAddr::V4(ip) => ip.octets(),
+            std::net::IpAddr::V6(_) => panic!("expected IPv4 peer"),
+        };
+        let xport = peer.port() ^ ((magic_cookie >> 16) as u16);
+
+        let mut response = Vec::new();
+        response.extend_from_slice(&0x0101u16.to_be_bytes());
+        response.extend_from_slice(&12u16.to_be_bytes());
+        response.extend_from_slice(&magic_cookie.to_be_bytes());
+        response.extend_from_slice(transaction_id);
+        response.extend_from_slice(&0x0020u16.to_be_bytes());
+        response.extend_from_slice(&8u16.to_be_bytes());
+        response.push(0);
+        response.push(0x01);
+        response.extend_from_slice(&xport.to_be_bytes());
+        response.push(peer_ip[0] ^ cookie_bytes[0]);
+        response.push(peer_ip[1] ^ cookie_bytes[1]);
+        response.push(peer_ip[2] ^ cookie_bytes[2]);
+        response.push(peer_ip[3] ^ cookie_bytes[3]);
+        stun_server
+            .send_to(&response, peer)
+            .expect("send stun response");
+    });
+
+    let probe = UdpSocket::bind("127.0.0.1:0").expect("free udp port");
+    let listener_addr = probe.local_addr().unwrap();
+    drop(probe);
+    let snapshot_path = std::env::temp_dir().join(format!(
+        "lai-cli-runtime-bootstrap-stun-snapshot-{}.json",
+        std::process::id()
+    ));
+    let snapshot_path_string = snapshot_path.display().to_string();
+    fs::remove_file(&snapshot_path).ok();
+
+    let listener = Command::new(env!("CARGO_BIN_EXE_lai-cli"))
+        .args([
+            "p2p-handshake-listen",
+            "--bind",
+            &listener_addr.to_string(),
+            "--key",
+            "test-room-key",
+            "--responder-peer-id",
+            "peer_b",
+            "--max-packets",
+            "1",
+            "--timeout-ms",
+            "2000",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn p2p listener");
+    std::thread::sleep(Duration::from_millis(80));
+
+    let remote_offer = serde_json::json!({
+        "schema_version": 1,
+        "room_id": "room_test",
+        "peer_id": "peer_b",
+        "nonce": "nonce-b",
+        "created_at_ms": 1,
+        "candidates": [{
+            "candidate_type": "host",
+            "transport": "udp",
+            "endpoint": listener_addr.to_string(),
+            "priority": 100,
+            "source": "test-listener"
+        }]
+    });
+    let remote_offer = serde_json::to_string(&remote_offer).unwrap();
+    let value = run_cli(&[
+        "room-runtime-run",
+        "--room-id",
+        "room_test",
+        "--peer-id",
+        "peer_a",
+        "--virtual-ip",
+        "10.77.12.2",
+        "--bind",
+        "127.0.0.1:0",
+        "--key",
+        "test-room-key",
+        "--duration-ms",
+        "50",
+        "--snapshot-out",
+        &snapshot_path_string,
+        "--peer-timeout-ms",
+        "0",
+        "--nat-bootstrap-remote-peer",
+        &format!("peer_b,10.77.12.3,{remote_offer}"),
+        "--nat-bootstrap-attempts",
+        "1",
+        "--nat-bootstrap-interval-ms",
+        "0",
+        "--nat-bootstrap-timeout-ms",
+        "2000",
+        "--nat-bootstrap-stun-server",
+        &format!("localhost:{}", stun_addr.port()),
+        "--nat-bootstrap-stun-timeout-ms",
+        "2000",
+    ]);
+    let listener_output = listener.wait_with_output().expect("listener exits");
+    stun_handle.join().expect("fake stun server exits");
+
+    assert_eq!(value["status"], "ok");
+    assert_eq!(value["natBootstrapResults"][0]["status"], "ok");
+    assert_eq!(
+        value["natBootstrapResults"][0]["localOffer"]["candidates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|candidate| candidate["candidate_type"] == "srflx"
+                && candidate["source"] == "observed-endpoint"),
+        true
+    );
     assert!(
         listener_output.status.success(),
         "listener failed\nstatus: {}\nstdout: {}\nstderr: {}",
@@ -2915,6 +3114,84 @@ fn nat_candidates_and_plan_exchange_endpoints() {
 }
 
 #[test]
+fn nat_plan_orders_routable_candidates_before_private_host() {
+    let local_offer = serde_json::json!({
+        "schema_version": 1,
+        "room_id": "room_test",
+        "peer_id": "peer_a",
+        "virtual_ip": "10.77.12.2",
+        "nonce": "nonce-a",
+        "created_at_ms": 1,
+        "candidates": [{
+            "candidate_type": "host",
+            "transport": "udp",
+            "endpoint": "10.0.0.2:39090",
+            "priority": 100,
+            "source": "local-socket"
+        }]
+    });
+    let remote_offer = serde_json::json!({
+        "schema_version": 1,
+        "room_id": "room_test",
+        "peer_id": "peer_b",
+        "virtual_ip": "10.77.12.3",
+        "nonce": "nonce-b",
+        "created_at_ms": 1,
+        "candidates": [
+            {
+                "candidate_type": "host",
+                "transport": "udp",
+                "endpoint": "192.168.1.20:39090",
+                "priority": 100,
+                "source": "local-socket"
+            },
+            {
+                "candidate_type": "relay",
+                "transport": "udp",
+                "endpoint": "203.0.113.10:39091",
+                "priority": 10,
+                "source": "relay"
+            },
+            {
+                "candidate_type": "srflx",
+                "transport": "udp",
+                "endpoint": "198.51.100.20:44000",
+                "priority": 90,
+                "source": "observed-endpoint"
+            },
+            {
+                "candidate_type": "srflx",
+                "transport": "udp",
+                "endpoint": "198.51.100.20:39090",
+                "priority": 90,
+                "source": "upnp-port-mapping"
+            }
+        ]
+    });
+    let local_offer = serde_json::to_string(&local_offer).unwrap();
+    let remote_offer = serde_json::to_string(&remote_offer).unwrap();
+
+    let plan = run_cli(&[
+        "nat-plan",
+        "--local-offer",
+        &local_offer,
+        "--remote-offer",
+        &remote_offer,
+    ]);
+
+    assert_eq!(plan["status"], "ready");
+    assert_eq!(
+        plan["target_endpoints"],
+        serde_json::json!([
+            "198.51.100.20:39090",
+            "198.51.100.20:44000",
+            "192.168.1.20:39090",
+            "203.0.113.10:39091"
+        ])
+    );
+}
+
+#[test]
 fn relay_fallback_plan_selects_relay_after_p2p_failure() {
     let local = run_cli(&[
         "nat-candidates",
@@ -3159,6 +3436,311 @@ fn nat_candidates_can_query_stun_like_server_for_observed_endpoint() {
     let server_json: Value =
         serde_json::from_slice(&server_output.stdout).expect("server final json");
     assert_eq!(server_json["handledRequests"], 1);
+}
+
+#[test]
+fn nat_candidates_can_query_standard_stun_server_for_observed_endpoint() {
+    let server = UdpSocket::bind("127.0.0.1:0").expect("bind fake stun server");
+    let server_addr = server.local_addr().unwrap();
+    let handle = std::thread::spawn(move || {
+        let mut buffer = [0u8; 1500];
+        let (received, peer) = server.recv_from(&mut buffer).expect("receive stun request");
+        assert!(received >= 20, "short STUN request");
+        let transaction_id = &buffer[8..20];
+        let magic_cookie = 0x2112A442u32;
+        let cookie_bytes = magic_cookie.to_be_bytes();
+        let peer_ip = match peer.ip() {
+            std::net::IpAddr::V4(ip) => ip.octets(),
+            std::net::IpAddr::V6(_) => panic!("expected IPv4 peer"),
+        };
+        let xport = peer.port() ^ ((magic_cookie >> 16) as u16);
+
+        let mut response = Vec::new();
+        response.extend_from_slice(&0x0101u16.to_be_bytes());
+        response.extend_from_slice(&12u16.to_be_bytes());
+        response.extend_from_slice(&magic_cookie.to_be_bytes());
+        response.extend_from_slice(transaction_id);
+        response.extend_from_slice(&0x0020u16.to_be_bytes());
+        response.extend_from_slice(&8u16.to_be_bytes());
+        response.push(0);
+        response.push(0x01);
+        response.extend_from_slice(&xport.to_be_bytes());
+        response.push(peer_ip[0] ^ cookie_bytes[0]);
+        response.push(peer_ip[1] ^ cookie_bytes[1]);
+        response.push(peer_ip[2] ^ cookie_bytes[2]);
+        response.push(peer_ip[3] ^ cookie_bytes[3]);
+        server.send_to(&response, peer).expect("send stun response");
+    });
+
+    let value = run_cli(&[
+        "nat-candidates",
+        "--room-id",
+        "room_test",
+        "--peer-id",
+        "peer_a",
+        "--bind",
+        "127.0.0.1:0",
+        "--stun-server",
+        &format!("localhost:{}", server_addr.port()),
+        "--stun-timeout-ms",
+        "2000",
+        "--nonce",
+        "standard-stun-nonce",
+    ]);
+    handle.join().expect("fake stun server exits");
+
+    assert_eq!(value["status"], "ok");
+    assert!(value["offer"]["candidates"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|candidate| candidate["candidate_type"] == "srflx"
+            && candidate["source"] == "observed-endpoint"));
+}
+
+#[test]
+fn nat_candidates_reports_endpoint_dependent_stun_mapping() {
+    let (server_a, handle_a) = spawn_fake_standard_stun(0);
+    let (server_b, handle_b) = spawn_fake_standard_stun(1);
+    let stun_servers = format!(
+        "localhost:{},localhost:{}",
+        server_a.port(),
+        server_b.port()
+    );
+
+    let value = run_cli(&[
+        "nat-candidates",
+        "--room-id",
+        "room_test",
+        "--peer-id",
+        "peer_a",
+        "--bind",
+        "127.0.0.1:0",
+        "--stun-server",
+        &stun_servers,
+        "--stun-timeout-ms",
+        "2000",
+        "--nonce",
+        "endpoint-dependent-stun-nonce",
+    ]);
+    handle_a.join().expect("first fake stun server exits");
+    handle_b.join().expect("second fake stun server exits");
+
+    assert_eq!(value["status"], "ok");
+    assert_eq!(
+        value["stunMapping"]["mappingBehavior"],
+        "endpoint-dependent"
+    );
+    assert_eq!(
+        value["stunMapping"]["observedEndpoints"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    assert!(
+        value["offer"]["candidates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|candidate| candidate["candidate_type"] == "srflx"
+                && candidate["source"] == "observed-endpoint")
+            .count()
+            >= 2
+    );
+}
+
+#[test]
+fn nat_candidates_can_query_standard_stun_server_for_ipv6_observed_endpoint() {
+    let server = UdpSocket::bind("[::1]:0").expect("bind fake IPv6 stun server");
+    let server_addr = server.local_addr().unwrap();
+    let handle = std::thread::spawn(move || {
+        let mut buffer = [0u8; 1500];
+        let (received, peer) = server.recv_from(&mut buffer).expect("receive stun request");
+        assert!(received >= 20, "short STUN request");
+        let transaction_id = &buffer[8..20];
+        let magic_cookie = 0x2112A442u32;
+        let mut mask = [0u8; 16];
+        mask[..4].copy_from_slice(&magic_cookie.to_be_bytes());
+        mask[4..].copy_from_slice(transaction_id);
+        let peer_ip = match peer.ip() {
+            std::net::IpAddr::V6(ip) => ip.octets(),
+            std::net::IpAddr::V4(_) => panic!("expected IPv6 peer"),
+        };
+        let xport = peer.port() ^ ((magic_cookie >> 16) as u16);
+
+        let mut response = Vec::new();
+        response.extend_from_slice(&0x0101u16.to_be_bytes());
+        response.extend_from_slice(&24u16.to_be_bytes());
+        response.extend_from_slice(&magic_cookie.to_be_bytes());
+        response.extend_from_slice(transaction_id);
+        response.extend_from_slice(&0x0020u16.to_be_bytes());
+        response.extend_from_slice(&20u16.to_be_bytes());
+        response.push(0);
+        response.push(0x02);
+        response.extend_from_slice(&xport.to_be_bytes());
+        for index in 0..16 {
+            response.push(peer_ip[index] ^ mask[index]);
+        }
+        server.send_to(&response, peer).expect("send stun response");
+    });
+
+    let value = run_cli(&[
+        "nat-candidates",
+        "--room-id",
+        "room_test",
+        "--peer-id",
+        "peer_a",
+        "--bind",
+        "[::1]:0",
+        "--stun-server",
+        &format!("[::1]:{}", server_addr.port()),
+        "--stun-timeout-ms",
+        "2000",
+        "--nonce",
+        "standard-ipv6-stun-nonce",
+    ]);
+    handle.join().expect("fake IPv6 stun server exits");
+
+    assert_eq!(value["status"], "ok");
+    assert!(value["offer"]["candidates"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|candidate| candidate["candidate_type"] == "srflx"
+            && candidate["source"] == "observed-endpoint"
+            && candidate["endpoint"]
+                .as_str()
+                .unwrap()
+                .starts_with("[::1]:")));
+}
+
+#[test]
+fn nat_candidates_do_not_publish_unspecified_host_endpoint() {
+    let value = run_cli(&[
+        "nat-candidates",
+        "--room-id",
+        "room_test",
+        "--peer-id",
+        "peer_a",
+        "--bind",
+        "0.0.0.0:0",
+        "--nonce",
+        "unspecified-host-nonce",
+    ]);
+
+    assert_eq!(value["status"], "ok");
+    assert!(!value["offer"]["candidates"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|candidate| candidate["endpoint"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("0.0.0.0:")));
+}
+
+#[test]
+fn nat_candidates_can_add_upnp_port_mapping_candidate() {
+    let server = TcpListener::bind("127.0.0.1:0").expect("bind fake upnp gateway");
+    let server_addr = server.local_addr().unwrap();
+    let handle = std::thread::spawn(move || {
+        for _ in 0..3 {
+            let (mut stream, _) = server.accept().expect("accept upnp request");
+            stream
+                .set_read_timeout(Some(Duration::from_millis(100)))
+                .expect("set fake upnp read timeout");
+            let mut request_bytes = Vec::new();
+            let mut buffer = [0u8; 1024];
+            loop {
+                match stream.read(&mut buffer) {
+                    Ok(0) => break,
+                    Ok(read) => request_bytes.extend_from_slice(&buffer[..read]),
+                    Err(err)
+                        if matches!(
+                            err.kind(),
+                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                        ) =>
+                    {
+                        break;
+                    }
+                    Err(err) => panic!("read upnp request: {err}"),
+                }
+            }
+            let request = String::from_utf8_lossy(&request_bytes);
+            let body = if request.starts_with("GET /root.xml ") {
+                r#"<?xml version="1.0"?>
+<root>
+  <device>
+    <serviceList>
+      <service>
+        <serviceType>urn:schemas-upnp-org:service:WANIPConnection:1</serviceType>
+        <controlURL>/control</controlURL>
+      </service>
+    </serviceList>
+  </device>
+</root>"#
+                    .to_owned()
+            } else if request.contains("AddPortMapping") {
+                assert!(request.contains("<NewProtocol>UDP</NewProtocol>"));
+                r#"<?xml version="1.0"?>
+<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/">
+  <s:Body><u:AddPortMappingResponse xmlns:u="urn:schemas-upnp-org:service:WANIPConnection:1" /></s:Body>
+</s:Envelope>"#
+                    .to_owned()
+            } else if request.contains("GetExternalIPAddress") {
+                r#"<?xml version="1.0"?>
+<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/">
+  <s:Body><u:GetExternalIPAddressResponse xmlns:u="urn:schemas-upnp-org:service:WANIPConnection:1">
+    <NewExternalIPAddress>198.51.100.77</NewExternalIPAddress>
+  </u:GetExternalIPAddressResponse></s:Body>
+</s:Envelope>"#
+                    .to_owned()
+            } else {
+                panic!("unexpected upnp request: {request}");
+            };
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.as_bytes().len(),
+                body,
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("write upnp response");
+        }
+    });
+
+    let value = run_cli(&[
+        "nat-candidates",
+        "--room-id",
+        "room_test",
+        "--peer-id",
+        "peer_a",
+        "--bind",
+        "127.0.0.1:0",
+        "--upnp-port-map",
+        "true",
+        "--upnp-gateway-location",
+        &format!("http://{server_addr}/root.xml"),
+        "--upnp-timeout-ms",
+        "2000",
+        "--nonce",
+        "upnp-nonce",
+    ]);
+    handle.join().expect("fake upnp gateway exits");
+
+    assert_eq!(value["status"], "ok");
+    assert_eq!(value["upnpPortMapping"]["status"], "mapped");
+    assert!(value["offer"]["candidates"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|candidate| candidate["candidate_type"] == "srflx"
+            && candidate["source"] == "upnp-port-mapping"
+            && candidate["endpoint"]
+                .as_str()
+                .unwrap()
+                .starts_with("198.51.100.77:")));
 }
 
 #[test]
@@ -3722,8 +4304,14 @@ fn nat_p2p_bootstrap_punches_then_completes_encrypted_handshake() {
     let listener_output = listener.wait_with_output().expect("listener exits");
 
     assert_eq!(bootstrap["status"], "ok");
+    assert!(bootstrap["localEndpoint"]
+        .as_str()
+        .unwrap()
+        .starts_with("127.0.0.1:"));
     assert_eq!(bootstrap["selectedPeer"]["responderPeerId"], "peer_b");
     assert_eq!(bootstrap["selectedPeer"]["nonceMatched"], true);
+    assert_eq!(bootstrap["selectedPeer"]["handshakeRole"], "received-ack");
+    assert_eq!(bootstrap["selectedPeer"]["confirmedByAck"], true);
     assert_eq!(bootstrap["punchPackets"].as_array().unwrap().len(), 1);
     assert_eq!(bootstrap["handshakePackets"].as_array().unwrap().len(), 1);
     assert!(
@@ -3741,6 +4329,134 @@ fn nat_p2p_bootstrap_punches_then_completes_encrypted_handshake() {
         .as_array()
         .unwrap()
         .is_empty());
+}
+
+#[test]
+fn nat_p2p_bootstrap_can_complete_when_both_peers_start_together() {
+    let probe_a = UdpSocket::bind("127.0.0.1:0").expect("free udp port a");
+    let addr_a = probe_a.local_addr().unwrap();
+    let probe_b = UdpSocket::bind("127.0.0.1:0").expect("free udp port b");
+    let addr_b = probe_b.local_addr().unwrap();
+    drop(probe_a);
+    drop(probe_b);
+
+    let offer_a = serde_json::json!({
+        "schema_version": 1,
+        "room_id": "room_test",
+        "peer_id": "peer_a",
+        "nonce": "nonce-a",
+        "created_at_ms": 1,
+        "candidates": [{
+            "candidate_type": "host",
+            "transport": "udp",
+            "endpoint": addr_a.to_string(),
+            "priority": 100,
+            "source": "test-bootstrap"
+        }]
+    });
+    let offer_b = serde_json::json!({
+        "schema_version": 1,
+        "room_id": "room_test",
+        "peer_id": "peer_b",
+        "nonce": "nonce-b",
+        "created_at_ms": 1,
+        "candidates": [{
+            "candidate_type": "host",
+            "transport": "udp",
+            "endpoint": addr_b.to_string(),
+            "priority": 100,
+            "source": "test-bootstrap"
+        }]
+    });
+    let offer_a = serde_json::to_string(&offer_a).unwrap();
+    let offer_b = serde_json::to_string(&offer_b).unwrap();
+
+    let peer_a = Command::new(env!("CARGO_BIN_EXE_lai-cli"))
+        .args([
+            "nat-p2p-bootstrap",
+            "--room-id",
+            "room_test",
+            "--peer-id",
+            "peer_a",
+            "--virtual-ip",
+            "10.77.12.2",
+            "--key",
+            "test-room-key",
+            "--bind",
+            &addr_a.to_string(),
+            "--remote-offer",
+            &offer_b,
+            "--punch-attempts",
+            "2",
+            "--punch-interval-ms",
+            "25",
+            "--handshake-timeout-ms",
+            "3000",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn peer a bootstrap");
+
+    let peer_b = Command::new(env!("CARGO_BIN_EXE_lai-cli"))
+        .args([
+            "nat-p2p-bootstrap",
+            "--room-id",
+            "room_test",
+            "--peer-id",
+            "peer_b",
+            "--virtual-ip",
+            "10.77.12.3",
+            "--key",
+            "test-room-key",
+            "--bind",
+            &addr_b.to_string(),
+            "--remote-offer",
+            &offer_a,
+            "--punch-attempts",
+            "2",
+            "--punch-interval-ms",
+            "25",
+            "--handshake-timeout-ms",
+            "3000",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn peer b bootstrap");
+
+    let output_a = peer_a.wait_with_output().expect("peer a exits");
+    let output_b = peer_b.wait_with_output().expect("peer b exits");
+
+    assert!(
+        output_a.status.success(),
+        "peer a failed\nstatus: {}\nstdout: {}\nstderr: {}",
+        output_a.status,
+        String::from_utf8_lossy(&output_a.stdout),
+        String::from_utf8_lossy(&output_a.stderr)
+    );
+    assert!(
+        output_b.status.success(),
+        "peer b failed\nstatus: {}\nstdout: {}\nstderr: {}",
+        output_b.status,
+        String::from_utf8_lossy(&output_b.stdout),
+        String::from_utf8_lossy(&output_b.stderr)
+    );
+    let value_a: Value = serde_json::from_slice(&output_a.stdout).expect("peer a json");
+    let value_b: Value = serde_json::from_slice(&output_b.stdout).expect("peer b json");
+
+    assert_eq!(value_a["status"], "ok");
+    assert_eq!(value_a["localEndpoint"], addr_a.to_string());
+    assert_eq!(value_a["selectedPeer"]["responderPeerId"], "peer_b");
+    assert_eq!(value_a["selectedPeer"]["nonceMatched"], true);
+    assert_eq!(value_a["selectedPeer"]["handshakeRole"], "received-ack");
+    assert_eq!(value_a["selectedPeer"]["confirmedByAck"], true);
+    assert_eq!(value_b["status"], "ok");
+    assert_eq!(value_b["localEndpoint"], addr_b.to_string());
+    assert_eq!(value_b["selectedPeer"]["responderPeerId"], "peer_a");
+    assert_eq!(value_b["selectedPeer"]["nonceMatched"], true);
+    assert_eq!(value_b["selectedPeer"]["handshakeRole"], "received-ack");
+    assert_eq!(value_b["selectedPeer"]["confirmedByAck"], true);
 }
 
 #[test]

@@ -5,7 +5,9 @@ $csc = Join-Path $env:WINDIR 'Microsoft.NET\Framework64\v4.0.30319\csc.exe'
 $dist = Join-Path $repoRoot 'dist'
 $icon = Join-Path $repoRoot 'assets\LocalAreaInterconnection.ico'
 $cliSource = Join-Path $repoRoot 'windows-cli\LocalAreaInterconnectionCli.cs'
-$desktopSource = Join-Path $repoRoot 'windows-cli\LocalAreaInterconnectionDesktop.cs'
+$desktopSources = Get-ChildItem -Path (Join-Path $repoRoot 'windows-cli') -Filter 'LocalAreaInterconnectionDesktop*.cs' |
+    Sort-Object Name |
+    ForEach-Object { $_.FullName }
 $gameProfilesSource = Join-Path $repoRoot 'assets\game-profiles.example.json'
 $cliOut = Join-Path $dist 'LocalAreaInterconnection.Cli.exe'
 $nativeCliOut = Join-Path $dist 'LocalAreaInterconnection.Native.Cli.exe'
@@ -23,7 +25,7 @@ if ($LASTEXITCODE -ne 0) {
     throw "Failed to compile CLI backend."
 }
 
-& $csc /nologo /target:winexe /out:$desktopOut /win32icon:$icon /reference:System.Windows.Forms.dll /reference:System.Drawing.dll $desktopSource
+& $csc /nologo /target:winexe /out:$desktopOut /win32icon:$icon /reference:System.Windows.Forms.dll /reference:System.Drawing.dll $desktopSources
 if ($LASTEXITCODE -ne 0) {
     throw "Failed to compile desktop shell."
 }

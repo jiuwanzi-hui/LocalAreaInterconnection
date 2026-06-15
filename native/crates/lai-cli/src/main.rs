@@ -1,5 +1,22 @@
+mod cli_args;
+mod connection_paths;
+mod coordination_http;
+mod nat_direct;
+
 use base64::{engine::general_purpose::STANDARD_NO_PAD, Engine as _};
-use clap::{CommandFactory, Parser, Subcommand};
+use clap::{CommandFactory, Parser};
+use cli_args::{Cli, Command};
+use connection_paths::{
+    connection_path_peer_id, connection_path_reports_from_bootstrap_outputs,
+    connection_path_status_from_bootstrap_status, load_nat_offer_argument,
+    load_relay_fallback_for_export, runtime_relay_fallback_summaries,
+};
+use coordination_http::{
+    coordination_http_close, coordination_http_fetch_offers, coordination_http_heartbeat,
+    coordination_http_kick, coordination_http_leave, coordination_http_prune,
+    coordination_http_publish_offer, coordination_http_room_view,
+    load_coordination_store_or_default, run_coordination_http_server,
+};
 use lai_core::{
     add_room_member, close_room, create_command_execution_preview, create_diagnostic_export_bundle,
     create_game_network_plan, create_invite, create_join_plan, create_p2p_handshake_ack,
@@ -19,6 +36,12 @@ use lai_core::{
     PacketCaptureSummary, PacketObservation, RoomRuntimePeer, RoomRuntimePlan, TunnelEnvelope,
     TunnelObservation, TunnelServiceSnapshot, UdpForwardObservation, VirtualUdpPacket,
 };
+use nat_direct::{
+    apply_stun_mapping_candidates_to_offer, apply_upnp_port_mapping_to_offer,
+    enrich_offer_with_local_host_candidates, query_stun_like_server, run_nat_hole_punch,
+    run_nat_hole_punch_loopback_test, run_nat_p2p_bootstrap, run_stun_like_server,
+    UpnpPortMappingReport,
+};
 use rand::RngCore;
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
@@ -28,13 +51,6 @@ use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::path::Path;
 use std::process::Command as ProcessCommand;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-
-#[derive(Parser)]
-#[command(name = "lai-cli")]
-struct Cli {
-    #[command(subcommand)]
-    command: Option<Command>,
-}
 
 struct RuntimePacketIoProbeOptions {
     wintun_adapter_name: String,
@@ -62,1079 +78,6 @@ struct RuntimeCoordinationMonitorReport {
     room_present: bool,
     checked_at_ms: u128,
     detail: String,
-}
-
-#[derive(Subcommand)]
-enum Command {
-    Init {
-        #[arg(long, default_value = "LAN Room")]
-        room_name: String,
-        #[arg(long, default_value = "Host")]
-        host: String,
-    },
-    Decode {
-        #[arg(long)]
-        invite: String,
-    },
-    Join {
-        #[arg(long)]
-        invite: String,
-    },
-    RoomSummary {
-        #[arg(long, default_value = "LAN Room")]
-        room_name: String,
-        #[arg(long, default_value = "Host")]
-        host: String,
-        #[arg(long = "peer")]
-        peers: Vec<String>,
-        #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
-        close: bool,
-    },
-    RoomRuntimePlan {
-        #[arg(long)]
-        room_id: String,
-        #[arg(long)]
-        peer_id: String,
-        #[arg(long)]
-        virtual_ip: String,
-        #[arg(long, default_value = "0.0.0.0:39090")]
-        bind: String,
-        #[arg(long = "peer")]
-        peers: Vec<String>,
-        #[arg(long = "nat-bootstrap-peer")]
-        nat_bootstrap_peers: Vec<String>,
-        #[arg(long, default_value = "")]
-        game_ports: String,
-        #[arg(long, default_value = "")]
-        broadcast_ports: String,
-    },
-    RuntimeCleanupPlan {
-        #[arg(long)]
-        room_id: String,
-        #[arg(long)]
-        peer_id: String,
-        #[arg(long)]
-        virtual_ip: String,
-        #[arg(long)]
-        subnet: Option<String>,
-        #[arg(long, default_value = "LocalAreaInterconnection")]
-        adapter_name: String,
-        #[arg(long, default_value = "userspace-udp")]
-        packet_io_backend: String,
-        #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
-        restore_adapter: bool,
-        #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
-        cleanup_routes: bool,
-    },
-    RuntimeCleanupReport {
-        #[arg(long)]
-        runtime_snapshot: Option<String>,
-        #[arg(long)]
-        cleanup_plan: Option<String>,
-        #[arg(long)]
-        adapter_netsh_output: Option<String>,
-        #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
-        adapter_scan: bool,
-        #[arg(long, default_value = "LocalAreaInterconnection")]
-        adapter_name: String,
-        #[arg(long)]
-        route_output: Option<String>,
-        #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
-        route_scan: bool,
-    },
-    RuntimeCleanupApply {
-        #[arg(long)]
-        runtime_snapshot: Option<String>,
-        #[arg(long)]
-        cleanup_plan: Option<String>,
-        #[arg(long)]
-        adapter_netsh_output: Option<String>,
-        #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
-        adapter_scan: bool,
-        #[arg(long, default_value = "LocalAreaInterconnection")]
-        adapter_name: String,
-        #[arg(long)]
-        route_output: Option<String>,
-        #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
-        route_scan: bool,
-        #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
-        yes: bool,
-    },
-    RouteScan {
-        #[arg(long)]
-        route_output: Option<String>,
-        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
-        route_scan: bool,
-        #[arg(long)]
-        virtual_ip: Option<String>,
-        #[arg(long)]
-        subnet: Option<String>,
-    },
-    GamePortScan {
-        #[arg(long)]
-        netstat_output: Option<String>,
-        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
-        netstat_scan: bool,
-        #[arg(long, default_value = "Generic LAN Game")]
-        game_name: String,
-        #[arg(long)]
-        catalog: Option<String>,
-        #[arg(long)]
-        steam_app_id: Option<String>,
-        #[arg(long, default_value = "")]
-        ports: String,
-        #[arg(long, default_value = "udp,tcp")]
-        protocols: String,
-    },
-    GameReadiness {
-        #[arg(long)]
-        network_report: String,
-        #[arg(long)]
-        game_plan: Option<String>,
-        #[arg(long)]
-        catalog: Option<String>,
-        #[arg(long, default_value = "Generic LAN Game")]
-        game_name: String,
-        #[arg(long)]
-        steam_app_id: Option<String>,
-        #[arg(long)]
-        subnet: String,
-        #[arg(long, default_value = "manual_ports")]
-        discovery: String,
-        #[arg(long, default_value = "")]
-        ports: String,
-        #[arg(long, default_value = "unknown")]
-        compatibility: String,
-        #[arg(long)]
-        host_ip: Option<String>,
-        #[arg(long)]
-        local_ip: Option<String>,
-        #[arg(long)]
-        firewall_netsh_output: Option<String>,
-        #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
-        firewall_scan: bool,
-        #[arg(long)]
-        program: Option<String>,
-        #[arg(long)]
-        netstat_output: Option<String>,
-        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
-        netstat_scan: bool,
-        #[arg(long, default_value = "udp,tcp")]
-        protocols: String,
-        #[arg(long)]
-        relay_local_offer: Option<String>,
-        #[arg(long)]
-        relay_remote_offer: Option<String>,
-        #[arg(long, default_value = "unknown")]
-        relay_p2p_status: String,
-    },
-    RoomRuntimeRun {
-        #[arg(long)]
-        room_id: String,
-        #[arg(long)]
-        peer_id: String,
-        #[arg(long)]
-        virtual_ip: String,
-        #[arg(long, default_value = "127.0.0.1:0")]
-        bind: String,
-        #[arg(long = "peer")]
-        peers: Vec<String>,
-        #[arg(long = "nat-bootstrap-peer")]
-        nat_bootstrap_peers: Vec<String>,
-        #[arg(long = "nat-bootstrap-remote-peer")]
-        nat_bootstrap_remote_peers: Vec<String>,
-        #[arg(long)]
-        coordination_store: Option<String>,
-        #[arg(long)]
-        coordination_server: Option<String>,
-        #[arg(long = "coordination-peer")]
-        coordination_peers: Vec<String>,
-        #[arg(long, default_value = "")]
-        game_ports: String,
-        #[arg(long, default_value = "")]
-        broadcast_ports: String,
-        #[arg(long, default_value_t = 30)]
-        max_broadcast_packets_per_second: u16,
-        #[arg(long)]
-        key: String,
-        #[arg(long, default_value_t = 1000)]
-        duration_ms: u64,
-        #[arg(long)]
-        observe_file: Option<String>,
-        #[arg(long)]
-        snapshot_out: Option<String>,
-        #[arg(long, default_value = "userspace-udp")]
-        packet_io_backend: String,
-        #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
-        forward_raw_ipv4: bool,
-        #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
-        self_probe: bool,
-        #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
-        capture_self_probe: bool,
-        #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
-        forward_self_probe: bool,
-        #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
-        inject_self_probe: bool,
-        #[arg(long)]
-        inject_target: Option<String>,
-        #[arg(long, default_value_t = 500)]
-        heartbeat_interval_ms: u64,
-        #[arg(long, default_value_t = 3000)]
-        peer_timeout_ms: u64,
-        #[arg(long, default_value_t = 4)]
-        nat_bootstrap_attempts: u16,
-        #[arg(long, default_value_t = 25)]
-        nat_bootstrap_interval_ms: u64,
-        #[arg(long, default_value_t = 2000)]
-        nat_bootstrap_timeout_ms: u64,
-        #[arg(long)]
-        stop_file: Option<String>,
-        #[arg(long)]
-        snapshot_interval_ms: Option<u64>,
-        #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
-        coordination_monitor: bool,
-        #[arg(long, default_value_t = 1000)]
-        coordination_monitor_interval_ms: u64,
-        #[arg(long, default_value = "LocalAreaInterconnection")]
-        wintun_adapter_name: String,
-        #[arg(long, default_value_t = 128 * 1024)]
-        wintun_ring_capacity: u32,
-        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
-        wintun_probe_receive: bool,
-        #[arg(long, default_value_t = 8)]
-        wintun_receive_attempts: u32,
-        #[arg(long, default_value_t = 25)]
-        wintun_receive_poll_interval_ms: u64,
-        #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
-        wintun_probe_send: bool,
-        #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
-        wintun_runtime: bool,
-    },
-    Diagnose {
-        #[arg(long)]
-        p2p: Option<String>,
-        #[arg(long)]
-        firewall: Option<String>,
-    },
-    GamePlan {
-        #[arg(long, default_value = "Generic LAN Game")]
-        game_name: String,
-        #[arg(long)]
-        subnet: String,
-        #[arg(long, default_value = "udp_broadcast")]
-        discovery: String,
-        #[arg(long, default_value = "")]
-        ports: String,
-        #[arg(long, default_value = "unknown")]
-        compatibility: String,
-        #[arg(long)]
-        host_ip: Option<String>,
-        #[arg(long)]
-        local_ip: Option<String>,
-    },
-    GameProfilePlan {
-        #[arg(long)]
-        catalog: String,
-        #[arg(long)]
-        game_name: Option<String>,
-        #[arg(long)]
-        steam_app_id: Option<String>,
-        #[arg(long)]
-        subnet: String,
-        #[arg(long)]
-        host_ip: Option<String>,
-        #[arg(long)]
-        local_ip: Option<String>,
-        #[arg(long, default_value_t = 30)]
-        max_broadcast_packets_per_second: u16,
-    },
-    GameProfileList {
-        #[arg(long)]
-        catalog: String,
-        #[arg(long)]
-        query: Option<String>,
-    },
-    FirewallPlan {
-        #[arg(long, default_value = "Generic LAN Game")]
-        game_name: String,
-        #[arg(long)]
-        catalog: Option<String>,
-        #[arg(long)]
-        steam_app_id: Option<String>,
-        #[arg(long)]
-        subnet: String,
-        #[arg(long, default_value = "manual_ports")]
-        discovery: String,
-        #[arg(long, default_value = "")]
-        ports: String,
-        #[arg(long, default_value = "unknown")]
-        compatibility: String,
-        #[arg(long)]
-        program: Option<String>,
-    },
-    FirewallDiagnose {
-        #[arg(long, default_value = "Generic LAN Game")]
-        game_name: String,
-        #[arg(long)]
-        catalog: Option<String>,
-        #[arg(long)]
-        steam_app_id: Option<String>,
-        #[arg(long)]
-        subnet: String,
-        #[arg(long, default_value = "manual_ports")]
-        discovery: String,
-        #[arg(long, default_value = "")]
-        ports: String,
-        #[arg(long, default_value = "unknown")]
-        compatibility: String,
-        #[arg(long, default_value = "")]
-        observed: String,
-        #[arg(long)]
-        netsh_output: Option<String>,
-        #[arg(long)]
-        program: Option<String>,
-    },
-    AdapterPlan {
-        #[arg(long, default_value = "LocalAreaInterconnection")]
-        adapter_name: String,
-        #[arg(long)]
-        subnet: String,
-        #[arg(long)]
-        ip: String,
-        #[arg(long, default_value_t = 1420)]
-        mtu: u16,
-        #[arg(long, default_value_t = 5)]
-        metric: u16,
-    },
-    AdapterApply {
-        #[arg(long, default_value = "LocalAreaInterconnection")]
-        adapter_name: String,
-        #[arg(long)]
-        subnet: String,
-        #[arg(long)]
-        ip: String,
-        #[arg(long, default_value_t = 1420)]
-        mtu: u16,
-        #[arg(long, default_value_t = 5)]
-        metric: u16,
-        #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
-        yes: bool,
-    },
-    AdapterEnsure {
-        #[arg(long, default_value = "LocalAreaInterconnection")]
-        adapter_name: String,
-        #[arg(long)]
-        subnet: String,
-        #[arg(long)]
-        ip: String,
-        #[arg(long, default_value_t = 1420)]
-        mtu: u16,
-        #[arg(long, default_value_t = 5)]
-        metric: u16,
-        #[arg(long)]
-        adapter_netsh_output: Option<String>,
-        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
-        adapter_scan: bool,
-        #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
-        yes: bool,
-    },
-    VirtualPacketPlan {
-        #[arg(long, default_value = "LocalAreaInterconnection")]
-        adapter_name: String,
-        #[arg(long, default_value = "userspace-udp")]
-        backend: String,
-        #[arg(long, default_value_t = 1420)]
-        mtu: u16,
-    },
-    VirtualPacketBuildUdp {
-        #[arg(long)]
-        source_ip: String,
-        #[arg(long)]
-        destination_ip: String,
-        #[arg(long)]
-        source_port: u16,
-        #[arg(long)]
-        destination_port: u16,
-        #[arg(long, default_value = "hello")]
-        message: String,
-        #[arg(long, default_value_t = 64)]
-        ttl: u8,
-    },
-    VirtualPacketBuildTcp {
-        #[arg(long)]
-        source_ip: String,
-        #[arg(long)]
-        destination_ip: String,
-        #[arg(long)]
-        source_port: u16,
-        #[arg(long)]
-        destination_port: u16,
-        #[arg(long, default_value = "hello")]
-        message: String,
-        #[arg(long, default_value_t = 0x18)]
-        flags: u16,
-        #[arg(long, default_value_t = 64)]
-        ttl: u8,
-    },
-    VirtualPacketParse {
-        #[arg(long)]
-        packet_base64: String,
-    },
-    VirtualPacketParseSummary {
-        #[arg(long)]
-        packet_base64: String,
-    },
-    VirtualPacketLoopbackTest {
-        #[arg(long, default_value = "10.77.12.2")]
-        source_ip: String,
-        #[arg(long, default_value = "10.77.12.255")]
-        destination_ip: String,
-        #[arg(long, default_value_t = 39077)]
-        source_port: u16,
-        #[arg(long, default_value_t = 27015)]
-        destination_port: u16,
-        #[arg(long, default_value = "discover")]
-        message: String,
-    },
-    TunnelSeal {
-        #[arg(long)]
-        key: String,
-        #[arg(long, default_value = "game-udp")]
-        packet_kind: String,
-        #[arg(long, default_value_t = 1)]
-        sequence: u64,
-        #[arg(long)]
-        message: String,
-    },
-    TunnelOpen {
-        #[arg(long)]
-        key: String,
-        #[arg(long)]
-        envelope: String,
-    },
-    TunnelLoopbackTest {
-        #[arg(long, default_value = "127.0.0.1:0")]
-        bind: String,
-        #[arg(long)]
-        key: String,
-        #[arg(long, default_value = "ping")]
-        message: String,
-        #[arg(long, default_value_t = 2000)]
-        timeout_ms: u64,
-    },
-    TunnelListen {
-        #[arg(long, default_value = "0.0.0.0:39090")]
-        bind: String,
-        #[arg(long)]
-        key: String,
-        #[arg(long, default_value_t = 1)]
-        max_packets: u16,
-        #[arg(long, default_value_t = 30000)]
-        timeout_ms: u64,
-        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
-        echo: bool,
-    },
-    TunnelSend {
-        #[arg(long, default_value = "0.0.0.0:0")]
-        bind: String,
-        #[arg(long)]
-        peer: String,
-        #[arg(long)]
-        key: String,
-        #[arg(long, default_value = "ping")]
-        message: String,
-        #[arg(long, default_value_t = 2000)]
-        timeout_ms: u64,
-        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
-        wait_reply: bool,
-    },
-    RelayUdpServer {
-        #[arg(long, default_value = "0.0.0.0:39091")]
-        bind: String,
-        #[arg(long)]
-        key: String,
-        #[arg(long, default_value = "room_test")]
-        room_id: String,
-        #[arg(long = "allowed-peer")]
-        allowed_peers: Vec<String>,
-        #[arg(long, default_value_t = 0)]
-        max_packets: u16,
-        #[arg(long, default_value_t = 30000)]
-        timeout_ms: u64,
-    },
-    RelayUdpLoopbackTest {
-        #[arg(long, default_value = "127.0.0.1:0")]
-        bind: String,
-        #[arg(long)]
-        key: String,
-        #[arg(long, default_value = "room_test")]
-        room_id: String,
-        #[arg(long, default_value = "relay ping")]
-        message: String,
-        #[arg(long, default_value_t = 2000)]
-        timeout_ms: u64,
-    },
-    P2pHandshakeLoopbackTest {
-        #[arg(long, default_value = "127.0.0.1:0")]
-        bind: String,
-        #[arg(long, default_value = "room_test")]
-        room_id: String,
-        #[arg(long, default_value = "peer_local")]
-        peer_id: String,
-        #[arg(long, default_value = "peer_echo")]
-        responder_peer_id: String,
-        #[arg(long)]
-        virtual_ip: String,
-        #[arg(long)]
-        key: String,
-        #[arg(long, default_value_t = 2000)]
-        timeout_ms: u64,
-    },
-    P2pHandshakeListen {
-        #[arg(long, default_value = "0.0.0.0:39090")]
-        bind: String,
-        #[arg(long)]
-        key: String,
-        #[arg(long, default_value = "peer_responder")]
-        responder_peer_id: String,
-        #[arg(long, default_value_t = 1)]
-        max_packets: u16,
-        #[arg(long, default_value_t = 30000)]
-        timeout_ms: u64,
-    },
-    P2pHandshakeSend {
-        #[arg(long, default_value = "0.0.0.0:0")]
-        bind: String,
-        #[arg(long)]
-        peer: String,
-        #[arg(long, default_value = "room_test")]
-        room_id: String,
-        #[arg(long, default_value = "peer_local")]
-        peer_id: String,
-        #[arg(long)]
-        virtual_ip: String,
-        #[arg(long)]
-        key: String,
-        #[arg(long, default_value_t = 2000)]
-        timeout_ms: u64,
-    },
-    NatCandidates {
-        #[arg(long, default_value = "room_test")]
-        room_id: String,
-        #[arg(long, default_value = "peer_local")]
-        peer_id: String,
-        #[arg(long, default_value = "0.0.0.0:0")]
-        bind: String,
-        #[arg(long)]
-        observed_endpoint: Option<String>,
-        #[arg(long)]
-        stun_server: Option<String>,
-        #[arg(long, default_value_t = 1000)]
-        stun_timeout_ms: u64,
-        #[arg(long = "relay")]
-        relay_endpoints: Vec<String>,
-        #[arg(long)]
-        nonce: Option<String>,
-    },
-    NatPlan {
-        #[arg(long)]
-        local_offer: String,
-        #[arg(long)]
-        remote_offer: String,
-        #[arg(long, default_value_t = 8)]
-        attempts: u16,
-        #[arg(long, default_value_t = 50)]
-        interval_ms: u64,
-    },
-    RelayFallbackPlan {
-        #[arg(long)]
-        local_offer: String,
-        #[arg(long)]
-        remote_offer: String,
-        #[arg(long, default_value = "unknown")]
-        p2p_status: String,
-    },
-    ConnectionPathPlan {
-        #[arg(long)]
-        local_offer: String,
-        #[arg(long)]
-        remote_offer: String,
-        #[arg(long, default_value = "unknown")]
-        p2p_status: String,
-    },
-    NatHolePunch {
-        #[arg(long, default_value = "room_test")]
-        room_id: String,
-        #[arg(long, default_value = "peer_local")]
-        peer_id: String,
-        #[arg(long, default_value = "0.0.0.0:0")]
-        bind: String,
-        #[arg(long)]
-        remote_offer: String,
-        #[arg(long)]
-        observed_endpoint: Option<String>,
-        #[arg(long)]
-        stun_server: Option<String>,
-        #[arg(long, default_value_t = 1000)]
-        stun_timeout_ms: u64,
-        #[arg(long = "relay")]
-        relay_endpoints: Vec<String>,
-        #[arg(long, default_value_t = 8)]
-        attempts: u16,
-        #[arg(long, default_value_t = 50)]
-        interval_ms: u64,
-        #[arg(long, default_value_t = 500)]
-        receive_timeout_ms: u64,
-        #[arg(long, default_value = "nat-punch")]
-        message: String,
-    },
-    NatP2pBootstrap {
-        #[arg(long, default_value = "room_test")]
-        room_id: String,
-        #[arg(long, default_value = "peer_local")]
-        peer_id: String,
-        #[arg(long)]
-        virtual_ip: String,
-        #[arg(long)]
-        key: String,
-        #[arg(long, default_value = "0.0.0.0:0")]
-        bind: String,
-        #[arg(long)]
-        remote_offer: String,
-        #[arg(long)]
-        observed_endpoint: Option<String>,
-        #[arg(long)]
-        stun_server: Option<String>,
-        #[arg(long, default_value_t = 1000)]
-        stun_timeout_ms: u64,
-        #[arg(long = "relay")]
-        relay_endpoints: Vec<String>,
-        #[arg(long, default_value_t = 4)]
-        punch_attempts: u16,
-        #[arg(long, default_value_t = 25)]
-        punch_interval_ms: u64,
-        #[arg(long, default_value_t = 2000)]
-        handshake_timeout_ms: u64,
-    },
-    NatHolePunchLoopbackTest {
-        #[arg(long, default_value = "room_test")]
-        room_id: String,
-        #[arg(long, default_value = "peer_a")]
-        peer_a: String,
-        #[arg(long, default_value = "peer_b")]
-        peer_b: String,
-        #[arg(long, default_value_t = 4)]
-        attempts: u16,
-        #[arg(long, default_value_t = 25)]
-        interval_ms: u64,
-        #[arg(long, default_value = "nat-punch")]
-        message: String,
-    },
-    StunLikeServe {
-        #[arg(long, default_value = "0.0.0.0:39120")]
-        bind: String,
-        #[arg(long, default_value_t = 0)]
-        max_requests: u32,
-        #[arg(long, default_value_t = 30000)]
-        timeout_ms: u64,
-    },
-    StunLikeQuery {
-        #[arg(long, default_value = "0.0.0.0:0")]
-        bind: String,
-        #[arg(long)]
-        server: String,
-        #[arg(long, default_value_t = 1000)]
-        timeout_ms: u64,
-    },
-    CoordinationStoreInit {
-        #[arg(long)]
-        out: String,
-    },
-    CoordinationOfferPublish {
-        #[arg(long)]
-        store: String,
-        #[arg(long)]
-        offer: String,
-        #[arg(long, default_value_t = 30000)]
-        ttl_ms: u128,
-    },
-    CoordinationOfferFetch {
-        #[arg(long)]
-        store: String,
-        #[arg(long)]
-        room_id: String,
-        #[arg(long)]
-        peer_id: String,
-    },
-    CoordinationHeartbeat {
-        #[arg(long)]
-        store: String,
-        #[arg(long)]
-        room_id: String,
-        #[arg(long)]
-        peer_id: String,
-        #[arg(long, default_value_t = 30000)]
-        ttl_ms: u128,
-    },
-    CoordinationLeave {
-        #[arg(long)]
-        store: String,
-        #[arg(long)]
-        room_id: String,
-        #[arg(long)]
-        peer_id: String,
-    },
-    CoordinationKick {
-        #[arg(long)]
-        store: String,
-        #[arg(long)]
-        room_id: String,
-        #[arg(long)]
-        peer_id: String,
-        #[arg(long)]
-        kicked_by: String,
-    },
-    CoordinationClose {
-        #[arg(long)]
-        store: String,
-        #[arg(long)]
-        room_id: String,
-        #[arg(long)]
-        closed_by: Option<String>,
-    },
-    CoordinationRoomView {
-        #[arg(long)]
-        store: String,
-        #[arg(long)]
-        room_id: String,
-        #[arg(long)]
-        peer_id: String,
-        #[arg(long)]
-        subnet: String,
-    },
-    CoordinationPrune {
-        #[arg(long)]
-        store: String,
-    },
-    CoordinationHttpServe {
-        #[arg(long, default_value = "127.0.0.1:39110")]
-        bind: String,
-        #[arg(long)]
-        store: String,
-        #[arg(long, default_value_t = 0)]
-        max_requests: u32,
-        #[arg(long, default_value_t = 30000)]
-        request_timeout_ms: u64,
-    },
-    CoordinationHttpOfferPublish {
-        #[arg(long)]
-        server: String,
-        #[arg(long)]
-        offer: String,
-        #[arg(long, default_value_t = 30000)]
-        ttl_ms: u128,
-    },
-    CoordinationHttpOfferFetch {
-        #[arg(long)]
-        server: String,
-        #[arg(long)]
-        room_id: String,
-        #[arg(long)]
-        peer_id: String,
-    },
-    CoordinationHttpHeartbeat {
-        #[arg(long)]
-        server: String,
-        #[arg(long)]
-        room_id: String,
-        #[arg(long)]
-        peer_id: String,
-        #[arg(long, default_value_t = 30000)]
-        ttl_ms: u128,
-    },
-    CoordinationHttpLeave {
-        #[arg(long)]
-        server: String,
-        #[arg(long)]
-        room_id: String,
-        #[arg(long)]
-        peer_id: String,
-    },
-    CoordinationHttpKick {
-        #[arg(long)]
-        server: String,
-        #[arg(long)]
-        room_id: String,
-        #[arg(long)]
-        peer_id: String,
-        #[arg(long)]
-        kicked_by: String,
-    },
-    CoordinationHttpClose {
-        #[arg(long)]
-        server: String,
-        #[arg(long)]
-        room_id: String,
-        #[arg(long)]
-        closed_by: Option<String>,
-    },
-    CoordinationHttpPrune {
-        #[arg(long)]
-        server: String,
-    },
-    UdpForward {
-        #[arg(long, default_value = "0.0.0.0:39078")]
-        listen: String,
-        #[arg(long)]
-        forward: String,
-        #[arg(long, default_value_t = 64)]
-        max_packets: u16,
-        #[arg(long, default_value_t = 30000)]
-        timeout_ms: u64,
-        #[arg(long)]
-        observe_file: Option<String>,
-        #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
-        broadcast: bool,
-    },
-    UdpForwardLoopbackTest {
-        #[arg(long, default_value = "hello")]
-        message: String,
-        #[arg(long)]
-        observe_file: Option<String>,
-    },
-    UdpCapture {
-        #[arg(long, default_value = "0.0.0.0:39077")]
-        listen: String,
-        #[arg(long, default_value_t = 64)]
-        max_packets: u16,
-        #[arg(long, default_value_t = 30000)]
-        timeout_ms: u64,
-        #[arg(long)]
-        observe_file: Option<String>,
-        #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
-        broadcast: bool,
-    },
-    UdpCaptureLoopbackTest {
-        #[arg(long, default_value = "hello")]
-        message: String,
-        #[arg(long)]
-        observe_file: Option<String>,
-    },
-    UdpLoopbackTest {
-        #[arg(long, default_value_t = 39077)]
-        port: u16,
-        #[arg(long, default_value = "ping")]
-        message: String,
-        #[arg(long, default_value_t = 3000)]
-        timeout_ms: u64,
-        #[arg(long)]
-        observe_file: Option<String>,
-    },
-    UdpBroadcastTest {
-        #[arg(long, default_value_t = 39078)]
-        port: u16,
-        #[arg(long, default_value = "discover")]
-        message: String,
-        #[arg(long, default_value_t = 3000)]
-        timeout_ms: u64,
-        #[arg(long)]
-        observe_file: Option<String>,
-    },
-    TcpLoopbackTest {
-        #[arg(long, default_value_t = 39079)]
-        port: u16,
-        #[arg(long, default_value = "ping")]
-        message: String,
-        #[arg(long, default_value_t = 3000)]
-        timeout_ms: u64,
-        #[arg(long)]
-        observe_file: Option<String>,
-    },
-    NetworkObserve {
-        #[arg(long)]
-        adapter_name: Option<String>,
-        #[arg(long, default_value_t = true)]
-        adapter_enabled: bool,
-        #[arg(long)]
-        expected_ip: Option<String>,
-        #[arg(long)]
-        assigned_ip: Option<String>,
-        #[arg(long)]
-        subnet: Option<String>,
-        #[arg(long)]
-        adapter_netsh_output: Option<String>,
-        #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
-        adapter_scan: bool,
-        #[arg(long, default_value = "connected")]
-        tunnel_state: String,
-        #[arg(long, default_value_t = 0)]
-        connected_peers: u16,
-        #[arg(long, default_value_t = 0)]
-        expected_peers: u16,
-        #[arg(long)]
-        latency_ms: Option<u32>,
-        #[arg(long)]
-        packet_loss_percent: Option<f32>,
-        #[arg(long)]
-        connection_path: Option<String>,
-        #[arg(long)]
-        ping_test: Option<String>,
-        #[arg(long)]
-        ping_output: Option<String>,
-        #[arg(long, default_value = "")]
-        broadcast_ports: String,
-        #[arg(long, default_value = "")]
-        game_ports: String,
-        #[arg(long, default_value = "")]
-        packets: String,
-        #[arg(long)]
-        packet_observations: Option<String>,
-        #[arg(long)]
-        route_output: Option<String>,
-        #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
-        route_scan: bool,
-    },
-    DiagnosticExport {
-        #[arg(long)]
-        out: String,
-        #[arg(long, default_value = "LocalAreaInterconnection")]
-        adapter_name: String,
-        #[arg(long)]
-        expected_ip: Option<String>,
-        #[arg(long)]
-        assigned_ip: Option<String>,
-        #[arg(long)]
-        subnet: Option<String>,
-        #[arg(long)]
-        adapter_netsh_output: Option<String>,
-        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
-        adapter_scan: bool,
-        #[arg(long)]
-        firewall_netsh_output: Option<String>,
-        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
-        firewall_scan: bool,
-        #[arg(long)]
-        ping_test: Option<String>,
-        #[arg(long)]
-        ping_output: Option<String>,
-        #[arg(long, default_value_t = 0)]
-        expected_peers: u16,
-        #[arg(long, default_value = "")]
-        broadcast_ports: String,
-        #[arg(long, default_value = "")]
-        game_ports: String,
-        #[arg(long, default_value = "")]
-        packets: String,
-        #[arg(long)]
-        packet_observations: Option<String>,
-        #[arg(long)]
-        runtime_snapshot: Option<String>,
-        #[arg(long)]
-        route_output: Option<String>,
-        #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
-        route_scan: bool,
-        #[arg(long)]
-        netstat_output: Option<String>,
-        #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
-        netstat_scan: bool,
-        #[arg(long, default_value = "Generic LAN Game")]
-        game_name: String,
-        #[arg(long)]
-        catalog: Option<String>,
-        #[arg(long)]
-        steam_app_id: Option<String>,
-        #[arg(long, default_value = "manual_ports")]
-        discovery: String,
-        #[arg(long, default_value = "")]
-        ports: String,
-        #[arg(long, default_value = "unknown")]
-        compatibility: String,
-        #[arg(long)]
-        program: Option<String>,
-        #[arg(long, default_value = "userspace-udp")]
-        packet_io_backend: String,
-        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
-        packet_io_probe: bool,
-        #[arg(long, default_value_t = 128 * 1024)]
-        wintun_ring_capacity: u32,
-        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
-        wintun_probe_receive: bool,
-        #[arg(long, default_value_t = 8)]
-        wintun_receive_attempts: u32,
-        #[arg(long, default_value_t = 25)]
-        wintun_receive_poll_interval_ms: u64,
-        #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
-        wintun_probe_send: bool,
-        #[arg(long)]
-        relay_local_offer: Option<String>,
-        #[arg(long)]
-        relay_remote_offer: Option<String>,
-        #[arg(long, default_value = "failed")]
-        relay_p2p_status: String,
-    },
-    WintunDetect,
-    WintunAdapterCreate {
-        #[arg(long, default_value = "LocalAreaInterconnection")]
-        adapter_name: String,
-        #[arg(long, default_value = "LocalAreaInterconnection")]
-        tunnel_type: String,
-        #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
-        yes: bool,
-    },
-    WintunAdapterDelete {
-        #[arg(long, default_value = "LocalAreaInterconnection")]
-        adapter_name: String,
-        #[arg(long, default_value = "LocalAreaInterconnection")]
-        tunnel_type: String,
-        #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
-        force_close_sessions: bool,
-        #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
-        yes: bool,
-    },
-    WintunAdapterOpen {
-        #[arg(long, default_value = "LocalAreaInterconnection")]
-        adapter_name: String,
-        #[arg(long, default_value = "LocalAreaInterconnection")]
-        tunnel_type: String,
-    },
-    WintunSessionProbe {
-        #[arg(long, default_value = "LocalAreaInterconnection")]
-        adapter_name: String,
-        #[arg(long, default_value = "LocalAreaInterconnection")]
-        tunnel_type: String,
-        #[arg(long, default_value_t = 128 * 1024)]
-        ring_capacity: u32,
-    },
-    WintunPacketSendProbe {
-        #[arg(long, default_value = "LocalAreaInterconnection")]
-        adapter_name: String,
-        #[arg(long, default_value_t = 128 * 1024)]
-        ring_capacity: u32,
-        #[arg(long, default_value = "10.77.12.2")]
-        source_ip: String,
-        #[arg(long, default_value = "10.77.12.255")]
-        destination_ip: String,
-        #[arg(long, default_value_t = 39077)]
-        source_port: u16,
-        #[arg(long, default_value_t = 27015)]
-        destination_port: u16,
-        #[arg(long, default_value = "wintun-probe")]
-        message: String,
-        #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
-        broadcast: bool,
-        #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
-        yes: bool,
-    },
-    WintunPacketReceiveProbe {
-        #[arg(long, default_value = "LocalAreaInterconnection")]
-        adapter_name: String,
-        #[arg(long, default_value_t = 128 * 1024)]
-        ring_capacity: u32,
-        #[arg(long, default_value_t = 8)]
-        max_attempts: u32,
-        #[arg(long, default_value_t = 25)]
-        poll_interval_ms: u64,
-    },
 }
 
 fn main() {
@@ -1624,6 +567,12 @@ fn run_main() -> Result<(), Box<dyn std::error::Error>> {
             nat_bootstrap_attempts,
             nat_bootstrap_interval_ms,
             nat_bootstrap_timeout_ms,
+            nat_bootstrap_stun_server,
+            nat_bootstrap_stun_timeout_ms,
+            nat_bootstrap_upnp_port_map,
+            nat_bootstrap_upnp_timeout_ms,
+            nat_bootstrap_upnp_lease_seconds,
+            nat_bootstrap_upnp_gateway_location,
             stop_file,
             snapshot_interval_ms,
             coordination_monitor,
@@ -1651,6 +600,12 @@ fn run_main() -> Result<(), Box<dyn std::error::Error>> {
                 nat_bootstrap_attempts,
                 nat_bootstrap_interval_ms,
                 nat_bootstrap_timeout_ms,
+                nat_bootstrap_stun_server.as_deref(),
+                nat_bootstrap_stun_timeout_ms,
+                nat_bootstrap_upnp_port_map,
+                nat_bootstrap_upnp_timeout_ms,
+                nat_bootstrap_upnp_lease_seconds,
+                nat_bootstrap_upnp_gateway_location.as_deref(),
             )?;
             runtime_peers.append(&mut bootstrapped_peers);
             let (mut coordination_bootstrapped_peers, mut coordination_bootstrap_results) =
@@ -1668,6 +623,12 @@ fn run_main() -> Result<(), Box<dyn std::error::Error>> {
                         nat_bootstrap_attempts,
                         nat_bootstrap_interval_ms,
                         nat_bootstrap_timeout_ms,
+                        nat_bootstrap_stun_server.as_deref(),
+                        nat_bootstrap_stun_timeout_ms,
+                        nat_bootstrap_upnp_port_map,
+                        nat_bootstrap_upnp_timeout_ms,
+                        nat_bootstrap_upnp_lease_seconds,
+                        nat_bootstrap_upnp_gateway_location.as_deref(),
                     )?
                 };
             runtime_peers.append(&mut coordination_bootstrapped_peers);
@@ -1686,6 +647,12 @@ fn run_main() -> Result<(), Box<dyn std::error::Error>> {
                         nat_bootstrap_attempts,
                         nat_bootstrap_interval_ms,
                         nat_bootstrap_timeout_ms,
+                        nat_bootstrap_stun_server.as_deref(),
+                        nat_bootstrap_stun_timeout_ms,
+                        nat_bootstrap_upnp_port_map,
+                        nat_bootstrap_upnp_timeout_ms,
+                        nat_bootstrap_upnp_lease_seconds,
+                        nat_bootstrap_upnp_gateway_location.as_deref(),
                     )?
                 };
             runtime_peers.append(&mut coordination_server_peers);
@@ -2315,11 +1282,16 @@ fn run_main() -> Result<(), Box<dyn std::error::Error>> {
         Command::NatCandidates {
             room_id,
             peer_id,
+            virtual_ip,
             bind,
             observed_endpoint,
             stun_server,
             stun_timeout_ms,
             relay_endpoints,
+            upnp_port_map,
+            upnp_timeout_ms,
+            upnp_lease_seconds,
+            upnp_gateway_location,
             nonce,
         } => {
             let socket = UdpSocket::bind(&bind)?;
@@ -2328,17 +1300,11 @@ fn run_main() -> Result<(), Box<dyn std::error::Error>> {
                 .as_deref()
                 .map(str::parse::<SocketAddr>)
                 .transpose()?;
-            let observed_endpoint = resolve_observed_endpoint(
-                &socket,
-                observed_endpoint,
-                stun_server.as_deref(),
-                stun_timeout_ms,
-            )?;
             let relay_endpoints = relay_endpoints
                 .iter()
                 .map(|endpoint| endpoint.parse::<SocketAddr>())
                 .collect::<Result<Vec<_>, _>>()?;
-            let offer = lai_core::create_nat_traversal_offer(
+            let mut offer = lai_core::create_nat_traversal_offer(
                 &room_id,
                 &peer_id,
                 nonce.unwrap_or_else(random_nonce),
@@ -2347,6 +1313,28 @@ fn run_main() -> Result<(), Box<dyn std::error::Error>> {
                 observed_endpoint,
                 relay_endpoints,
             );
+            offer.virtual_ip = virtual_ip
+                .as_deref()
+                .map(str::parse::<Ipv4Addr>)
+                .transpose()?;
+            enrich_offer_with_local_host_candidates(&mut offer, &socket)?;
+            let stun_mapping = apply_stun_mapping_candidates_to_offer(
+                &mut offer,
+                &socket,
+                stun_server.as_deref(),
+                stun_timeout_ms,
+            );
+            let upnp_mapping = if upnp_port_map {
+                apply_upnp_port_mapping_to_offer(
+                    &mut offer,
+                    &socket,
+                    upnp_timeout_ms,
+                    upnp_lease_seconds,
+                    upnp_gateway_location.as_deref(),
+                )
+            } else {
+                UpnpPortMappingReport::disabled()
+            };
             let message = lai_core::create_coordination_message(
                 "candidate-offer",
                 room_id,
@@ -2361,6 +1349,8 @@ fn run_main() -> Result<(), Box<dyn std::error::Error>> {
                     "status": "ok",
                     "offer": offer,
                     "coordinationMessage": message,
+                    "stunMapping": stun_mapping,
+                    "upnpPortMapping": upnp_mapping,
                 }))?
             );
         }
@@ -2404,6 +1394,10 @@ fn run_main() -> Result<(), Box<dyn std::error::Error>> {
             stun_server,
             stun_timeout_ms,
             relay_endpoints,
+            upnp_port_map,
+            upnp_timeout_ms,
+            upnp_lease_seconds,
+            upnp_gateway_location,
             attempts,
             interval_ms,
             receive_timeout_ms,
@@ -2426,6 +1420,10 @@ fn run_main() -> Result<(), Box<dyn std::error::Error>> {
                 observed_endpoint,
                 stun_server.as_deref(),
                 stun_timeout_ms,
+                upnp_port_map,
+                upnp_timeout_ms,
+                upnp_lease_seconds,
+                upnp_gateway_location.as_deref(),
                 relay_endpoints,
                 attempts,
                 interval_ms,
@@ -2445,6 +1443,10 @@ fn run_main() -> Result<(), Box<dyn std::error::Error>> {
             stun_server,
             stun_timeout_ms,
             relay_endpoints,
+            upnp_port_map,
+            upnp_timeout_ms,
+            upnp_lease_seconds,
+            upnp_gateway_location,
             punch_attempts,
             punch_interval_ms,
             handshake_timeout_ms,
@@ -2468,6 +1470,10 @@ fn run_main() -> Result<(), Box<dyn std::error::Error>> {
                 observed_endpoint,
                 stun_server.as_deref(),
                 stun_timeout_ms,
+                upnp_port_map,
+                upnp_timeout_ms,
+                upnp_lease_seconds,
+                upnp_gateway_location.as_deref(),
                 relay_endpoints,
                 punch_attempts,
                 punch_interval_ms,
@@ -2670,6 +1676,20 @@ fn run_main() -> Result<(), Box<dyn std::error::Error>> {
             peer_id,
         } => {
             let result = coordination_http_fetch_offers(&server, &room_id, &peer_id)?;
+            println!("{}", serde_json::to_string_pretty(&result)?);
+        }
+        Command::CoordinationHttpRoomView {
+            server,
+            room_id,
+            peer_id,
+            subnet,
+        } => {
+            let result = coordination_http_room_view(
+                &server,
+                &room_id,
+                &peer_id,
+                subnet.parse::<Ipv4Subnet>()?,
+            )?;
             println!("{}", serde_json::to_string_pretty(&result)?);
         }
         Command::CoordinationHttpHeartbeat {
@@ -3401,6 +2421,12 @@ fn run_runtime_nat_bootstraps(
     attempts: u16,
     interval_ms: u64,
     timeout_ms: u64,
+    stun_server: Option<&str>,
+    stun_timeout_ms: u64,
+    upnp_port_map: bool,
+    upnp_timeout_ms: u64,
+    upnp_lease_seconds: u32,
+    upnp_gateway_location: Option<&str>,
 ) -> Result<(Vec<RoomRuntimePeer>, Vec<serde_json::Value>), Box<dyn std::error::Error>> {
     let mut peers = Vec::new();
     let mut results = Vec::new();
@@ -3427,8 +2453,12 @@ fn run_runtime_nat_bootstraps(
             bind,
             &remote_offer,
             None,
-            None,
-            0,
+            stun_server,
+            stun_timeout_ms,
+            upnp_port_map,
+            upnp_timeout_ms,
+            upnp_lease_seconds,
+            upnp_gateway_location,
             Vec::new(),
             attempts,
             interval_ms,
@@ -3455,6 +2485,12 @@ fn run_runtime_coordination_bootstraps(
     attempts: u16,
     interval_ms: u64,
     timeout_ms: u64,
+    stun_server: Option<&str>,
+    stun_timeout_ms: u64,
+    upnp_port_map: bool,
+    upnp_timeout_ms: u64,
+    upnp_lease_seconds: u32,
+    upnp_gateway_location: Option<&str>,
 ) -> Result<(Vec<RoomRuntimePeer>, Vec<serde_json::Value>), Box<dyn std::error::Error>> {
     let Some(store_path) = store_path else {
         return Ok((Vec::new(), Vec::new()));
@@ -3495,8 +2531,12 @@ fn run_runtime_coordination_bootstraps(
             bind,
             offer,
             None,
-            None,
-            0,
+            stun_server,
+            stun_timeout_ms,
+            upnp_port_map,
+            upnp_timeout_ms,
+            upnp_lease_seconds,
+            upnp_gateway_location,
             Vec::new(),
             attempts,
             interval_ms,
@@ -3554,6 +2594,12 @@ fn run_runtime_coordination_server_bootstraps(
     attempts: u16,
     interval_ms: u64,
     timeout_ms: u64,
+    stun_server: Option<&str>,
+    stun_timeout_ms: u64,
+    upnp_port_map: bool,
+    upnp_timeout_ms: u64,
+    upnp_lease_seconds: u32,
+    upnp_gateway_location: Option<&str>,
 ) -> Result<(Vec<RoomRuntimePeer>, Vec<serde_json::Value>), Box<dyn std::error::Error>> {
     let Some(server) = server else {
         return Ok((Vec::new(), Vec::new()));
@@ -3588,8 +2634,12 @@ fn run_runtime_coordination_server_bootstraps(
             bind,
             offer,
             None,
-            None,
-            0,
+            stun_server,
+            stun_timeout_ms,
+            upnp_port_map,
+            upnp_timeout_ms,
+            upnp_lease_seconds,
+            upnp_gateway_location,
             Vec::new(),
             attempts,
             interval_ms,
@@ -3636,595 +2686,6 @@ fn run_runtime_coordination_server_bootstraps(
     Ok((peers, bootstrap_results))
 }
 
-fn run_coordination_http_server(
-    bind: &str,
-    store_path: &str,
-    max_requests: u32,
-    request_timeout_ms: u64,
-) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
-    let listener = TcpListener::bind(bind)?;
-    let bound_addr = listener.local_addr()?;
-    let mut store = load_coordination_store_or_default(store_path)?;
-    let mut handled_requests = 0u32;
-
-    while max_requests == 0 || handled_requests < max_requests {
-        let (mut stream, remote_addr) = listener.accept()?;
-        stream.set_read_timeout(Some(Duration::from_millis(request_timeout_ms)))?;
-        stream.set_write_timeout(Some(Duration::from_millis(request_timeout_ms)))?;
-        let request_result = read_http_request(&mut stream);
-        let response = match request_result {
-            Ok(request) => handle_coordination_http_request(request, &mut store, store_path),
-            Err(err) => Ok((
-                400,
-                serde_json::json!({
-                    "status": "error",
-                    "error": err.to_string(),
-                }),
-            )),
-        };
-        let (status_code, body) = match response {
-            Ok(response) => response,
-            Err(err) => (
-                500,
-                serde_json::json!({
-                    "status": "error",
-                    "error": err.to_string(),
-                }),
-            ),
-        };
-        write_http_json_response(&mut stream, status_code, &body)?;
-        handled_requests = handled_requests.saturating_add(1);
-        let _ = remote_addr;
-    }
-
-    Ok(serde_json::json!({
-        "status": "ok",
-        "bind": bound_addr.to_string(),
-        "store": store_path,
-        "handledRequests": handled_requests,
-    }))
-}
-
-fn handle_coordination_http_request(
-    request: HttpRequest,
-    store: &mut lai_core::CoordinationStore,
-    store_path: &str,
-) -> Result<(u16, serde_json::Value), Box<dyn std::error::Error>> {
-    let path_segments = request
-        .path
-        .trim_matches('/')
-        .split('/')
-        .filter(|segment| !segment.is_empty())
-        .map(percent_decode)
-        .collect::<Result<Vec<_>, _>>()?;
-    let path_segments = path_segments.iter().map(String::as_str).collect::<Vec<_>>();
-
-    if request.method == "GET" && request.path == "/health" {
-        return Ok((
-            200,
-            serde_json::json!({
-                "status": "ok",
-                "schemaVersion": store.schema_version,
-            }),
-        ));
-    }
-
-    match (request.method.as_str(), path_segments.as_slice()) {
-        ("POST", ["v1", "offers"]) => {
-            let body: serde_json::Value = serde_json::from_slice(&request.body)?;
-            let offer_value = body
-                .get("offer")
-                .ok_or_else(|| invalid_input("missing JSON field `offer`".to_owned()))?
-                .clone();
-            let offer: lai_core::NatTraversalOffer = serde_json::from_value(offer_value)?;
-            let ttl_ms = body
-                .get("ttlMs")
-                .or_else(|| body.get("ttl_ms"))
-                .and_then(serde_json::Value::as_u64)
-                .map(u128::from)
-                .unwrap_or(30_000);
-            let update =
-                lai_core::publish_coordination_offer(store, offer, current_epoch_ms(), ttl_ms);
-            write_json_file(store_path, store)?;
-            Ok((200, serde_json::to_value(update)?))
-        }
-        ("GET", ["v1", "rooms", room_id, "offers"]) => {
-            let peer_id = query_value(&request.query, "peer_id")
-                .or_else(|| query_value(&request.query, "peerId"))
-                .ok_or_else(|| invalid_input("missing query parameter `peer_id`".to_owned()))?;
-            let result = lai_core::fetch_coordination_offers(
-                store,
-                room_id.to_owned(),
-                peer_id,
-                current_epoch_ms(),
-            );
-            write_json_file(store_path, store)?;
-            Ok((200, serde_json::to_value(result)?))
-        }
-        ("GET", ["v1", "rooms", room_id, "view"]) => {
-            let peer_id = query_value(&request.query, "peer_id")
-                .or_else(|| query_value(&request.query, "peerId"))
-                .ok_or_else(|| invalid_input("missing query parameter `peer_id`".to_owned()))?;
-            let subnet = query_value(&request.query, "subnet")
-                .ok_or_else(|| invalid_input("missing query parameter `subnet`".to_owned()))?
-                .parse::<Ipv4Subnet>()?;
-            let view = lai_core::coordination_room_view(
-                store,
-                room_id.to_owned(),
-                peer_id,
-                subnet,
-                current_epoch_ms(),
-            );
-            Ok((200, serde_json::to_value(view)?))
-        }
-        ("POST", ["v1", "rooms", room_id, "peers", peer_id, "heartbeat"]) => {
-            let body = if request.body.is_empty() {
-                serde_json::json!({})
-            } else {
-                serde_json::from_slice::<serde_json::Value>(&request.body)?
-            };
-            let ttl_ms = body
-                .get("ttlMs")
-                .or_else(|| body.get("ttl_ms"))
-                .and_then(serde_json::Value::as_u64)
-                .map(u128::from)
-                .unwrap_or(30_000);
-            let update = lai_core::heartbeat_coordination_peer(
-                store,
-                room_id.to_owned(),
-                peer_id.to_owned(),
-                current_epoch_ms(),
-                ttl_ms,
-            );
-            write_json_file(store_path, store)?;
-            Ok((200, serde_json::to_value(update)?))
-        }
-        ("POST", ["v1", "rooms", room_id, "peers", peer_id, "leave"]) => {
-            let report = lai_core::leave_coordination_room(
-                store,
-                room_id.to_owned(),
-                peer_id.to_owned(),
-                current_epoch_ms(),
-            );
-            write_json_file(store_path, store)?;
-            Ok((200, serde_json::to_value(report)?))
-        }
-        ("POST", ["v1", "rooms", room_id, "peers", peer_id, "kick"]) => {
-            let body = if request.body.is_empty() {
-                serde_json::json!({})
-            } else {
-                serde_json::from_slice::<serde_json::Value>(&request.body)?
-            };
-            let kicked_by = body
-                .get("kickedBy")
-                .or_else(|| body.get("kicked_by"))
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("unknown");
-            let report = lai_core::kick_coordination_peer(
-                store,
-                room_id.to_owned(),
-                peer_id.to_owned(),
-                kicked_by.to_owned(),
-                current_epoch_ms(),
-            );
-            write_json_file(store_path, store)?;
-            Ok((200, serde_json::to_value(report)?))
-        }
-        ("POST", ["v1", "rooms", room_id, "close"]) => {
-            let body = if request.body.is_empty() {
-                serde_json::json!({})
-            } else {
-                serde_json::from_slice::<serde_json::Value>(&request.body)?
-            };
-            let closed_by = body
-                .get("closedBy")
-                .or_else(|| body.get("closed_by"))
-                .and_then(serde_json::Value::as_str);
-            let report = if let Some(closed_by) = closed_by {
-                lai_core::close_coordination_room_by_peer(
-                    store,
-                    room_id.to_owned(),
-                    closed_by.to_owned(),
-                )
-            } else {
-                lai_core::close_coordination_room(store, room_id.to_owned())
-            };
-            write_json_file(store_path, store)?;
-            Ok((200, serde_json::to_value(report)?))
-        }
-        ("POST", ["v1", "prune"]) => {
-            let report = lai_core::prune_expired_coordination_peers(store, current_epoch_ms());
-            write_json_file(store_path, store)?;
-            Ok((200, serde_json::to_value(report)?))
-        }
-        _ => Ok((
-            404,
-            serde_json::json!({
-                "status": "error",
-                "error": "not found",
-                "method": request.method,
-                "path": request.path,
-            }),
-        )),
-    }
-}
-
-struct HttpRequest {
-    method: String,
-    path: String,
-    query: String,
-    body: Vec<u8>,
-}
-
-fn read_http_request(stream: &mut TcpStream) -> Result<HttpRequest, Box<dyn std::error::Error>> {
-    let mut bytes = Vec::new();
-    let mut buffer = [0u8; 1024];
-    let (header_end, content_length) = loop {
-        let read = stream.read(&mut buffer)?;
-        if read == 0 {
-            return Err(invalid_input(
-                "connection closed before HTTP headers".to_owned(),
-            ));
-        }
-        bytes.extend_from_slice(&buffer[..read]);
-        if bytes.len() > 1024 * 1024 {
-            return Err(invalid_input("HTTP request too large".to_owned()));
-        }
-        if let Some(header_end) = find_header_end(&bytes) {
-            let headers = String::from_utf8_lossy(&bytes[..header_end]).to_string();
-            let content_length = parse_content_length(&headers)?;
-            break (header_end, content_length);
-        }
-    };
-    let body_start = header_end + 4;
-    while bytes.len() < body_start.saturating_add(content_length) {
-        let read = stream.read(&mut buffer)?;
-        if read == 0 {
-            break;
-        }
-        bytes.extend_from_slice(&buffer[..read]);
-    }
-    if bytes.len() < body_start.saturating_add(content_length) {
-        return Err(invalid_input(
-            "HTTP body shorter than Content-Length".to_owned(),
-        ));
-    }
-
-    let headers = String::from_utf8_lossy(&bytes[..header_end]).to_string();
-    let request_line = headers
-        .lines()
-        .next()
-        .ok_or_else(|| invalid_input("missing HTTP request line".to_owned()))?;
-    let mut request_parts = request_line.split_whitespace();
-    let method = request_parts
-        .next()
-        .ok_or_else(|| invalid_input("missing HTTP method".to_owned()))?
-        .to_owned();
-    let target = request_parts
-        .next()
-        .ok_or_else(|| invalid_input("missing HTTP target".to_owned()))?;
-    let (path, query) = split_path_query(target);
-    let body = bytes[body_start..body_start + content_length].to_vec();
-
-    Ok(HttpRequest {
-        method,
-        path,
-        query,
-        body,
-    })
-}
-
-fn write_http_json_response(
-    stream: &mut TcpStream,
-    status_code: u16,
-    body: &serde_json::Value,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let body_text = serde_json::to_string(body)?;
-    let status_text = match status_code {
-        200 => "OK",
-        400 => "Bad Request",
-        404 => "Not Found",
-        _ => "Internal Server Error",
-    };
-    let response = format!(
-        "HTTP/1.1 {status_code} {status_text}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-        body_text.as_bytes().len(),
-        body_text
-    );
-    stream.write_all(response.as_bytes())?;
-    stream.flush()?;
-    Ok(())
-}
-
-fn coordination_http_publish_offer(
-    server: &str,
-    offer: &lai_core::NatTraversalOffer,
-    ttl_ms: u128,
-) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
-    http_post_json(
-        &format!("{}/v1/offers", trim_trailing_slash(server)),
-        &serde_json::json!({
-            "offer": offer,
-            "ttlMs": ttl_ms,
-        }),
-    )
-}
-
-fn coordination_http_fetch_offers(
-    server: &str,
-    room_id: &str,
-    peer_id: &str,
-) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
-    http_get_json(&format!(
-        "{}/v1/rooms/{}/offers?peer_id={}",
-        trim_trailing_slash(server),
-        percent_encode(room_id),
-        percent_encode(peer_id)
-    ))
-}
-
-fn coordination_http_room_view(
-    server: &str,
-    room_id: &str,
-    peer_id: &str,
-    subnet: Ipv4Subnet,
-) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
-    http_get_json(&format!(
-        "{}/v1/rooms/{}/view?peer_id={}&subnet={}",
-        trim_trailing_slash(server),
-        percent_encode(room_id),
-        percent_encode(peer_id),
-        percent_encode(&subnet.to_string())
-    ))
-}
-
-fn coordination_http_heartbeat(
-    server: &str,
-    room_id: &str,
-    peer_id: &str,
-    ttl_ms: u128,
-) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
-    http_post_json(
-        &format!(
-            "{}/v1/rooms/{}/peers/{}/heartbeat",
-            trim_trailing_slash(server),
-            percent_encode(room_id),
-            percent_encode(peer_id)
-        ),
-        &serde_json::json!({ "ttlMs": ttl_ms }),
-    )
-}
-
-fn coordination_http_leave(
-    server: &str,
-    room_id: &str,
-    peer_id: &str,
-) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
-    http_post_json(
-        &format!(
-            "{}/v1/rooms/{}/peers/{}/leave",
-            trim_trailing_slash(server),
-            percent_encode(room_id),
-            percent_encode(peer_id)
-        ),
-        &serde_json::json!({}),
-    )
-}
-
-fn coordination_http_kick(
-    server: &str,
-    room_id: &str,
-    peer_id: &str,
-    kicked_by: &str,
-) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
-    http_post_json(
-        &format!(
-            "{}/v1/rooms/{}/peers/{}/kick",
-            trim_trailing_slash(server),
-            percent_encode(room_id),
-            percent_encode(peer_id)
-        ),
-        &serde_json::json!({ "kickedBy": kicked_by }),
-    )
-}
-
-fn coordination_http_close(
-    server: &str,
-    room_id: &str,
-    closed_by: Option<&str>,
-) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
-    let body = closed_by
-        .map(|closed_by| serde_json::json!({ "closedBy": closed_by }))
-        .unwrap_or_else(|| serde_json::json!({}));
-    http_post_json(
-        &format!(
-            "{}/v1/rooms/{}/close",
-            trim_trailing_slash(server),
-            percent_encode(room_id)
-        ),
-        &body,
-    )
-}
-
-fn coordination_http_prune(server: &str) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
-    http_post_json(
-        &format!("{}/v1/prune", trim_trailing_slash(server)),
-        &serde_json::json!({}),
-    )
-}
-
-fn http_get_json(url: &str) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
-    send_http_json_request("GET", url, None)
-}
-
-fn http_post_json(
-    url: &str,
-    body: &serde_json::Value,
-) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
-    send_http_json_request("POST", url, Some(&serde_json::to_string(body)?))
-}
-
-fn send_http_json_request(
-    method: &str,
-    url: &str,
-    body: Option<&str>,
-) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
-    let parsed = parse_http_url(url)?;
-    let mut stream = TcpStream::connect((&parsed.host[..], parsed.port))?;
-    stream.set_read_timeout(Some(Duration::from_secs(30)))?;
-    stream.set_write_timeout(Some(Duration::from_secs(30)))?;
-    let body = body.unwrap_or("");
-    let request = format!(
-        "{method} {} HTTP/1.1\r\nHost: {}\r\nAccept: application/json\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-        parsed.path_and_query,
-        parsed.host_header,
-        body.as_bytes().len(),
-        body
-    );
-    stream.write_all(request.as_bytes())?;
-    stream.flush()?;
-    let mut response = Vec::new();
-    stream.read_to_end(&mut response)?;
-    parse_http_json_response(&response)
-}
-
-struct ParsedHttpUrl {
-    host: String,
-    port: u16,
-    host_header: String,
-    path_and_query: String,
-}
-
-fn parse_http_url(url: &str) -> Result<ParsedHttpUrl, Box<dyn std::error::Error>> {
-    let without_scheme = url
-        .strip_prefix("http://")
-        .ok_or_else(|| invalid_input("only http:// coordination URLs are supported".to_owned()))?;
-    let (authority, path_and_query) = match without_scheme.split_once('/') {
-        Some((authority, path)) => (authority, format!("/{path}")),
-        None => (without_scheme, "/".to_owned()),
-    };
-    if authority.is_empty() {
-        return Err(invalid_input("missing HTTP host".to_owned()));
-    }
-    let (host, port) = match authority.rsplit_once(':') {
-        Some((host, port)) => (host.to_owned(), port.parse::<u16>()?),
-        None => (authority.to_owned(), 80),
-    };
-    if host.is_empty() {
-        return Err(invalid_input("missing HTTP host".to_owned()));
-    }
-    Ok(ParsedHttpUrl {
-        host,
-        port,
-        host_header: authority.to_owned(),
-        path_and_query,
-    })
-}
-
-fn parse_http_json_response(
-    response: &[u8],
-) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
-    let header_end = find_header_end(response)
-        .ok_or_else(|| invalid_input("HTTP response missing header terminator".to_owned()))?;
-    let headers = String::from_utf8_lossy(&response[..header_end]).to_string();
-    let status_line = headers
-        .lines()
-        .next()
-        .ok_or_else(|| invalid_input("HTTP response missing status line".to_owned()))?;
-    let status_code = status_line
-        .split_whitespace()
-        .nth(1)
-        .ok_or_else(|| invalid_input("HTTP response missing status code".to_owned()))?
-        .parse::<u16>()?;
-    let body = &response[header_end + 4..];
-    let value = if body.is_empty() {
-        serde_json::json!({})
-    } else {
-        serde_json::from_slice::<serde_json::Value>(body)?
-    };
-    if !(200..300).contains(&status_code) {
-        return Err(invalid_input(format!(
-            "HTTP request failed with status {status_code}: {value}"
-        )));
-    }
-    Ok(value)
-}
-
-fn find_header_end(bytes: &[u8]) -> Option<usize> {
-    bytes.windows(4).position(|window| window == b"\r\n\r\n")
-}
-
-fn parse_content_length(headers: &str) -> Result<usize, Box<dyn std::error::Error>> {
-    for line in headers.lines().skip(1) {
-        let Some((name, value)) = line.split_once(':') else {
-            continue;
-        };
-        if name.trim().eq_ignore_ascii_case("content-length") {
-            return Ok(value.trim().parse::<usize>()?);
-        }
-    }
-    Ok(0)
-}
-
-fn split_path_query(target: &str) -> (String, String) {
-    match target.split_once('?') {
-        Some((path, query)) => (path.to_owned(), query.to_owned()),
-        None => (target.to_owned(), String::new()),
-    }
-}
-
-fn query_value(query: &str, name: &str) -> Option<String> {
-    query.split('&').find_map(|part| {
-        let (key, value) = part.split_once('=')?;
-        if key == name {
-            percent_decode(value).ok()
-        } else {
-            None
-        }
-    })
-}
-
-fn percent_encode(value: &str) -> String {
-    let mut encoded = String::new();
-    for byte in value.as_bytes() {
-        match *byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                encoded.push(*byte as char);
-            }
-            other => encoded.push_str(&format!("%{other:02X}")),
-        }
-    }
-    encoded
-}
-
-fn percent_decode(value: &str) -> Result<String, Box<dyn std::error::Error>> {
-    let bytes = value.as_bytes();
-    let mut decoded = Vec::with_capacity(bytes.len());
-    let mut index = 0usize;
-    while index < bytes.len() {
-        match bytes[index] {
-            b'%' if index + 2 < bytes.len() => {
-                let hex = std::str::from_utf8(&bytes[index + 1..index + 3])?;
-                decoded.push(u8::from_str_radix(hex, 16)?);
-                index += 3;
-            }
-            b'+' => {
-                decoded.push(b' ');
-                index += 1;
-            }
-            byte => {
-                decoded.push(byte);
-                index += 1;
-            }
-        }
-    }
-    Ok(String::from_utf8(decoded)?)
-}
-
-fn trim_trailing_slash(value: &str) -> &str {
-    value.trim_end_matches('/')
-}
-
 fn parse_coordination_peer_specs(
     values: &[String],
 ) -> Result<Vec<(String, Ipv4Addr)>, Box<dyn std::error::Error>> {
@@ -4259,16 +2720,6 @@ fn load_json_argument(value: &str) -> Result<serde_json::Value, Box<dyn std::err
         value.to_owned()
     };
     Ok(serde_json::from_str(text.trim_start_matches('\u{feff}'))?)
-}
-
-fn load_coordination_store_or_default(
-    path: &str,
-) -> Result<lai_core::CoordinationStore, Box<dyn std::error::Error>> {
-    match fs::read_to_string(path) {
-        Ok(text) => Ok(serde_json::from_str(&text)?),
-        Err(err) if err.kind() == ErrorKind::NotFound => Ok(lai_core::create_coordination_store()),
-        Err(err) => Err(err.into()),
-    }
 }
 
 fn parse_discovery(value: &str) -> Result<DiscoveryMode, Box<dyn std::error::Error>> {
@@ -4655,8 +3106,56 @@ fn write_json_file<T: serde::Serialize>(
             fs::create_dir_all(parent)?;
         }
     }
-    fs::write(path, format!("{}\n", serde_json::to_string_pretty(value)?))?;
+    write_text_file_with_retry(
+        path,
+        &format!("{}\n", serde_json::to_string_pretty(value)?),
+        12,
+        Duration::from_millis(25),
+    )?;
     Ok(())
+}
+
+fn read_text_file_with_retry(
+    path: &str,
+    attempts: usize,
+    delay: Duration,
+) -> Result<String, std::io::Error> {
+    let mut last_error = None;
+    for attempt in 0..attempts.max(1) {
+        match fs::read_to_string(path) {
+            Ok(text) => return Ok(text),
+            Err(err) => {
+                if err.kind() == ErrorKind::NotFound || attempt + 1 >= attempts.max(1) {
+                    return Err(err);
+                }
+                last_error = Some(err);
+                std::thread::sleep(delay);
+            }
+        }
+    }
+    Err(last_error.unwrap_or_else(|| std::io::Error::new(ErrorKind::Other, "failed to read file")))
+}
+
+fn write_text_file_with_retry(
+    path: &str,
+    text: &str,
+    attempts: usize,
+    delay: Duration,
+) -> Result<(), std::io::Error> {
+    let mut last_error = None;
+    for attempt in 0..attempts.max(1) {
+        match fs::write(path, text) {
+            Ok(()) => return Ok(()),
+            Err(err) => {
+                if attempt + 1 >= attempts.max(1) {
+                    return Err(err);
+                }
+                last_error = Some(err);
+                std::thread::sleep(delay);
+            }
+        }
+    }
+    Err(last_error.unwrap_or_else(|| std::io::Error::new(ErrorKind::Other, "failed to write file")))
 }
 
 fn detect_windows_elevation() -> Option<bool> {
@@ -5610,225 +4109,6 @@ fn run_p2p_handshake_send(
     }))
 }
 
-fn load_nat_offer_argument(
-    value: &str,
-) -> Result<lai_core::NatTraversalOffer, Box<dyn std::error::Error>> {
-    let text = if Path::new(value).exists() {
-        let bytes = fs::read(value)?;
-        let bytes = bytes
-            .strip_prefix(&[0xef, 0xbb, 0xbf])
-            .unwrap_or(bytes.as_slice());
-        String::from_utf8(bytes.to_vec())?
-    } else {
-        value.to_owned()
-    };
-    Ok(serde_json::from_str(&text)?)
-}
-
-fn load_relay_fallback_for_export(
-    local_offer: Option<&str>,
-    remote_offer: Option<&str>,
-    p2p_status: &str,
-) -> (
-    Option<lai_core::RelayFallbackPlan>,
-    Option<lai_core::ConnectionPathReport>,
-    Option<String>,
-) {
-    match (local_offer, remote_offer) {
-        (None, None) => (None, None, None),
-        (Some(_), None) | (None, Some(_)) => (
-            None,
-            None,
-            Some(
-                "Both --relay-local-offer and --relay-remote-offer are required for relay fallback export."
-                    .to_owned(),
-            ),
-        ),
-        (Some(local_offer), Some(remote_offer)) => {
-            let local = match load_nat_offer_argument(local_offer) {
-                Ok(offer) => offer,
-                Err(err) => {
-                    return (
-                        None,
-                        None,
-                        Some(format!("failed to load relay local offer: {err}")),
-                    )
-                }
-            };
-            let remote = match load_nat_offer_argument(remote_offer) {
-                Ok(offer) => offer,
-                Err(err) => {
-                    return (
-                        None,
-                        None,
-                        Some(format!("failed to load relay remote offer: {err}")),
-                    )
-                }
-            };
-            let relay_fallback =
-                lai_core::create_relay_fallback_plan(&local, &remote, p2p_status);
-            let connection_path = lai_core::evaluate_connection_path(&local, &remote, p2p_status);
-            (
-                Some(relay_fallback),
-                Some(connection_path),
-                None,
-            )
-        }
-    }
-}
-
-fn connection_path_reports_from_bootstrap_outputs(
-    nat_results: &[serde_json::Value],
-    coordination_results: &[serde_json::Value],
-    coordination_server_results: &[serde_json::Value],
-) -> Result<Vec<serde_json::Value>, Box<dyn std::error::Error>> {
-    let mut reports = Vec::new();
-    for result in nat_results {
-        if let Some(report) = connection_path_report_from_bootstrap_result(
-            "nat-bootstrap-remote-peer",
-            result
-                .get("remoteOffer")
-                .and_then(|offer| offer.get("peer_id"))
-                .and_then(serde_json::Value::as_str),
-            result,
-        )? {
-            reports.push(report);
-        }
-    }
-    for wrapper in coordination_results
-        .iter()
-        .chain(coordination_server_results.iter())
-    {
-        let Some(result) = wrapper.get("result") else {
-            continue;
-        };
-        let source = wrapper
-            .get("source")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("coordination");
-        if let Some(report) = connection_path_report_from_bootstrap_result(
-            source,
-            wrapper.get("peerId").and_then(serde_json::Value::as_str),
-            result,
-        )? {
-            reports.push(report);
-        }
-    }
-    Ok(reports)
-}
-
-fn runtime_relay_fallback_summaries(
-    connection_path_reports: &[serde_json::Value],
-) -> Vec<serde_json::Value> {
-    connection_path_reports
-        .iter()
-        .filter_map(|entry| {
-            let report = entry.get("report").or(Some(entry))?;
-            let fallback = report.get("relay_fallback")?;
-            let status = fallback
-                .get("status")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("unknown");
-            let selected_path = report
-                .get("selected_path")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("unknown");
-            let selected_relay_endpoints = fallback
-                .get("selected_relay_endpoints")
-                .and_then(serde_json::Value::as_array)
-                .cloned()
-                .unwrap_or_default();
-            let recommended_actions = fallback
-                .get("recommended_actions")
-                .and_then(serde_json::Value::as_array)
-                .cloned()
-                .unwrap_or_default();
-            let warnings = fallback
-                .get("warnings")
-                .and_then(serde_json::Value::as_array)
-                .cloned()
-                .unwrap_or_default();
-            Some(serde_json::json!({
-                "source": entry
-                    .get("source")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("connection-path"),
-                "peerId": connection_path_peer_id(entry).unwrap_or_else(|| {
-                    report
-                        .get("remote_peer_id")
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or("unknown")
-                        .to_owned()
-                }),
-                "bootstrapStatus": entry
-                    .get("bootstrapStatus")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("unknown"),
-                "status": status,
-                "selectedPath": selected_path,
-                "p2pStatus": fallback
-                    .get("p2p_status")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("unknown"),
-                "p2pCandidateCount": fallback
-                    .get("p2p_candidate_count")
-                    .and_then(serde_json::Value::as_u64)
-                    .unwrap_or_default(),
-                "relayCandidateCount": fallback
-                    .get("relay_candidate_count")
-                    .and_then(serde_json::Value::as_u64)
-                    .unwrap_or_default(),
-                "selectedRelayEndpoints": selected_relay_endpoints,
-                "recommendedActions": recommended_actions,
-                "warnings": warnings,
-            }))
-        })
-        .collect()
-}
-
-fn connection_path_report_from_bootstrap_result(
-    source: &str,
-    peer_id: Option<&str>,
-    result: &serde_json::Value,
-) -> Result<Option<serde_json::Value>, Box<dyn std::error::Error>> {
-    let Some(local_offer_value) = result.get("localOffer").cloned() else {
-        return Ok(None);
-    };
-    let Some(remote_offer_value) = result.get("remoteOffer").cloned() else {
-        return Ok(None);
-    };
-    let local_offer: lai_core::NatTraversalOffer = serde_json::from_value(local_offer_value)?;
-    let remote_offer: lai_core::NatTraversalOffer = serde_json::from_value(remote_offer_value)?;
-    let bootstrap_status = result
-        .get("status")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("unknown");
-    let p2p_status = connection_path_status_from_bootstrap_status(bootstrap_status);
-    let report = lai_core::evaluate_connection_path(&local_offer, &remote_offer, p2p_status);
-    let selected_peer = result.get("selectedPeer");
-    Ok(Some(serde_json::json!({
-        "source": source,
-        "peerId": peer_id.unwrap_or(remote_offer.peer_id.as_str()),
-        "bootstrapStatus": bootstrap_status,
-        "bootstrapLatencyMs": selected_peer
-            .and_then(|peer| peer.get("latencyMs"))
-            .and_then(serde_json::Value::as_u64),
-        "observedEndpoint": selected_peer
-            .and_then(|peer| peer.get("observedEndpoint"))
-            .and_then(serde_json::Value::as_str),
-        "report": report,
-    })))
-}
-
-fn connection_path_status_from_bootstrap_status(status: &str) -> &'static str {
-    match status {
-        "ok" | "connected" | "success" | "succeeded" => "ok",
-        "handshake-timeout" | "timeout" | "timed-out" | "no-response" => "timeout",
-        "failed" | "blocked" | "unreachable" | "disconnected" => "failed",
-        _ => "unknown",
-    }
-}
-
 fn check_runtime_coordination_monitor(
     monitor: &RuntimeCoordinationMonitor,
     room_id: &str,
@@ -5913,525 +4193,6 @@ fn monitor_subnet_for_virtual_ip(virtual_ip: Ipv4Addr) -> Ipv4Subnet {
         network: Ipv4Addr::new(octets[0], octets[1], octets[2], 0),
         prefix: 24,
     }
-}
-
-fn resolve_observed_endpoint(
-    socket: &UdpSocket,
-    observed_endpoint: Option<SocketAddr>,
-    stun_server: Option<&str>,
-    stun_timeout_ms: u64,
-) -> Result<Option<SocketAddr>, Box<dyn std::error::Error>> {
-    if observed_endpoint.is_some() {
-        return Ok(observed_endpoint);
-    }
-    let Some(stun_server) = stun_server else {
-        return Ok(None);
-    };
-    let response = query_stun_like_server(socket, stun_server, stun_timeout_ms)?;
-    let observed = response
-        .get("observedEndpoint")
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| invalid_input("STUN-like response is missing observedEndpoint".to_owned()))?
-        .parse::<SocketAddr>()?;
-    Ok(Some(observed))
-}
-
-fn run_stun_like_server(
-    bind: &str,
-    max_requests: u32,
-    timeout_ms: u64,
-) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
-    let socket = UdpSocket::bind(bind)?;
-    socket.set_read_timeout(Some(Duration::from_millis(timeout_ms)))?;
-    let local_addr = socket.local_addr()?;
-    let mut handled_requests = 0u32;
-    let mut requests = Vec::new();
-    let mut buffer = [0u8; 2048];
-
-    while max_requests == 0 || handled_requests < max_requests {
-        match socket.recv_from(&mut buffer) {
-            Ok((received, peer)) => {
-                let request = serde_json::from_slice::<serde_json::Value>(&buffer[..received])
-                    .unwrap_or_else(|_| serde_json::json!({ "type": "unknown" }));
-                let response = serde_json::json!({
-                    "schemaVersion": 1,
-                    "type": "stun-like-response",
-                    "status": "ok",
-                    "observedEndpoint": peer.to_string(),
-                    "serverEndpoint": local_addr.to_string(),
-                    "receivedBytes": received,
-                    "request": request,
-                });
-                let response_bytes = serde_json::to_vec(&response)?;
-                socket.send_to(&response_bytes, peer)?;
-                handled_requests = handled_requests.saturating_add(1);
-                requests.push(serde_json::json!({
-                    "peer": peer.to_string(),
-                    "bytes": received,
-                    "request": request,
-                }));
-            }
-            Err(err)
-                if matches!(
-                    err.kind(),
-                    ErrorKind::WouldBlock
-                        | ErrorKind::TimedOut
-                        | ErrorKind::Interrupted
-                        | ErrorKind::ConnectionReset
-                ) =>
-            {
-                break;
-            }
-            Err(err) => return Err(err.into()),
-        }
-    }
-
-    Ok(serde_json::json!({
-        "status": "ok",
-        "bind": local_addr.to_string(),
-        "handledRequests": handled_requests,
-        "requests": requests,
-    }))
-}
-
-fn query_stun_like_server(
-    socket: &UdpSocket,
-    server: &str,
-    timeout_ms: u64,
-) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
-    let server = server.parse::<SocketAddr>()?;
-    let previous_timeout = socket.read_timeout()?;
-    socket.set_read_timeout(Some(Duration::from_millis(timeout_ms)))?;
-    let request = serde_json::json!({
-        "schemaVersion": 1,
-        "type": "stun-like-query",
-        "sentAtMs": current_epoch_ms(),
-        "localEndpoint": socket.local_addr()?.to_string(),
-    });
-    let request_bytes = serde_json::to_vec(&request)?;
-    let sent = socket.send_to(&request_bytes, server)?;
-    let mut buffer = [0u8; 2048];
-    let result = match socket.recv_from(&mut buffer) {
-        Ok((received, peer)) => {
-            let mut response: serde_json::Value = serde_json::from_slice(&buffer[..received])?;
-            response["status"] = serde_json::Value::String("ok".to_owned());
-            response["queryLocalEndpoint"] =
-                serde_json::Value::String(socket.local_addr()?.to_string());
-            response["server"] = serde_json::Value::String(server.to_string());
-            response["responsePeer"] = serde_json::Value::String(peer.to_string());
-            response["bytesSent"] = serde_json::Value::from(sent as u64);
-            response["bytesReceived"] = serde_json::Value::from(received as u64);
-            Ok(response)
-        }
-        Err(err)
-            if matches!(
-                err.kind(),
-                ErrorKind::WouldBlock
-                    | ErrorKind::TimedOut
-                    | ErrorKind::Interrupted
-                    | ErrorKind::ConnectionReset
-            ) =>
-        {
-            Ok(serde_json::json!({
-                "status": "timeout",
-                "server": server.to_string(),
-                "queryLocalEndpoint": socket.local_addr()?.to_string(),
-                "bytesSent": sent,
-            }))
-        }
-        Err(err) => Err(err.into()),
-    };
-    socket.set_read_timeout(previous_timeout)?;
-    result
-}
-
-fn run_nat_hole_punch(
-    room_id: &str,
-    peer_id: &str,
-    bind: &str,
-    remote_offer: &lai_core::NatTraversalOffer,
-    observed_endpoint: Option<SocketAddr>,
-    stun_server: Option<&str>,
-    stun_timeout_ms: u64,
-    relay_endpoints: Vec<SocketAddr>,
-    attempts: u16,
-    interval_ms: u64,
-    receive_timeout_ms: u64,
-    message: &str,
-) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
-    let socket = UdpSocket::bind(bind)?;
-    if receive_timeout_ms > 0 {
-        socket.set_read_timeout(Some(Duration::from_millis(receive_timeout_ms)))?;
-    }
-    let observed_endpoint =
-        resolve_observed_endpoint(&socket, observed_endpoint, stun_server, stun_timeout_ms)?;
-    let local_offer = lai_core::create_nat_traversal_offer(
-        room_id,
-        peer_id,
-        random_nonce(),
-        current_epoch_ms(),
-        socket.local_addr()?,
-        observed_endpoint,
-        relay_endpoints,
-    );
-    let plan = lai_core::create_nat_punch_plan(&local_offer, remote_offer, attempts, interval_ms);
-    let mut sent_packets = Vec::new();
-    let mut received_packets = Vec::new();
-    let mut buffer = [0u8; 2048];
-
-    if plan.status == "ready" {
-        for attempt in 0..plan.attempt_count {
-            let payload = serde_json::json!({
-                "schemaVersion": 1,
-                "type": "nat-punch",
-                "roomId": room_id,
-                "peerId": peer_id,
-                "attempt": attempt,
-                "message": message,
-                "sentAtMs": current_epoch_ms(),
-            })
-            .to_string();
-            for target in &plan.target_endpoints {
-                let sent = socket.send_to(payload.as_bytes(), target)?;
-                sent_packets.push(serde_json::json!({
-                    "target": target,
-                    "attempt": attempt,
-                    "bytes": sent,
-                }));
-            }
-            if receive_timeout_ms > 0 {
-                drain_udp_socket_packet_records(&socket, &mut buffer, &mut received_packets)?;
-            }
-            if interval_ms > 0 && attempt + 1 < plan.attempt_count {
-                std::thread::sleep(Duration::from_millis(interval_ms));
-            }
-        }
-        if receive_timeout_ms > 0 {
-            drain_udp_socket_packet_records(&socket, &mut buffer, &mut received_packets)?;
-        }
-    }
-
-    let status = if plan.status != "ready" {
-        plan.status.clone()
-    } else if received_packets.is_empty() {
-        "sent-no-response".to_owned()
-    } else {
-        "ok".to_owned()
-    };
-
-    Ok(serde_json::json!({
-        "status": status,
-        "localOffer": local_offer,
-        "remoteOffer": remote_offer,
-        "plan": plan,
-        "sentPackets": sent_packets,
-        "receivedPackets": received_packets,
-    }))
-}
-
-fn run_nat_p2p_bootstrap(
-    room_id: &str,
-    peer_id: &str,
-    virtual_ip: Ipv4Addr,
-    key: &str,
-    bind: &str,
-    remote_offer: &lai_core::NatTraversalOffer,
-    observed_endpoint: Option<SocketAddr>,
-    stun_server: Option<&str>,
-    stun_timeout_ms: u64,
-    relay_endpoints: Vec<SocketAddr>,
-    punch_attempts: u16,
-    punch_interval_ms: u64,
-    handshake_timeout_ms: u64,
-) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
-    let socket = UdpSocket::bind(bind)?;
-    socket.set_read_timeout(Some(Duration::from_millis(25)))?;
-    let local_endpoint = socket.local_addr()?;
-    let observed_endpoint =
-        resolve_observed_endpoint(&socket, observed_endpoint, stun_server, stun_timeout_ms)?;
-    let local_offer = lai_core::create_nat_traversal_offer(
-        room_id,
-        peer_id,
-        random_nonce(),
-        current_epoch_ms(),
-        local_endpoint,
-        observed_endpoint,
-        relay_endpoints,
-    );
-    let plan = lai_core::create_nat_punch_plan(
-        &local_offer,
-        remote_offer,
-        punch_attempts,
-        punch_interval_ms,
-    );
-    let mut punch_packets = Vec::new();
-    let mut handshake_packets = Vec::new();
-    let mut ignored_packets = Vec::new();
-    let mut selected_peer = None;
-    let mut buffer = vec![0u8; 65_535];
-
-    if plan.status == "ready" {
-        for attempt in 0..plan.attempt_count {
-            let payload = serde_json::json!({
-                "schemaVersion": 1,
-                "type": "nat-punch",
-                "roomId": room_id,
-                "peerId": peer_id,
-                "attempt": attempt,
-                "sentAtMs": current_epoch_ms(),
-            })
-            .to_string();
-            for target in &plan.target_endpoints {
-                let sent = socket.send_to(payload.as_bytes(), target)?;
-                punch_packets.push(serde_json::json!({
-                    "target": target,
-                    "attempt": attempt,
-                    "bytes": sent,
-                }));
-            }
-            if punch_interval_ms > 0 && attempt + 1 < plan.attempt_count {
-                std::thread::sleep(Duration::from_millis(punch_interval_ms));
-            }
-        }
-
-        let started_at_ms = current_epoch_ms();
-        let hello = create_p2p_handshake_hello(
-            room_id,
-            peer_id,
-            virtual_ip,
-            local_endpoint.to_string(),
-            random_nonce(),
-            started_at_ms,
-        );
-        let hello_bytes = serde_json::to_vec(&hello)?;
-        let envelope =
-            seal_tunnel_payload(key, "p2p-handshake-hello", 1, started_at_ms, &hello_bytes)?;
-        let envelope_bytes = serde_json::to_vec(&envelope)?;
-        for target in &plan.target_endpoints {
-            let sent = socket.send_to(&envelope_bytes, target)?;
-            handshake_packets.push(serde_json::json!({
-                "target": target,
-                "packetKind": "p2p-handshake-hello",
-                "bytes": sent,
-            }));
-        }
-
-        let deadline = Instant::now() + Duration::from_millis(handshake_timeout_ms);
-        while handshake_timeout_ms > 0 && Instant::now() < deadline {
-            match socket.recv_from(&mut buffer) {
-                Ok((received, peer)) => {
-                    let envelope: TunnelEnvelope = match serde_json::from_slice(&buffer[..received])
-                    {
-                        Ok(value) => value,
-                        Err(_) => {
-                            ignored_packets.push(serde_json::json!({
-                                "peer": peer.to_string(),
-                                "bytes": received,
-                                "reason": "not-tunnel-envelope",
-                            }));
-                            continue;
-                        }
-                    };
-                    let payload = match open_tunnel_payload(key, &envelope) {
-                        Ok(value) => value,
-                        Err(_) => {
-                            ignored_packets.push(serde_json::json!({
-                                "peer": peer.to_string(),
-                                "bytes": received,
-                                "reason": "decrypt-failed",
-                            }));
-                            continue;
-                        }
-                    };
-                    if payload.metadata.packet_kind != "p2p-handshake-ack" {
-                        ignored_packets.push(serde_json::json!({
-                            "peer": peer.to_string(),
-                            "bytes": received,
-                            "reason": "unexpected-packet-kind",
-                            "packetKind": payload.metadata.packet_kind,
-                        }));
-                        continue;
-                    }
-                    let ack: P2pHandshakeAck = serde_json::from_slice(&payload.plaintext)?;
-                    let nonce_matched = ack.nonce == hello.nonce;
-                    selected_peer = Some(serde_json::json!({
-                        "endpoint": peer.to_string(),
-                        "responderPeerId": ack.responder_peer_id,
-                        "observedEndpoint": ack.observed_endpoint,
-                        "nonceMatched": nonce_matched,
-                        "accepted": ack.accepted,
-                        "latencyMs": current_epoch_ms().saturating_sub(started_at_ms),
-                    }));
-                    if ack.accepted && nonce_matched {
-                        break;
-                    }
-                }
-                Err(err)
-                    if matches!(
-                        err.kind(),
-                        ErrorKind::WouldBlock
-                            | ErrorKind::TimedOut
-                            | ErrorKind::Interrupted
-                            | ErrorKind::ConnectionReset
-                    ) => {}
-                Err(err) => return Err(err.into()),
-            }
-        }
-    }
-
-    let status = if plan.status != "ready" {
-        plan.status.clone()
-    } else if selected_peer
-        .as_ref()
-        .and_then(|peer| peer["accepted"].as_bool())
-        .unwrap_or(false)
-        && selected_peer
-            .as_ref()
-            .and_then(|peer| peer["nonceMatched"].as_bool())
-            .unwrap_or(false)
-    {
-        "ok".to_owned()
-    } else {
-        "handshake-timeout".to_owned()
-    };
-
-    Ok(serde_json::json!({
-        "status": status,
-        "localOffer": local_offer,
-        "remoteOffer": remote_offer,
-        "plan": plan,
-        "punchPackets": punch_packets,
-        "handshakePackets": handshake_packets,
-        "ignoredPackets": ignored_packets,
-        "selectedPeer": selected_peer,
-    }))
-}
-
-fn run_nat_hole_punch_loopback_test(
-    room_id: &str,
-    peer_a: &str,
-    peer_b: &str,
-    attempts: u16,
-    interval_ms: u64,
-    message: &str,
-) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
-    let socket_a = UdpSocket::bind("127.0.0.1:0")?;
-    let socket_b = UdpSocket::bind("127.0.0.1:0")?;
-    socket_a.set_read_timeout(Some(Duration::from_millis(50)))?;
-    socket_b.set_read_timeout(Some(Duration::from_millis(50)))?;
-    let offer_a = lai_core::create_nat_traversal_offer(
-        room_id,
-        peer_a,
-        random_nonce(),
-        current_epoch_ms(),
-        socket_a.local_addr()?,
-        Some(socket_a.local_addr()?),
-        Vec::new(),
-    );
-    let offer_b = lai_core::create_nat_traversal_offer(
-        room_id,
-        peer_b,
-        random_nonce(),
-        current_epoch_ms(),
-        socket_b.local_addr()?,
-        Some(socket_b.local_addr()?),
-        Vec::new(),
-    );
-    let plan_a = lai_core::create_nat_punch_plan(&offer_a, &offer_b, attempts, interval_ms);
-    let plan_b = lai_core::create_nat_punch_plan(&offer_b, &offer_a, attempts, interval_ms);
-    let mut sent_a = 0u16;
-    let mut sent_b = 0u16;
-    let mut received_by_a = 0u16;
-    let mut received_by_b = 0u16;
-    let mut buffer = [0u8; 2048];
-
-    for attempt in 0..attempts.max(1) {
-        let payload_a = format!("{}:{}:{attempt}:{message}", room_id, peer_a);
-        for target in &plan_a.target_endpoints {
-            socket_a.send_to(payload_a.as_bytes(), target)?;
-            sent_a += 1;
-        }
-        let payload_b = format!("{}:{}:{attempt}:{message}", room_id, peer_b);
-        for target in &plan_b.target_endpoints {
-            socket_b.send_to(payload_b.as_bytes(), target)?;
-            sent_b += 1;
-        }
-        drain_udp_socket(&socket_a, &mut buffer, &mut received_by_a)?;
-        drain_udp_socket(&socket_b, &mut buffer, &mut received_by_b)?;
-        if interval_ms > 0 && attempt + 1 < attempts.max(1) {
-            std::thread::sleep(Duration::from_millis(interval_ms));
-        }
-    }
-    drain_udp_socket(&socket_a, &mut buffer, &mut received_by_a)?;
-    drain_udp_socket(&socket_b, &mut buffer, &mut received_by_b)?;
-
-    Ok(serde_json::json!({
-        "status": if received_by_a > 0 && received_by_b > 0 { "ok" } else { "timeout" },
-        "offerA": offer_a,
-        "offerB": offer_b,
-        "planA": plan_a,
-        "planB": plan_b,
-        "sentByA": sent_a,
-        "sentByB": sent_b,
-        "receivedByA": received_by_a,
-        "receivedByB": received_by_b,
-    }))
-}
-
-fn drain_udp_socket(
-    socket: &UdpSocket,
-    buffer: &mut [u8],
-    received_count: &mut u16,
-) -> Result<(), Box<dyn std::error::Error>> {
-    loop {
-        match socket.recv_from(buffer) {
-            Ok((_, _)) => *received_count = received_count.saturating_add(1),
-            Err(err)
-                if matches!(
-                    err.kind(),
-                    ErrorKind::WouldBlock
-                        | ErrorKind::TimedOut
-                        | ErrorKind::Interrupted
-                        | ErrorKind::ConnectionReset
-                ) =>
-            {
-                break;
-            }
-            Err(err) => return Err(err.into()),
-        }
-    }
-    Ok(())
-}
-
-fn drain_udp_socket_packet_records(
-    socket: &UdpSocket,
-    buffer: &mut [u8],
-    received_packets: &mut Vec<serde_json::Value>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    loop {
-        match socket.recv_from(buffer) {
-            Ok((bytes, peer)) => {
-                received_packets.push(serde_json::json!({
-                    "peer": peer.to_string(),
-                    "bytes": bytes,
-                    "text": String::from_utf8_lossy(&buffer[..bytes]).to_string(),
-                }));
-            }
-            Err(err)
-                if matches!(
-                    err.kind(),
-                    ErrorKind::WouldBlock
-                        | ErrorKind::TimedOut
-                        | ErrorKind::Interrupted
-                        | ErrorKind::ConnectionReset
-                ) =>
-            {
-                break;
-            }
-            Err(err) => return Err(err.into()),
-        }
-    }
-    Ok(())
 }
 
 fn run_room_runtime(
@@ -8746,19 +6507,6 @@ fn round_trip_jitter_ms(
         .map(|pair| pair[1].1.abs_diff(pair[0].1))
         .sum::<u64>();
     Some(total_delta as f64 / (samples.len() - 1) as f64)
-}
-
-fn connection_path_peer_id(entry: &serde_json::Value) -> Option<String> {
-    entry
-        .get("peerId")
-        .and_then(serde_json::Value::as_str)
-        .or_else(|| {
-            entry
-                .get("report")
-                .and_then(|report| report.get("remote_peer_id"))
-                .and_then(serde_json::Value::as_str)
-        })
-        .map(str::to_owned)
 }
 
 fn peer_has_tunnel_packets(packets: &[serde_json::Value], endpoint: &str) -> bool {
