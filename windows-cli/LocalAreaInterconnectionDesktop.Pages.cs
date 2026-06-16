@@ -436,9 +436,12 @@ public partial class LocalAreaInterconnectionDesktop
         AddToolButton("copyIp", delegate { CopyVirtualIp(); });
         AddToolButton("decodeInvite", delegate { DecodeInvite(); });
         AddToolButton("joinRoom", delegate { JoinRoom(); });
+        AddToolButton("prepareLanEnvironment", delegate { RunPrepareLanEnvironment(); });
         AddToolButton("adapterPlan", delegate { RunNativeCli("adapter-plan --adapter-name LocalAreaInterconnection --subnet " + subnet.Text + " --ip " + ip.Text); });
         AddToolButton("adapterScan", delegate { RunNativeAdapterEnsure(); });
         AddToolButton("nativeAdapterEnsure", delegate { RunNativeAdapterEnsure(); });
+        AddToolButton("nativeAdapterApply", delegate { RunNativeAdapterApply(); });
+        AddToolButton("firewallApply", delegate { RunFirewallApply(); });
         AddToolButton("nativeRuntimeSelfTest", delegate { RunNativeRuntimeSelfTest(); });
         AddToolButton("wintunDetect", delegate { RunWintunDetect(); });
         AddToolButton("wintunProbe", delegate { RunWintunSessionProbe(); });

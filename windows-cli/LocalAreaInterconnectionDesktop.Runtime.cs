@@ -769,14 +769,9 @@ public partial class LocalAreaInterconnectionDesktop
     {
         Task.Factory.StartNew(delegate
         {
-            string firewallOutput = "";
             string publishOutput = "";
             try
             {
-                firewallOutput = EnsureFirewallRule(
-                    "LocalAreaInterconnection Runtime " + peer,
-                    "UDP",
-                    runtimePort.ToString(CultureInfo.InvariantCulture));
                 if (coordinationServerValue.Length > 0)
                 {
                     string offerOutput = CreateNativeOfferSnapshot(
@@ -811,10 +806,6 @@ public partial class LocalAreaInterconnectionDesktop
                             || publishOutput.IndexOf("10060", StringComparison.OrdinalIgnoreCase) >= 0
                             || publishOutput.IndexOf("超时", StringComparison.OrdinalIgnoreCase) >= 0
                             || publishOutput.IndexOf("timed", StringComparison.OrdinalIgnoreCase) >= 0;
-                        if (showDetails && firewallOutput.Length > 0)
-                        {
-                            output.Text += Environment.NewLine + Environment.NewLine + firewallOutput;
-                        }
                         if ((showDetails || publishNeedsAttention) && publishOutput.Length > 0)
                         {
                             output.Text += Environment.NewLine + Environment.NewLine + publishOutput;

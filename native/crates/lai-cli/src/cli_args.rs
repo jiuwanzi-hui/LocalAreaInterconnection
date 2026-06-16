@@ -327,6 +327,28 @@ pub(crate) enum Command {
         #[arg(long)]
         program: Option<String>,
     },
+    FirewallApply {
+        #[arg(long, default_value = "Generic LAN Game")]
+        game_name: String,
+        #[arg(long)]
+        catalog: Option<String>,
+        #[arg(long)]
+        steam_app_id: Option<String>,
+        #[arg(long)]
+        subnet: String,
+        #[arg(long, default_value = "manual_ports")]
+        discovery: String,
+        #[arg(long, default_value = "")]
+        ports: String,
+        #[arg(long, default_value = "unknown")]
+        compatibility: String,
+        #[arg(long)]
+        program: Option<String>,
+        #[arg(long)]
+        remote_scope: Option<String>,
+        #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+        yes: bool,
+    },
     FirewallDiagnose {
         #[arg(long, default_value = "Generic LAN Game")]
         game_name: String,
@@ -981,6 +1003,8 @@ pub(crate) enum Command {
         #[arg(long)]
         packet_observations: Option<String>,
         #[arg(long)]
+        runtime_snapshot: Option<String>,
+        #[arg(long)]
         route_output: Option<String>,
         #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
         route_scan: bool,
@@ -1065,6 +1089,14 @@ pub(crate) enum Command {
     },
     WintunDetect,
     WintunAdapterCreate {
+        #[arg(long, default_value = "LocalAreaInterconnection")]
+        adapter_name: String,
+        #[arg(long, default_value = "LocalAreaInterconnection")]
+        tunnel_type: String,
+        #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+        yes: bool,
+    },
+    WintunAdapterEnsure {
         #[arg(long, default_value = "LocalAreaInterconnection")]
         adapter_name: String,
         #[arg(long, default_value = "LocalAreaInterconnection")]

@@ -860,6 +860,85 @@ fn run_main() -> Result<(), Box<dyn std::error::Error>> {
             );
             println!("{}", serde_json::to_string_pretty(&firewall_plan)?);
         }
+        Command::FirewallApply {
+            game_name,
+            catalog,
+            steam_app_id,
+            subnet,
+            discovery,
+            ports,
+            compatibility,
+            program,
+            remote_scope,
+            yes,
+        } => {
+            let profile = profile_from_catalog_or_args(
+                catalog.as_deref(),
+                game_name,
+                steam_app_id.as_deref(),
+                discovery,
+                ports,
+                compatibility,
+            )?;
+            let subnet = subnet.parse::<Ipv4Subnet>()?;
+            let mut network_plan = create_game_network_plan(&profile, subnet, None, None, 30);
+            if let Some(remote_scope) = remote_scope {
+                for rule in &mut network_plan.firewall_rules {
+                    rule.remote_scope = remote_scope.clone();
+                }
+            }
+            let firewall_plan = create_windows_firewall_plan(
+                &network_plan.firewall_rules,
+                "LocalAreaInterconnection",
+                program,
+            );
+            let elevated = detect_windows_elevation();
+            let preview = create_command_execution_preview(
+                &firewall_commands_as_network_commands(&firewall_plan.commands),
+                firewall_plan.requires_elevation,
+                yes,
+                elevated,
+            );
+            let command_results = if preview.can_execute_now {
+                execute_firewall_commands(&firewall_plan.commands)
+            } else {
+                Vec::new()
+            };
+            let status = if preview.can_execute_now
+                && command_results
+                    .iter()
+                    .all(|record| record.status == CommandExecutionStatus::Succeeded)
+            {
+                "applied".to_owned()
+            } else if preview.can_execute_now {
+                "failed".to_owned()
+            } else if !yes {
+                "needs-confirmation".to_owned()
+            } else if firewall_plan.requires_elevation && elevated != Some(true) {
+                "needs-elevation".to_owned()
+            } else {
+                "planned".to_owned()
+            };
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "status": status,
+                    "platform": firewall_plan.platform,
+                    "gameName": profile.game_name,
+                    "requiresElevation": firewall_plan.requires_elevation,
+                    "confirmed": yes,
+                    "elevated": elevated,
+                    "executionPreview": preview,
+                    "commandResults": command_results,
+                    "warnings": firewall_plan.warnings,
+                    "nextAction": if status == "applied" {
+                        "Run firewall diagnostics or game readiness again to verify the inbound rules."
+                    } else {
+                        "Review the firewall commands, approve the Administrator prompt, then run firewall diagnostics again."
+                    },
+                }))?
+            );
+        }
         Command::FirewallDiagnose {
             game_name,
             catalog,
@@ -1828,6 +1907,7 @@ fn run_main() -> Result<(), Box<dyn std::error::Error>> {
             game_ports,
             packets,
             packet_observations,
+            runtime_snapshot,
             route_output,
             route_scan,
         } => {
@@ -1867,6 +1947,34 @@ fn run_main() -> Result<(), Box<dyn std::error::Error>> {
                 Vec::new()
             };
             packet_observations_data.extend(parse_packet_observations(&packets)?);
+            let (runtime_snapshot_value, runtime_snapshot_error) =
+                load_runtime_snapshot(runtime_snapshot.as_deref());
+            if let Some(error) = runtime_snapshot_error.as_ref() {
+                return Err(
+                    invalid_input(format!("failed to load runtime snapshot: {error}")).into(),
+                );
+            }
+            let runtime_tunnel = runtime_snapshot_value
+                .as_ref()
+                .and_then(|snapshot| snapshot.get("tunnelServiceSnapshot").cloned())
+                .map(serde_json::from_value::<TunnelServiceSnapshot>)
+                .transpose()?
+                .map(|snapshot| lai_core::tunnel_observation_from_service(&snapshot));
+            let runtime_capture_packets = runtime_snapshot_value
+                .as_ref()
+                .map(runtime_packet_observations_from_snapshot)
+                .transpose()?
+                .unwrap_or_default();
+            packet_observations_data.extend(runtime_capture_packets);
+            if let Some(snapshot) = runtime_snapshot_value.as_ref() {
+                for line in runtime_packet_observation_lines(snapshot)? {
+                    packet_observations_data.push(line);
+                }
+            }
+            let runtime_peer_observations = runtime_snapshot_value
+                .as_ref()
+                .map(runtime_peer_observations_from_snapshot)
+                .unwrap_or_default();
             let route_source = load_route_source(route_output.as_deref(), route_scan);
             let route_observations = if route_source.error.is_none() {
                 lai_core::parse_windows_ipv4_routes(&route_source.raw_output)
@@ -1887,6 +1995,8 @@ fn run_main() -> Result<(), Box<dyn std::error::Error>> {
                         path: None,
                     }
                 }
+            } else if let Some(runtime_tunnel) = runtime_tunnel {
+                runtime_tunnel
             } else {
                 TunnelObservation {
                     state: tunnel_state,
@@ -1896,7 +2006,14 @@ fn run_main() -> Result<(), Box<dyn std::error::Error>> {
                     path: None,
                 }
             };
-            tunnel.path = connection_path;
+            if connection_path.is_some() {
+                tunnel.path = connection_path;
+            }
+            let expected_peers = if expected_peers == 0 && !runtime_peer_observations.is_empty() {
+                runtime_peer_observations.len().min(u16::MAX as usize) as u16
+            } else {
+                expected_peers
+            };
             let report = evaluate_network_observations(NetworkObservationSnapshot {
                 adapter,
                 tunnel: Some(tunnel),
@@ -1905,13 +2022,17 @@ fn run_main() -> Result<(), Box<dyn std::error::Error>> {
                 expected_broadcast_ports: parse_ports(&broadcast_ports)?,
                 expected_game_ports: parse_ports(&game_ports)?,
                 route_observations,
-                runtime_peers: Vec::new(),
+                runtime_peers: runtime_peer_observations,
             });
             let mut output = serde_json::to_value(&report)?;
             output["adapterSource"] = serde_json::to_value(adapter_source)?;
             output["pingSource"] = serde_json::to_value(ping_source)?;
             output["routeSource"] = serde_json::to_value(route_source)?;
             output["routeCount"] = serde_json::json!(route_count);
+            output["runtimeSnapshotSource"] = serde_json::json!({
+                "source": if runtime_snapshot.is_some() { "runtime-snapshot" } else { "not-provided" },
+                "loaded": runtime_snapshot_value.is_some(),
+            });
             println!("{}", serde_json::to_string_pretty(&output)?);
         }
         Command::DiagnosticExport {
@@ -2096,6 +2217,64 @@ fn run_main() -> Result<(), Box<dyn std::error::Error>> {
             };
             let report = lai_core::create_wintun_adapter(request);
             println!("{}", serde_json::to_string_pretty(&report)?);
+        }
+        Command::WintunAdapterEnsure {
+            adapter_name,
+            tunnel_type,
+            yes,
+        } => {
+            if !yes {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "status": "needs-confirmation",
+                        "adapterName": adapter_name,
+                        "tunnelType": tunnel_type,
+                        "requiresElevation": true,
+                        "confirmed": false,
+                        "canExecuteNow": false,
+                        "nextAction": "Review the request, then rerun with --yes true from an Administrator terminal.",
+                    }))?
+                );
+                return Ok(());
+            }
+            let create_report =
+                lai_core::create_wintun_adapter(lai_core::WintunAdapterCreateRequest {
+                    adapter_name: adapter_name.clone(),
+                    tunnel_type: tunnel_type.clone(),
+                });
+            let open_report = lai_core::open_wintun_adapter(lai_core::WintunAdapterOpenRequest {
+                adapter_name: adapter_name.clone(),
+            });
+            let create_ok = matches!(
+                create_report.status.as_str(),
+                "created" | "adapter-exists" | "already-exists"
+            );
+            let open_ok = open_report.opened;
+            let status = if open_ok {
+                "ready"
+            } else if create_ok {
+                "created-not-opened"
+            } else {
+                "unavailable"
+            };
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "status": status,
+                    "adapterName": adapter_name,
+                    "tunnelType": tunnel_type,
+                    "requiresElevation": true,
+                    "confirmed": true,
+                    "createReport": create_report,
+                    "openReport": open_report,
+                    "nextAction": if open_ok {
+                        "Continue with adapter IP configuration and firewall rules."
+                    } else {
+                        "Check wintun.dll, Administrator permission, and Windows driver installation."
+                    },
+                }))?
+            );
         }
         Command::WintunAdapterDelete {
             adapter_name,
@@ -3076,6 +3255,57 @@ fn merge_runtime_packet_observations(
     }
 }
 
+fn runtime_packet_observations_from_snapshot(
+    runtime_snapshot: &serde_json::Value,
+) -> Result<Vec<PacketObservation>, Box<dyn std::error::Error>> {
+    let Some(captures) = runtime_snapshot
+        .get("packetCaptureSummaries")
+        .and_then(serde_json::Value::as_array)
+    else {
+        return Ok(Vec::new());
+    };
+    captures
+        .iter()
+        .cloned()
+        .map(serde_json::from_value::<PacketCaptureSummary>)
+        .map(|result| {
+            result
+                .map(|summary| lai_core::packet_observation_from_capture_summary(&summary))
+                .map_err(|err| err.into())
+        })
+        .collect()
+}
+
+fn runtime_packet_observation_lines(
+    runtime_snapshot: &serde_json::Value,
+) -> Result<Vec<PacketObservation>, Box<dyn std::error::Error>> {
+    let Some(lines) = runtime_snapshot
+        .get("packetObservationLines")
+        .and_then(serde_json::Value::as_array)
+    else {
+        return Ok(Vec::new());
+    };
+    lines
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(lai_core::parse_packet_observation_line)
+        .map(|result| result.map_err(|err| err.into()))
+        .collect()
+}
+
+fn runtime_peer_observations_from_snapshot(
+    runtime_snapshot: &serde_json::Value,
+) -> Vec<lai_core::RuntimePeerObservation> {
+    let summaries = runtime_snapshot
+        .get("runtimePeerSummaries")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    runtime_peer_observations_from_summaries(&summaries)
+}
+
 fn diagnostic_environment() -> Result<DiagnosticExportEnvironment, Box<dyn std::error::Error>> {
     Ok(DiagnosticExportEnvironment {
         machine_name: std::env::var("COMPUTERNAME")
@@ -3337,6 +3567,42 @@ fn endpoint_matches_game_ports(
 
 fn execute_network_commands(commands: &[NetworkCommand]) -> Vec<CommandExecutionRecord> {
     commands.iter().map(execute_network_command).collect()
+}
+
+fn firewall_commands_as_network_commands(
+    commands: &[lai_core::FirewallCommand],
+) -> Vec<NetworkCommand> {
+    commands
+        .iter()
+        .map(|command| NetworkCommand {
+            tool: command.tool.clone(),
+            args: command.args.clone(),
+            command: command.command.clone(),
+            purpose: command
+                .purpose
+                .clone()
+                .unwrap_or_else(|| format!("Apply firewall rule {}", command.rule_name)),
+        })
+        .collect()
+}
+
+fn execute_firewall_commands(
+    commands: &[lai_core::FirewallCommand],
+) -> Vec<CommandExecutionRecord> {
+    commands
+        .iter()
+        .map(|command| {
+            execute_network_command(&NetworkCommand {
+                tool: command.tool.clone(),
+                args: command.args.clone(),
+                command: command.command.clone(),
+                purpose: command
+                    .purpose
+                    .clone()
+                    .unwrap_or_else(|| format!("Apply firewall rule {}", command.rule_name)),
+            })
+        })
+        .collect()
 }
 
 fn execute_network_command(command: &NetworkCommand) -> CommandExecutionRecord {

@@ -93,16 +93,13 @@ public partial class LocalAreaInterconnectionDesktop
             output.Text = T("directRemoteOfferRequired");
             return;
         }
-        output.Text = T("quickLanStarting");
+        string startText = T("quickLanStarting");
         if (hasDirectOffer)
         {
-            output.Text += Environment.NewLine + T("directBootstrapStarting") + " " + directPeerId + " @ " + directVirtualIp;
+            startText += Environment.NewLine + T("directBootstrapStarting") + " " + directPeerId + " @ " + directVirtualIp;
         }
-        Application.DoEvents();
-        StartNativeRuntime(false);
-        output.Text += Environment.NewLine
-            + Environment.NewLine
-            + T("quickLanStarted");
+        output.Text = startText;
+        RunPrepareLanEnvironmentAsync(true, startText);
     }
 
     void DecodeInvite()
@@ -281,6 +278,7 @@ public partial class LocalAreaInterconnectionDesktop
             + " --route-scan true"
             + PingArgs()
             + PacketObservationArgs()
+            + RuntimeSnapshotArgs()
             + " --broadcast-ports " + ports.Text
             + " --game-ports " + ports.Text;
     }
@@ -426,6 +424,135 @@ public partial class LocalAreaInterconnectionDesktop
             + " --subnet " + subnet.Text
             + " --ip " + ip.Text
             + " --adapter-scan true");
+    }
+
+    void RunNativeAdapterApply()
+    {
+        RunNativeCliElevatedWithConfirmation(
+            "adapter-ensure --adapter-name LocalAreaInterconnection"
+                + " --subnet " + subnet.Text
+                + " --ip " + ip.Text
+                + " --adapter-scan true"
+                + " --yes true",
+            "adapterApplyConfirm",
+            "nativeAdapterApply",
+            "adapter-apply");
+    }
+
+    void RunFirewallApply()
+    {
+        RunNativeCliElevatedWithConfirmation(
+            FirewallApplyArgs() + " --yes true",
+            "firewallApplyConfirm",
+            "firewallApply",
+            "firewall-apply");
+    }
+
+    bool PrepareLanEnvironmentForStart()
+    {
+        string[] steps = LanEnvironmentPrepareArgs();
+        if (!ConfirmAdminAction("prepareLanConfirm", "prepareLanEnvironment"))
+        {
+            output.Text = T("prepareLanCancelled");
+            return false;
+        }
+        string text = RunNativeCliElevatedBatch(steps, "prepare-lan");
+        output.Text = T("prepareLanFinished") + Environment.NewLine + text;
+        return ElevatedTextLooksSuccessful(text);
+    }
+
+    void RunPrepareLanEnvironment()
+    {
+        RunPrepareLanEnvironmentAsync(false, T("prepareLanStarting"));
+    }
+
+    void RunPrepareLanEnvironmentAsync(bool startRuntimeAfterPrepare, string initialText)
+    {
+        if (userActionRunning)
+        {
+            output.Text = T("actionAlreadyRunning");
+            return;
+        }
+        if (!ConfirmAdminAction("prepareLanConfirm", "prepareLanEnvironment"))
+        {
+            output.Text = T("prepareLanCancelled");
+            return;
+        }
+        userActionRunning = true;
+        SetActionButtonsEnabled(false);
+        output.Text = initialText;
+        string[] steps = LanEnvironmentPrepareArgs();
+        Task.Factory.StartNew(delegate
+        {
+            string prepareText = "";
+            Exception error = null;
+            try
+            {
+                prepareText = RunNativeCliElevatedBatch(steps, "prepare-lan");
+            }
+            catch (Exception ex)
+            {
+                error = ex;
+            }
+            if (IsDisposed || !IsHandleCreated)
+            {
+                return;
+            }
+            BeginInvoke((MethodInvoker)delegate
+            {
+                userActionRunning = false;
+                SetActionButtonsEnabled(true);
+                if (error != null)
+                {
+                    ShowActionError("prepareLanEnvironment", error);
+                    return;
+                }
+                bool prepared = ElevatedTextLooksSuccessful(prepareText);
+                output.Text = T("prepareLanFinished") + Environment.NewLine + prepareText;
+                if (!prepared)
+                {
+                    output.Text += Environment.NewLine + Environment.NewLine + T("prepareLanFailed");
+                    return;
+                }
+                if (startRuntimeAfterPrepare)
+                {
+                    StartNativeRuntime(false);
+                    if (runtimeProcess != null && !runtimeProcess.HasExited)
+                    {
+                        output.Text += Environment.NewLine
+                            + Environment.NewLine
+                            + T("quickLanStarted");
+                    }
+                }
+            });
+        });
+    }
+
+    string[] LanEnvironmentPrepareArgs()
+    {
+        return new string[]
+        {
+            "wintun-adapter-ensure --adapter-name LocalAreaInterconnection --tunnel-type LocalAreaInterconnection --yes true",
+            "adapter-ensure --adapter-name LocalAreaInterconnection"
+                + " --subnet " + subnet.Text
+                + " --ip " + ip.Text
+                + " --adapter-scan true"
+                + " --yes true",
+            FirewallApplyArgs() + " --yes true",
+            "firewall-apply --game-name " + Quote("LocalAreaInterconnection Runtime")
+                + " --subnet " + subnet.Text
+                + " --ports " + NativeRuntimePort().ToString(CultureInfo.InvariantCulture)
+                + " --remote-scope any"
+                + " --yes true"
+        };
+    }
+
+    string FirewallApplyArgs()
+    {
+        return "firewall-apply --game-name " + Quote(gameName.Text)
+            + GameCatalogArgs()
+            + " --subnet " + subnet.Text
+            + " --ports " + ports.Text;
     }
 
     void RunNativeRuntimeSelfTest()
@@ -655,6 +782,9 @@ public partial class LocalAreaInterconnectionDesktop
         if (confirmed)
         {
             args += " --yes true";
+            string elevatedText = RunNativeCliElevated(args, "runtime-cleanup-apply");
+            UpdateRoomDetailsFromRuntimeCleanupApply(elevatedText);
+            return;
         }
 
         string text = RunNativeCli(args);
@@ -940,7 +1070,21 @@ public partial class LocalAreaInterconnectionDesktop
             bind = CoordinationBind();
         }
         coordinationStoreFile = RuntimeRoomFilePath("coordination-store", "json");
-        string firewallOutput = EnsureCoordinationFirewallRule();
+        string firewallOutput = "";
+        if (ConfirmAdminAction("coordinationFirewallConfirm", "startCoordination"))
+        {
+            firewallOutput = RunNativeCliElevated(
+                "firewall-apply --game-name " + Quote("LocalAreaInterconnection Coordination")
+                    + " --subnet " + subnet.Text
+                    + " --ports " + CoordinationPort()
+                    + " --remote-scope any"
+                    + " --yes true",
+                "coordination-firewall");
+        }
+        else
+        {
+            firewallOutput = T("coordinationFirewallSkipped");
+        }
         coordinationOutput.Length = 0;
         coordinationProcess = StartNativeBackgroundProcess(
             "coordination-http-serve"

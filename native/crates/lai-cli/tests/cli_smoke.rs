@@ -239,6 +239,113 @@ Network Destination        Netmask          Gateway       Interface  Metric
 }
 
 #[test]
+fn network_observe_reads_runtime_snapshot_evidence() {
+    let snapshot_path = std::env::temp_dir().join(format!(
+        "lai-cli-network-observe-runtime-snapshot-{}.json",
+        std::process::id()
+    ));
+    let snapshot_arg = snapshot_path.to_string_lossy().to_string();
+    fs::write(
+        &snapshot_path,
+        serde_json::json!({
+            "tunnelServiceSnapshot": {
+                "service_running": true,
+                "connected_peer_count": 1,
+                "connection_path": "p2p",
+                "average_latency_ms": 12,
+                "packet_loss_percent": 0.0,
+                "bytes_sent": 128,
+                "bytes_received": 256,
+                "last_error": null
+            },
+            "packetCaptureSummaries": [
+                {
+                    "protocol": "udp",
+                    "source_ip": "10.77.12.2",
+                    "destination_ip": "10.77.12.255",
+                    "destination_port": 27015,
+                    "direction": "outbound",
+                    "broadcast": true,
+                    "packet_count": 1,
+                    "bytes": 8
+                },
+                {
+                    "protocol": "udp",
+                    "source_ip": "10.77.12.2",
+                    "destination_ip": "10.77.12.3",
+                    "destination_port": 27015,
+                    "direction": "outbound",
+                    "broadcast": false,
+                    "packet_count": 1,
+                    "bytes": 8
+                }
+            ],
+            "runtimePeerSummaries": [{
+                "peerId": "peer_b",
+                "virtualIp": "10.77.12.3",
+                "selectedPath": "p2p",
+                "connectionPathStatus": "observed",
+                "bootstrapStatus": "ok",
+                "connected": true,
+                "pathKind": "direct",
+                "latencyMs": 12,
+                "lastSeenAtMs": 200,
+                "lastSentAtMs": 220,
+                "bytesSent": 32,
+                "bytesReceived": 32,
+                "directBytesSent": 32,
+                "directBytesReceived": 32,
+                "relayBytesSent": 0,
+                "relayBytesReceived": 0,
+                "unknownPathBytesSent": 0,
+                "unknownPathBytesReceived": 0,
+                "heartbeatPacketsSent": 2,
+                "heartbeatAckPacketsReceived": 2,
+                "heartbeatLossPercent": 0.0,
+                "heartbeatLossWindowSize": 2,
+                "heartbeatLossWindowPercent": 0.0,
+                "heartbeatRttSampleCount": 2,
+                "heartbeatRttJitterMs": 1.0,
+                "forwardedPacketsSent": 1,
+                "tunnelPacketsReceived": 1
+            }]
+        })
+        .to_string(),
+    )
+    .expect("write runtime snapshot");
+
+    let value = run_cli(&[
+        "network-observe",
+        "--adapter-name",
+        "LocalAreaInterconnection",
+        "--expected-ip",
+        "10.77.12.2",
+        "--assigned-ip",
+        "10.77.12.2",
+        "--subnet",
+        "10.77.12.0/24",
+        "--runtime-snapshot",
+        &snapshot_arg,
+        "--broadcast-ports",
+        "27015",
+        "--game-ports",
+        "27015",
+    ]);
+    fs::remove_file(&snapshot_path).ok();
+
+    assert_eq!(value["runtimeSnapshotSource"]["loaded"], true);
+    assert_eq!(value["diagnostic_snapshot"]["tunnel"], "ok");
+    assert_eq!(value["diagnostic_snapshot"]["p2p"], "ok");
+    assert_eq!(value["diagnostic_snapshot"]["broadcast"], "seen");
+    assert_eq!(value["diagnostic_snapshot"]["game_traffic"], "seen");
+    assert!(value["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|check| { check["key"] == "runtime-peer:peer_b" && check["status"] == "ok" }));
+}
+
+#[test]
 fn room_summary_outputs_session_members() {
     let value = run_cli(&[
         "room-summary",
@@ -389,6 +496,25 @@ fn game_profile_plan_reads_catalog_and_outputs_network_plan() {
     assert_eq!(value["plan"]["firewall_rules"].as_array().unwrap().len(), 4);
     assert_eq!(value["plan"]["host_ip"], "10.77.12.1");
     assert_eq!(value["plan"]["local_ip"], "10.77.12.2");
+}
+
+#[test]
+fn firewall_apply_without_confirmation_returns_preview() {
+    let value = run_cli(&[
+        "firewall-apply",
+        "--game-name",
+        "Example Game",
+        "--subnet",
+        "10.77.12.0/24",
+        "--ports",
+        "27015",
+    ]);
+
+    assert_eq!(value["status"], "needs-confirmation");
+    assert_eq!(value["confirmed"], false);
+    assert_eq!(value["requiresElevation"], true);
+    assert_eq!(value["executionPreview"]["can_execute_now"], false);
+    assert_eq!(value["commandResults"].as_array().unwrap().len(), 0);
 }
 
 #[test]
@@ -5158,6 +5284,23 @@ fn wintun_detect_outputs_dll_and_admin_status() {
 fn wintun_adapter_create_requires_explicit_confirmation() {
     let value = run_cli(&[
         "wintun-adapter-create",
+        "--adapter-name",
+        "LocalAreaInterconnection",
+        "--tunnel-type",
+        "LocalAreaInterconnection",
+    ]);
+
+    assert_eq!(value["status"], "needs-confirmation");
+    assert_eq!(value["requiresElevation"], true);
+    assert_eq!(value["confirmed"], false);
+    assert_eq!(value["canExecuteNow"], false);
+    assert!(value["nextAction"].as_str().unwrap().contains("--yes true"));
+}
+
+#[test]
+fn wintun_adapter_ensure_requires_explicit_confirmation() {
+    let value = run_cli(&[
+        "wintun-adapter-ensure",
         "--adapter-name",
         "LocalAreaInterconnection",
         "--tunnel-type",
