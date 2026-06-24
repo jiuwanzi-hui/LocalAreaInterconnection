@@ -5853,8 +5853,15 @@ fn run_room_runtime(
             .map(UdpSocket::local_addr)
             .transpose()?
     };
-    let mut using_relay_fallback_targets = false;
+    let mut using_relay_fallback_targets = runtime_plan_has_relay_peer(&active_plan);
     let mut relay_fallback_events = Vec::new();
+    if using_relay_fallback_targets {
+        relay_fallback_events.push(serde_json::json!({
+            "status": "active",
+            "reason": "initial-relay-path",
+            "activatedAtMs": current_epoch_ms(),
+        }));
+    }
     let mut direct_restore_probe_endpoint = String::new();
     let mut direct_restore_probe_count = 0u8;
     let mut direct_restore_probe_started_at = None::<Instant>;
@@ -8035,9 +8042,9 @@ mod tests {
         best_direct_candidate_endpoint, current_epoch_ms, is_benign_route_result,
         latest_runtime_non_icmp_traffic_at_ms, latest_runtime_traffic_at_ms, next_runtime_sequence,
         runtime_active_connection_path, runtime_connected_peer_count_from_summaries,
-        runtime_peer_from_bootstrap_result, runtime_peer_summaries, runtime_reply_target,
-        runtime_targets_for_virtual_packet_destination, runtime_update_active_peer_direct_endpoint,
-        trim_event_log, RuntimeSendTarget,
+        runtime_peer_from_bootstrap_result, runtime_peer_summaries, runtime_plan_has_relay_peer,
+        runtime_reply_target, runtime_targets_for_virtual_packet_destination,
+        runtime_update_active_peer_direct_endpoint, trim_event_log, RuntimeSendTarget,
     };
     use lai_core::{
         NatCandidate, NatTraversalOffer, NetworkCommand, RoomRuntimePeer, RoomRuntimePlan,
@@ -8474,6 +8481,35 @@ mod tests {
             plan.peers[0].fallback_endpoint.as_deref(),
             Some("49.235.146.152:39091")
         );
+    }
+
+    #[test]
+    fn runtime_plan_marks_initial_relay_path_active() {
+        let plan = RoomRuntimePlan {
+            room_id: "room".to_owned(),
+            local_peer_id: "peer_a".to_owned(),
+            local_virtual_ip: Ipv4Addr::new(10, 77, 12, 2),
+            tunnel: RuntimeTunnelPlan {
+                bind_endpoint: "127.0.0.1:0".to_owned(),
+                encryption: "psk".to_owned(),
+                handshake: "p2p".to_owned(),
+                peer_count: 1,
+            },
+            peers: vec![RoomRuntimePeer {
+                peer_id: "peer_b".to_owned(),
+                virtual_ip: Ipv4Addr::new(10, 77, 12, 3),
+                endpoint: "49.235.146.152:39091".to_owned(),
+                connection_path: "relay".to_owned(),
+                direct_endpoint: Some("198.51.100.10:41000".to_owned()),
+                fallback_endpoint: Some("49.235.146.152:39091".to_owned()),
+            }],
+            capture_ports: Vec::<RuntimePortBinding>::new(),
+            udp_forwarders: Vec::<RuntimeUdpForwardPlan>::new(),
+            diagnostic_outputs: Vec::new(),
+            warnings: Vec::new(),
+        };
+
+        assert!(runtime_plan_has_relay_peer(&plan));
     }
 
     #[test]
@@ -10374,6 +10410,16 @@ fn runtime_active_connection_path(
     } else {
         observed_connection_path.map(str::to_owned)
     }
+}
+
+fn runtime_plan_has_relay_peer(plan: &RoomRuntimePlan) -> bool {
+    plan.peers.iter().any(|peer| {
+        peer.connection_path.eq_ignore_ascii_case("relay")
+            || peer.connection_path.eq_ignore_ascii_case("relayed")
+            || is_http_relay_endpoint(&peer.endpoint)
+            || peer.endpoint.parse::<SocketAddr>().is_ok()
+                && peer.fallback_endpoint.as_deref() == Some(peer.endpoint.as_str())
+    })
 }
 
 fn runtime_connected_peer_count_from_summaries(summaries: &[serde_json::Value]) -> u16 {
