@@ -208,11 +208,18 @@ public partial class LocalAreaInterconnectionDesktop
         try
         {
             string name = Environment.MachineName.Trim();
-            return name.Length > 0 ? name : "Alice";
+            if (name.Length > 0) return name;
+            name = Environment.GetEnvironmentVariable("COMPUTERNAME");
+            if (name != null)
+            {
+                name = name.Trim();
+                if (name.Length > 0) return name;
+            }
+            return "LocalHost";
         }
         catch
         {
-            return "Alice";
+            return "LocalHost";
         }
     }
 
@@ -1029,8 +1036,61 @@ public partial class LocalAreaInterconnectionDesktop
         {
             return true;
         }
+        if (path == "relay"
+            && DateTime.UtcNow - lastRuntimeP2pRetryUtc >= TimeSpan.FromSeconds(RelayP2pRetryCooldownSeconds)
+            && !RuntimeHasRecentForwardedTraffic(snapshot, RelayP2pRetryIdleTrafficSeconds))
+        {
+            return true;
+        }
 
         return false;
+    }
+
+    bool RuntimeHasRecentForwardedTraffic(string snapshot, int seconds)
+    {
+        long newest = LatestRuntimeTrafficTimestampMs(snapshot, "forwardedPackets", "sentAtMs");
+        newest = Math.Max(newest, LatestRuntimeTrafficTimestampMs(snapshot, "icmpEchoRequests", "sentAtMs"));
+        newest = Math.Max(newest, LatestRuntimeTrafficTimestampMs(snapshot, "icmpEchoReplies", "sentAtMs"));
+        newest = Math.Max(newest, LatestRuntimeTrafficTimestampMs(snapshot, "wintunRuntime", "receivedPackets", "sentAtMs"));
+        newest = Math.Max(newest, LatestRuntimeTrafficTimestampMs(snapshot, "wintunRuntime", "sentPackets", "sentAtMs"));
+        newest = Math.Max(newest, LatestRuntimeTrafficTimestampMs(snapshot, "wintunRuntime", "receivedPackets", "receivedAtMs"));
+        newest = Math.Max(newest, LatestRuntimeTrafficTimestampMs(snapshot, "wintunRuntime", "sentPackets", "receivedAtMs"));
+        if (newest <= 0) return false;
+        long now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+        return now - newest <= seconds * 1000L;
+    }
+
+    long LatestRuntimeTrafficTimestampMs(string json, string arrayKey, string timestampKey)
+    {
+        return LatestRuntimeTrafficTimestampMs(JsonArrayValue(json, arrayKey), timestampKey);
+    }
+
+    long LatestRuntimeTrafficTimestampMs(string json, string objectKey, string arrayKey, string timestampKey)
+    {
+        string child = JsonObjectValue(json, objectKey);
+        if (child.Length == 0) return 0;
+        return LatestRuntimeTrafficTimestampMs(JsonArrayValue(child, arrayKey), timestampKey);
+    }
+
+    long LatestRuntimeTrafficTimestampMs(string array, string timestampKey)
+    {
+        long newest = 0;
+        int search = 0;
+        while (search < array.Length)
+        {
+            int start = array.IndexOf('{', search);
+            if (start < 0) break;
+            int end = MatchingJsonBrace(array, start);
+            if (end < 0) break;
+            string item = array.Substring(start, end - start + 1);
+            long value;
+            if (Int64.TryParse(JsonNumberValue(item, timestampKey), NumberStyles.Integer, CultureInfo.InvariantCulture, out value))
+            {
+                newest = Math.Max(newest, value);
+            }
+            search = end + 1;
+        }
+        return newest;
     }
 
     bool RemotePeerTargetsSamePeer(string current, string next)

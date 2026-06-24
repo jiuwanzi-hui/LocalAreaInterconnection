@@ -124,9 +124,9 @@ public static class LocalAreaInterconnectionCli
     {
         Console.WriteLine("LocalAreaInterconnection Windows CLI");
         Console.WriteLine("Usage:");
-        Console.WriteLine("  LocalAreaInterconnection.Cli.exe init --room-name \"Friday LAN\" --host Alice [--coordination-endpoint http://192.168.1.10:39110]");
+        Console.WriteLine("  LocalAreaInterconnection.Cli.exe init --room-name \"Friday LAN\" [--host <computer-name>] [--coordination-endpoint http://192.168.1.10:39110]");
         Console.WriteLine("  LocalAreaInterconnection.Cli.exe decode --invite <code>");
-        Console.WriteLine("  LocalAreaInterconnection.Cli.exe join --invite <code> [--peer Bob]");
+        Console.WriteLine("  LocalAreaInterconnection.Cli.exe join --invite <code> [--peer <computer-name>]");
         Console.WriteLine("  LocalAreaInterconnection.Cli.exe diagnose --virtual-adapter ok --firewall allowed --p2p ok --broadcast missing");
         Console.WriteLine("  LocalAreaInterconnection.Cli.exe network-observe --adapter-name LocalAreaInterconnection --expected-ip 10.77.12.2 --assigned-ip 10.77.12.2 --subnet 10.77.12.0/24 --connected-peers 1 --expected-peers 1 --broadcast-ports 27015 --game-ports 27015 --packets udp:10.77.12.2:10.77.12.255:27015:broadcast:outbound:8,udp:10.77.12.2:10.77.12.3:27015:unicast:outbound:8");
         Console.WriteLine("  LocalAreaInterconnection.Cli.exe network-observe --adapter-name LocalAreaInterconnection --expected-ip 10.77.12.2 --assigned-ip 10.77.12.2 --subnet 10.77.12.0/24 --packet-observations packets.txt --broadcast-ports 27015 --game-ports 27015");
@@ -181,10 +181,29 @@ public static class LocalAreaInterconnectionCli
         return args.TryGetValue(key, out value) ? value : fallback;
     }
 
+    static string DefaultHostName()
+    {
+        try
+        {
+            string name = Environment.MachineName.Trim();
+            if (name.Length > 0) return name;
+            name = Environment.GetEnvironmentVariable("COMPUTERNAME");
+            if (name != null)
+            {
+                name = name.Trim();
+                if (name.Length > 0) return name;
+            }
+        }
+        catch
+        {
+        }
+        return "LocalHost";
+    }
+
     static void Init(Dictionary<string, string> args)
     {
         string roomName = Arg(args, "room-name", "LAN Room");
-        string host = Arg(args, "host", "Host");
+        string host = Arg(args, "host", DefaultHostName());
         string coordinationEndpoint = Arg(args, "coordination-endpoint", "");
         string roomId = RandomToken(8);
         string roomKey = RandomToken(32);
@@ -227,7 +246,7 @@ public static class LocalAreaInterconnectionCli
     static void Join(Dictionary<string, string> args)
     {
         string invite = Required(args, "invite");
-        string peer = Arg(args, "peer", "Player");
+        string peer = Arg(args, "peer", DefaultHostName());
         string payload = DecodeInvitePayload(invite);
         string subnet = JsonStringValue(payload, "virtual_subnet");
         string roomId = JsonStringValue(payload, "room_id");

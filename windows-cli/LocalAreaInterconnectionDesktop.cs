@@ -134,6 +134,8 @@ public partial class LocalAreaInterconnectionDesktop : Form, IMessageFilter
     string lastRuntimeP2pRetrySignature = "";
     string lastRemotePeerOfferSignature = "";
     string lastRuntimeSnapshotText = "";
+    const int RelayP2pRetryCooldownSeconds = 90;
+    const int RelayP2pRetryIdleTrafficSeconds = 10;
     string latestCoordinationViewText = "";
     int latestCoordinationOnlineCount = 0;
     int latestCoordinationMemberCount = 0;
