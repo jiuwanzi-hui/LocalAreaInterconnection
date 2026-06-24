@@ -957,13 +957,20 @@ public partial class LocalAreaInterconnectionDesktop
         if (spec.Length == 0) return;
         string current = remotePeer.Text.Trim();
         bool samePeer = RemotePeerTargetsSamePeer(current, spec);
-        if (samePeer && !RuntimeShouldRetryP2pForSamePeer(spec)) return;
+        string offerSignature = RemotePeerOfferSignatureFromCoordinationView(json, spec);
+        string previousOfferSignature = lastRemotePeerOfferSignature;
+        if (offerSignature.Length > 0)
+        {
+            lastRemotePeerOfferSignature = offerSignature;
+        }
+        if (samePeer && !RuntimeShouldRetryP2pForSamePeer(spec, offerSignature, previousOfferSignature)) return;
 
         remotePeer.Text = spec;
         if (runtimeProcess == null || runtimeProcess.HasExited) return;
 
         lastRuntimeP2pRetryUtc = DateTime.UtcNow;
         lastRuntimeP2pRetrySpec = spec;
+        lastRuntimeP2pRetrySignature = offerSignature;
         restartingRuntimeForRemotePeer = true;
         try
         {
@@ -976,10 +983,11 @@ public partial class LocalAreaInterconnectionDesktop
         }
     }
 
-    bool RuntimeShouldRetryP2pForSamePeer(string spec)
+    bool RuntimeShouldRetryP2pForSamePeer(string spec, string offerSignature, string previousOfferSignature)
     {
         if (runtimeProcess == null || runtimeProcess.HasExited) return false;
         if (lastRuntimeP2pRetrySpec == spec
+            && lastRuntimeP2pRetrySignature == offerSignature
             && DateTime.UtcNow - lastRuntimeP2pRetryUtc < TimeSpan.FromSeconds(30))
         {
             return false;
@@ -1007,6 +1015,15 @@ public partial class LocalAreaInterconnectionDesktop
             return true;
         }
 
+        string path = RuntimePrimaryPathKind(snapshot);
+        if (path == "relay"
+            && offerSignature.Length > 0
+            && previousOfferSignature.Length > 0
+            && offerSignature != previousOfferSignature)
+        {
+            return true;
+        }
+
         return false;
     }
 
@@ -1020,6 +1037,44 @@ public partial class LocalAreaInterconnectionDesktop
         if (!TryParseCoordinationPeerSpec(next, out nextPeer, out nextIp)) return false;
         return SafePeerId(currentPeer) == SafePeerId(nextPeer)
             && currentIp == nextIp;
+    }
+
+    string RemotePeerOfferSignatureFromCoordinationView(string json, string spec)
+    {
+        string specPeer;
+        string specIp;
+        if (!TryParseCoordinationPeerSpec(spec, out specPeer, out specIp)) return "";
+        string members = JsonArrayValue(json, "members");
+        if (members.Length == 0) members = JsonArrayValue(json, "peers");
+        int search = 0;
+        while (search < members.Length)
+        {
+            int start = members.IndexOf('{', search);
+            if (start < 0) break;
+            int end = MatchingJsonBrace(members, start);
+            if (end < 0) break;
+            string member = members.Substring(start, end - start + 1);
+            string peer = JsonStringValue(member, "peer_id");
+            if (peer.Length == 0) peer = JsonStringValue(member, "peerId");
+            string virtualIp = JsonStringValue(member, "virtual_ip");
+            if (virtualIp.Length == 0) virtualIp = JsonStringValue(member, "virtualIp");
+            if (SafePeerId(peer) == SafePeerId(specPeer) && virtualIp == specIp)
+            {
+                string offerCreated = JsonNumberValue(member, "offer_created_at_ms");
+                if (offerCreated.Length == 0) offerCreated = JsonNumberValue(member, "offerCreatedAtMs");
+                string candidateCount = JsonNumberValue(member, "candidate_count");
+                if (candidateCount.Length == 0) candidateCount = JsonNumberValue(member, "candidateCount");
+                string endpoint = JsonStringValue(member, "preferred_endpoint");
+                if (endpoint.Length == 0) endpoint = JsonStringValue(member, "preferredEndpoint");
+                if (offerCreated.Length == 0 && candidateCount.Length == 0 && endpoint.Length == 0)
+                {
+                    return "";
+                }
+                return SafePeerId(peer) + "|" + virtualIp + "|" + offerCreated + "|" + candidateCount + "|" + endpoint;
+            }
+            search = end + 1;
+        }
+        return "";
     }
 
     string RemotePeerSpecFromCoordinationView(string json)

@@ -10,6 +10,7 @@ pub struct CoordinationRoomMemberView {
     pub is_host: bool,
     pub candidate_count: usize,
     pub preferred_endpoint: Option<String>,
+    pub offer_created_at_ms: Option<u128>,
     pub last_seen_ms: u128,
     pub expires_at_ms: u128,
 }
@@ -63,6 +64,7 @@ pub fn coordination_room_view(
                             .max_by_key(|candidate| candidate.priority)
                             .map(|candidate| candidate.endpoint.clone())
                     });
+                    let offer_created_at_ms = peer.offer.as_ref().map(|offer| offer.created_at_ms);
                     CoordinationRoomMemberView {
                         peer_id: peer.peer_id.clone(),
                         virtual_ip: peer
@@ -74,6 +76,7 @@ pub fn coordination_room_view(
                         is_host: host_peer_id.as_deref() == Some(peer.peer_id.as_str()),
                         candidate_count,
                         preferred_endpoint,
+                        offer_created_at_ms,
                         last_seen_ms: peer.last_seen_ms,
                         expires_at_ms: peer.expires_at_ms,
                     }
@@ -186,6 +189,7 @@ mod tests {
             view.members[1].preferred_endpoint.as_deref(),
             Some("127.0.0.1:10001")
         );
+        assert_eq!(view.members[1].offer_created_at_ms, Some(20));
         assert!(view.next_action.contains("runtime bootstrap"));
     }
 
