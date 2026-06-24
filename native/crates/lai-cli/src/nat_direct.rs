@@ -5,8 +5,9 @@ use lai_core::{
 };
 use rand::RngCore;
 use serde::Serialize;
+use socket2::{Domain, Protocol, Socket, Type};
 use std::collections::HashSet;
-use std::io::{ErrorKind, Read, Write};
+use std::io::{self, ErrorKind, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream, ToSocketAddrs, UdpSocket};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -61,6 +62,61 @@ impl UpnpPortMappingReport {
             detail: "UPnP port mapping was not requested.".to_owned(),
         }
     }
+}
+
+pub fn bind_udp_socket(bind: &str) -> Result<UdpSocket, Box<dyn std::error::Error>> {
+    let Ok(addr) = bind.parse::<SocketAddr>() else {
+        return UdpSocket::bind(bind).map_err(Into::into);
+    };
+    if addr.ip().is_unspecified() {
+        if let Ok(socket) = bind_dual_stack_udp_socket(addr.port()) {
+            return Ok(socket);
+        }
+    }
+    UdpSocket::bind(addr).map_err(Into::into)
+}
+
+pub fn send_udp_to<A: ToSocketAddrs>(
+    socket: &UdpSocket,
+    bytes: &[u8],
+    target: A,
+) -> io::Result<usize> {
+    let local_is_ipv6 = socket.local_addr()?.is_ipv6();
+    let mut last_error = None;
+    for target in target.to_socket_addrs()? {
+        let mapped_target = if local_is_ipv6 {
+            ipv4_mapped_socket_addr(target)
+        } else {
+            target
+        };
+        match socket.send_to(bytes, mapped_target) {
+            Ok(sent) => return Ok(sent),
+            Err(err) => last_error = Some(err),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| {
+        io::Error::new(
+            ErrorKind::InvalidInput,
+            "UDP target resolved to no addresses",
+        )
+    }))
+}
+
+fn ipv4_mapped_socket_addr(target: SocketAddr) -> SocketAddr {
+    match target {
+        SocketAddr::V4(value) => {
+            SocketAddr::new(IpAddr::V6(value.ip().to_ipv6_mapped()), value.port())
+        }
+        SocketAddr::V6(_) => target,
+    }
+}
+
+fn bind_dual_stack_udp_socket(port: u16) -> Result<UdpSocket, Box<dyn std::error::Error>> {
+    let socket = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP))?;
+    socket.set_only_v6(false)?;
+    let address = SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), port);
+    socket.bind(&address.into())?;
+    Ok(socket.into())
 }
 
 #[derive(Clone, Debug)]
@@ -189,7 +245,7 @@ pub fn run_stun_like_server(
     max_requests: u32,
     timeout_ms: u64,
 ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
-    let socket = UdpSocket::bind(bind)?;
+    let socket = bind_udp_socket(bind)?;
     socket.set_read_timeout(Some(Duration::from_millis(timeout_ms)))?;
     let local_addr = socket.local_addr()?;
     let mut handled_requests = 0u32;
@@ -211,7 +267,7 @@ pub fn run_stun_like_server(
                     "request": request,
                 });
                 let response_bytes = serde_json::to_vec(&response)?;
-                socket.send_to(&response_bytes, peer)?;
+                send_udp_to(&socket, &response_bytes, peer)?;
                 handled_requests = handled_requests.saturating_add(1);
                 requests.push(serde_json::json!({
                     "peer": peer.to_string(),
@@ -257,7 +313,7 @@ pub fn query_stun_like_server(
         "localEndpoint": socket.local_addr()?.to_string(),
     });
     let request_bytes = serde_json::to_vec(&request)?;
-    let sent = socket.send_to(&request_bytes, server)?;
+    let sent = send_udp_to(socket, &request_bytes, server)?;
     let mut buffer = [0u8; 2048];
     let result = match socket.recv_from(&mut buffer) {
         Ok((received, peer)) => {
@@ -374,7 +430,7 @@ pub fn run_nat_hole_punch(
     receive_timeout_ms: u64,
     message: &str,
 ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
-    let socket = UdpSocket::bind(bind)?;
+    let socket = bind_udp_socket(bind)?;
     if receive_timeout_ms > 0 {
         socket.set_read_timeout(Some(Duration::from_millis(receive_timeout_ms)))?;
     }
@@ -423,7 +479,7 @@ pub fn run_nat_hole_punch(
             })
             .to_string();
             for target in &plan.target_endpoints {
-                let sent = socket.send_to(payload.as_bytes(), target)?;
+                let sent = send_udp_to(&socket, payload.as_bytes(), target)?;
                 sent_packets.push(serde_json::json!({
                     "target": target,
                     "attempt": attempt,
@@ -482,7 +538,7 @@ pub fn run_nat_p2p_bootstrap(
     punch_interval_ms: u64,
     handshake_timeout_ms: u64,
 ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
-    let socket = UdpSocket::bind(bind)?;
+    let socket = bind_udp_socket(bind)?;
     run_nat_p2p_bootstrap_on_socket(
         &socket,
         room_id,
@@ -598,7 +654,7 @@ pub fn run_nat_p2p_bootstrap_on_socket(
                 })
                 .to_string();
                 for target in &plan.target_endpoints {
-                    let sent = socket.send_to(payload.as_bytes(), target)?;
+                    let sent = send_udp_to(socket, payload.as_bytes(), target)?;
                     punch_packets.push(serde_json::json!({
                         "target": target,
                         "attempt": punch_attempt,
@@ -610,7 +666,7 @@ pub fn run_nat_p2p_bootstrap_on_socket(
             }
             if Instant::now() >= next_handshake_resend_at {
                 for target in &plan.target_endpoints {
-                    let sent = socket.send_to(&envelope_bytes, target)?;
+                    let sent = send_udp_to(socket, &envelope_bytes, target)?;
                     handshake_packets.push(serde_json::json!({
                         "target": target,
                         "packetKind": "p2p-handshake-hello",
@@ -674,7 +730,7 @@ pub fn run_nat_p2p_bootstrap_on_socket(
                             &ack_bytes,
                         )?;
                         let ack_wire = serde_json::to_vec(&ack_envelope)?;
-                        let sent = socket.send_to(&ack_wire, peer)?;
+                        let sent = send_udp_to(socket, &ack_wire, peer)?;
                         handshake_packets.push(serde_json::json!({
                             "target": peer.to_string(),
                             "packetKind": "p2p-handshake-ack",
@@ -760,7 +816,7 @@ pub fn run_nat_p2p_bootstrap_on_socket(
                             &confirm_bytes,
                         )?;
                         let confirm_wire = serde_json::to_vec(&confirm_envelope)?;
-                        let sent = socket.send_to(&confirm_wire, peer)?;
+                        let sent = send_udp_to(socket, &confirm_wire, peer)?;
                         handshake_packets.push(serde_json::json!({
                             "target": peer.to_string(),
                             "packetKind": "p2p-handshake-confirm",
@@ -872,12 +928,12 @@ pub fn run_nat_hole_punch_loopback_test(
     for attempt in 0..attempts.max(1) {
         let payload_a = format!("{}:{}:{attempt}:{message}", room_id, peer_a);
         for target in &plan_a.target_endpoints {
-            socket_a.send_to(payload_a.as_bytes(), target)?;
+            send_udp_to(&socket_a, payload_a.as_bytes(), target)?;
             sent_a += 1;
         }
         let payload_b = format!("{}:{}:{attempt}:{message}", room_id, peer_b);
         for target in &plan_b.target_endpoints {
-            socket_b.send_to(payload_b.as_bytes(), target)?;
+            send_udp_to(&socket_b, payload_b.as_bytes(), target)?;
             sent_b += 1;
         }
         drain_udp_socket(&socket_a, &mut buffer, &mut received_by_a)?;
@@ -1307,7 +1363,7 @@ fn query_standard_stun_server(
     request.extend_from_slice(&0u16.to_be_bytes());
     request.extend_from_slice(&0x2112A442u32.to_be_bytes());
     request.extend_from_slice(&transaction_id);
-    socket.send_to(&request, server)?;
+    send_udp_to(socket, &request, server)?;
 
     let mut buffer = [0u8; 1500];
     let result = match socket.recv_from(&mut buffer) {
@@ -1424,6 +1480,8 @@ fn default_route_host_candidates(bound: SocketAddr) -> Vec<SocketAddr> {
         }
         IpAddr::V6(addr) => {
             if addr.is_unspecified() {
+                push_default_route_candidate(&mut endpoints, "8.8.8.8:80", port);
+                push_default_route_candidate(&mut endpoints, "1.1.1.1:80", port);
                 push_default_route_candidate(&mut endpoints, "[2001:4860:4860::8888]:80", port);
                 push_default_route_candidate(&mut endpoints, "[2606:4700:4700::1111]:80", port);
             }
@@ -1572,4 +1630,25 @@ fn random_nonce() -> String {
 
 fn invalid_input(message: String) -> Box<dyn std::error::Error> {
     Box::new(std::io::Error::new(ErrorKind::InvalidInput, message))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{bind_udp_socket, send_udp_to};
+    use std::net::UdpSocket;
+    use std::time::Duration;
+
+    #[test]
+    fn dual_stack_bind_keeps_ipv4_udp_reachable() {
+        let receiver = UdpSocket::bind("127.0.0.1:0").unwrap();
+        receiver
+            .set_read_timeout(Some(Duration::from_millis(500)))
+            .unwrap();
+        let sender = bind_udp_socket("0.0.0.0:0").unwrap();
+        send_udp_to(&sender, b"ping", receiver.local_addr().unwrap()).unwrap();
+
+        let mut buffer = [0u8; 16];
+        let (received, _) = receiver.recv_from(&mut buffer).unwrap();
+        assert_eq!(&buffer[..received], b"ping");
+    }
 }

@@ -37,10 +37,10 @@ use lai_core::{
     TunnelObservation, TunnelServiceSnapshot, UdpForwardObservation, VirtualUdpPacket,
 };
 use nat_direct::{
-    apply_stun_mapping_candidates_to_offer, apply_upnp_port_mapping_to_offer,
+    apply_stun_mapping_candidates_to_offer, apply_upnp_port_mapping_to_offer, bind_udp_socket,
     enrich_offer_with_local_host_candidates, query_stun_like_server, run_nat_hole_punch,
     run_nat_hole_punch_loopback_test, run_nat_p2p_bootstrap, run_nat_p2p_bootstrap_on_socket,
-    run_stun_like_server, UpnpPortMappingReport,
+    run_stun_like_server, send_udp_to, UpnpPortMappingReport,
 };
 use rand::RngCore;
 use serde::Serialize;
@@ -1497,7 +1497,7 @@ fn run_main() -> Result<(), Box<dyn std::error::Error>> {
             upnp_gateway_location,
             nonce,
         } => {
-            let socket = UdpSocket::bind(&bind)?;
+            let socket = bind_udp_socket(&bind)?;
             let local_endpoint = socket.local_addr()?;
             let observed_endpoint = observed_endpoint
                 .as_deref()
@@ -4191,7 +4191,7 @@ fn run_tunnel_loopback_test(
     message: &str,
     timeout_ms: u64,
 ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
-    let socket = UdpSocket::bind(bind)?;
+    let socket = bind_udp_socket(bind)?;
     socket.set_read_timeout(Some(Duration::from_millis(timeout_ms)))?;
     let local_addr = socket.local_addr()?;
     let envelope = seal_tunnel_payload(
@@ -4202,7 +4202,7 @@ fn run_tunnel_loopback_test(
         message.as_bytes(),
     )?;
     let wire = serde_json::to_vec(&envelope)?;
-    let sent = socket.send_to(&wire, local_addr)?;
+    let sent = send_udp_to(&socket, &wire, local_addr)?;
     let mut buffer = vec![0u8; 65_535];
     let (received, peer) = socket.recv_from(&mut buffer)?;
     let received_envelope: TunnelEnvelope = serde_json::from_slice(&buffer[..received])?;
@@ -4226,7 +4226,7 @@ fn run_tunnel_listener(
     timeout_ms: u64,
     echo: bool,
 ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
-    let socket = UdpSocket::bind(bind)?;
+    let socket = bind_udp_socket(bind)?;
     socket.set_read_timeout(Some(Duration::from_millis(timeout_ms)))?;
     let mut buffer = vec![0u8; 65_535];
     let mut packets = Vec::new();
@@ -4246,7 +4246,7 @@ fn run_tunnel_listener(
                         &payload.plaintext,
                     )?;
                     let wire = serde_json::to_vec(&reply)?;
-                    socket.send_to(&wire, peer)?;
+                    send_udp_to(&socket, &wire, peer)?;
                 }
                 packets.push(serde_json::json!({
                     "peer": peer.to_string(),
@@ -4286,12 +4286,12 @@ fn run_tunnel_send(
     timeout_ms: u64,
     wait_reply: bool,
 ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
-    let socket = UdpSocket::bind(bind)?;
+    let socket = bind_udp_socket(bind)?;
     socket.set_read_timeout(Some(Duration::from_millis(timeout_ms)))?;
     let peer = peer.parse::<SocketAddr>()?;
     let envelope = seal_tunnel_payload(key, "game-udp", 1, current_epoch_ms(), message.as_bytes())?;
     let wire = serde_json::to_vec(&envelope)?;
-    let sent = socket.send_to(&wire, peer)?;
+    let sent = send_udp_to(&socket, &wire, peer)?;
     let reply = if wait_reply {
         let mut buffer = vec![0u8; 65_535];
         match socket.recv_from(&mut buffer) {
@@ -4595,7 +4595,7 @@ fn relay_packet_event(
             "sequence": sequence,
         }));
     };
-    let sent = socket.send_to(wire, target)?;
+    let sent = send_udp_to(socket, wire, target)?;
     Ok(serde_json::json!({
         "status": "forwarded",
         "source": source.to_string(),
@@ -4947,7 +4947,7 @@ fn register_runtime_relay_targets(
             match runtime_relay_register_packet(room_id, local_peer_id) {
                 Ok(wire) => {
                     if let Some(endpoint) = target.socket_endpoint {
-                        let _ = tunnel_socket.send_to(&wire, endpoint);
+                        let _ = send_udp_to(tunnel_socket, &wire, endpoint);
                     }
                 }
                 Err(err) => {
@@ -5027,7 +5027,7 @@ fn runtime_send_wire_to_target(
                 target.endpoint
             ))
         })?;
-        socket.send_to(&relay_wire, endpoint).map_err(Into::into)
+        send_udp_to(socket, &relay_wire, endpoint).map_err(Into::into)
     } else {
         let endpoint = target.socket_endpoint.ok_or_else(|| {
             invalid_input(format!(
@@ -5035,7 +5035,7 @@ fn runtime_send_wire_to_target(
                 target.endpoint
             ))
         })?;
-        socket.send_to(wire, endpoint).map_err(Into::into)
+        send_udp_to(socket, wire, endpoint).map_err(Into::into)
     }
 }
 
@@ -5275,23 +5275,53 @@ fn runtime_reply_target(
     }
 }
 
+fn socket_addr_equivalent(left: SocketAddr, right: SocketAddr) -> bool {
+    normalized_socket_addr(left) == normalized_socket_addr(right)
+}
+
+fn endpoint_matches_socket_addr(endpoint: &str, observed: SocketAddr) -> bool {
+    endpoint
+        .parse::<SocketAddr>()
+        .ok()
+        .is_some_and(|candidate| socket_addr_equivalent(candidate, observed))
+}
+
+fn endpoint_text_equivalent(left: &str, right: &str) -> bool {
+    if left == right {
+        return true;
+    }
+    match (left.parse::<SocketAddr>(), right.parse::<SocketAddr>()) {
+        (Ok(left), Ok(right)) => socket_addr_equivalent(left, right),
+        _ => false,
+    }
+}
+
+fn normalized_socket_addr(value: SocketAddr) -> SocketAddr {
+    match value {
+        SocketAddr::V6(v6) => v6
+            .ip()
+            .to_ipv4_mapped()
+            .map(|ip| SocketAddr::new(IpAddr::V4(ip), v6.port()))
+            .unwrap_or(SocketAddr::V6(v6)),
+        SocketAddr::V4(_) => value,
+    }
+}
+
 fn runtime_peer_for_reply_endpoint(
     plan: &RoomRuntimePlan,
     observed_peer: SocketAddr,
 ) -> Option<&RoomRuntimePeer> {
     let endpoint = observed_peer.to_string();
     plan.peers.iter().find(|peer| {
-        peer.endpoint == endpoint
+        endpoint_text_equivalent(&peer.endpoint, &endpoint)
             || peer
                 .direct_endpoint
                 .as_deref()
-                .and_then(|candidate| candidate.parse::<SocketAddr>().ok())
-                == Some(observed_peer)
+                .is_some_and(|candidate| endpoint_matches_socket_addr(candidate, observed_peer))
             || peer
                 .fallback_endpoint
                 .as_deref()
-                .and_then(|candidate| candidate.parse::<SocketAddr>().ok())
-                == Some(observed_peer)
+                .is_some_and(|candidate| endpoint_matches_socket_addr(candidate, observed_peer))
     })
 }
 
@@ -5299,15 +5329,13 @@ fn runtime_reply_connection_path(peer: &RoomRuntimePeer, observed_peer: SocketAd
     if peer
         .direct_endpoint
         .as_deref()
-        .and_then(|candidate| candidate.parse::<SocketAddr>().ok())
-        == Some(observed_peer)
+        .is_some_and(|candidate| endpoint_matches_socket_addr(candidate, observed_peer))
     {
         "direct".to_owned()
     } else if peer
         .fallback_endpoint
         .as_deref()
-        .and_then(|candidate| candidate.parse::<SocketAddr>().ok())
-        == Some(observed_peer)
+        .is_some_and(|candidate| endpoint_matches_socket_addr(candidate, observed_peer))
     {
         "relay".to_owned()
     } else {
@@ -5324,7 +5352,7 @@ fn run_p2p_handshake_loopback_test(
     key: &str,
     timeout_ms: u64,
 ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
-    let socket = UdpSocket::bind(bind)?;
+    let socket = bind_udp_socket(bind)?;
     socket.set_read_timeout(Some(Duration::from_millis(timeout_ms)))?;
     let local_addr = socket.local_addr()?;
     let started_at_ms = current_epoch_ms();
@@ -5339,7 +5367,7 @@ fn run_p2p_handshake_loopback_test(
     let hello_bytes = serde_json::to_vec(&hello)?;
     let hello_envelope =
         seal_tunnel_payload(key, "p2p-handshake-hello", 1, started_at_ms, &hello_bytes)?;
-    socket.send_to(&serde_json::to_vec(&hello_envelope)?, local_addr)?;
+    send_udp_to(&socket, &serde_json::to_vec(&hello_envelope)?, local_addr)?;
 
     let mut buffer = vec![0u8; 65_535];
     let (hello_received, hello_peer) = socket.recv_from(&mut buffer)?;
@@ -5358,7 +5386,7 @@ fn run_p2p_handshake_loopback_test(
     let ack_bytes = serde_json::to_vec(&ack)?;
     let ack_envelope =
         seal_tunnel_payload(key, "p2p-handshake-ack", 2, current_epoch_ms(), &ack_bytes)?;
-    socket.send_to(&serde_json::to_vec(&ack_envelope)?, hello_peer)?;
+    send_udp_to(&socket, &serde_json::to_vec(&ack_envelope)?, hello_peer)?;
 
     let (ack_received, ack_peer) = socket.recv_from(&mut buffer)?;
     let received_ack_envelope: TunnelEnvelope = serde_json::from_slice(&buffer[..ack_received])?;
@@ -5389,7 +5417,7 @@ fn run_p2p_handshake_listener(
     max_packets: u16,
     timeout_ms: u64,
 ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
-    let socket = UdpSocket::bind(bind)?;
+    let socket = bind_udp_socket(bind)?;
     socket.set_read_timeout(Some(Duration::from_millis(timeout_ms)))?;
     let local_addr = socket.local_addr()?;
     let mut buffer = vec![0u8; 65_535];
@@ -5445,7 +5473,7 @@ fn run_p2p_handshake_listener(
                     current_epoch_ms(),
                     &ack_bytes,
                 )?;
-                let sent = socket.send_to(&serde_json::to_vec(&ack_envelope)?, peer)?;
+                let sent = send_udp_to(&socket, &serde_json::to_vec(&ack_envelope)?, peer)?;
                 handshakes.push(serde_json::json!({
                     "peer": peer.to_string(),
                     "roomId": hello.room_id,
@@ -5490,7 +5518,7 @@ fn run_p2p_handshake_send(
     key: &str,
     timeout_ms: u64,
 ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
-    let socket = UdpSocket::bind(bind)?;
+    let socket = bind_udp_socket(bind)?;
     socket.set_read_timeout(Some(Duration::from_millis(timeout_ms)))?;
     let local_addr = socket.local_addr()?;
     let peer = peer.parse::<SocketAddr>()?;
@@ -5506,7 +5534,7 @@ fn run_p2p_handshake_send(
     let hello_bytes = serde_json::to_vec(&hello)?;
     let hello_envelope =
         seal_tunnel_payload(key, "p2p-handshake-hello", 1, started_at_ms, &hello_bytes)?;
-    let sent = socket.send_to(&serde_json::to_vec(&hello_envelope)?, peer)?;
+    let sent = send_udp_to(&socket, &serde_json::to_vec(&hello_envelope)?, peer)?;
 
     let mut buffer = vec![0u8; 65_535];
     let (received, ack_peer) = socket.recv_from(&mut buffer)?;
@@ -7683,7 +7711,7 @@ fn run_room_runtime(
 fn bind_runtime_tunnel_socket(
     bind_endpoint: &str,
 ) -> Result<UdpSocket, Box<dyn std::error::Error>> {
-    UdpSocket::bind(bind_endpoint).map_err(|err| {
+    bind_udp_socket(bind_endpoint).map_err(|err| {
         invalid_input(format!(
             "failed to bind runtime UDP tunnel socket `{bind_endpoint}`: {err}"
         ))
@@ -8040,8 +8068,9 @@ fn next_runtime_sequence(next_sequence: &mut u64) -> u64 {
 mod tests {
     use super::{
         best_direct_candidate_endpoint, current_epoch_ms, is_benign_route_result,
-        latest_runtime_non_icmp_traffic_at_ms, latest_runtime_traffic_at_ms, next_runtime_sequence,
-        runtime_active_connection_path, runtime_connected_peer_count_from_summaries,
+        json_matches_runtime_peer, latest_runtime_non_icmp_traffic_at_ms,
+        latest_runtime_traffic_at_ms, next_runtime_sequence, runtime_active_connection_path,
+        runtime_connected_peer_count_from_summaries, runtime_observed_configured_peer,
         runtime_peer_from_bootstrap_result, runtime_peer_summaries, runtime_plan_has_relay_peer,
         runtime_reply_target, runtime_targets_for_virtual_packet_destination,
         runtime_update_active_peer_direct_endpoint, trim_event_log, RuntimeSendTarget,
@@ -8217,6 +8246,60 @@ mod tests {
         assert_eq!(target.peer_id, "peer_b");
         assert_eq!(target.endpoint, direct_endpoint.to_string());
         assert_eq!(target.connection_path, "direct");
+    }
+
+    #[test]
+    fn reply_target_matches_ipv4_mapped_direct_endpoint() {
+        let observed_endpoint: SocketAddr = "[::ffff:127.0.0.1]:41001".parse().unwrap();
+        let plan = RoomRuntimePlan {
+            room_id: "room".to_owned(),
+            local_peer_id: "peer_a".to_owned(),
+            local_virtual_ip: Ipv4Addr::new(10, 77, 12, 2),
+            tunnel: RuntimeTunnelPlan {
+                bind_endpoint: "0.0.0.0:0".to_owned(),
+                encryption: "psk".to_owned(),
+                handshake: "p2p".to_owned(),
+                peer_count: 1,
+            },
+            peers: vec![RoomRuntimePeer {
+                peer_id: "peer_b".to_owned(),
+                virtual_ip: Ipv4Addr::new(10, 77, 12, 3),
+                endpoint: "203.0.113.10:39091".to_owned(),
+                connection_path: "relay".to_owned(),
+                direct_endpoint: Some("127.0.0.1:41001".to_owned()),
+                fallback_endpoint: Some("203.0.113.10:39091".to_owned()),
+            }],
+            capture_ports: Vec::<RuntimePortBinding>::new(),
+            udp_forwarders: Vec::<RuntimeUdpForwardPlan>::new(),
+            diagnostic_outputs: Vec::new(),
+            warnings: Vec::new(),
+        };
+
+        let target = runtime_reply_target(&plan, observed_endpoint, None);
+        let observed_peer = runtime_observed_configured_peer(&plan, observed_endpoint, None, false)
+            .expect("mapped IPv4 endpoint should match configured peer");
+
+        assert_eq!(target.peer_id, "peer_b");
+        assert_eq!(target.connection_path, "direct");
+        assert_eq!(observed_peer.peer_id, "peer_b");
+    }
+
+    #[test]
+    fn runtime_json_peer_match_accepts_ipv4_mapped_endpoint_text() {
+        let peer = RoomRuntimePeer {
+            peer_id: "peer_b".to_owned(),
+            virtual_ip: Ipv4Addr::new(10, 77, 12, 3),
+            endpoint: "203.0.113.10:39091".to_owned(),
+            connection_path: "relay".to_owned(),
+            direct_endpoint: Some("127.0.0.1:41001".to_owned()),
+            fallback_endpoint: Some("203.0.113.10:39091".to_owned()),
+        };
+        let value = serde_json::json!({
+            "peer": "[::ffff:127.0.0.1]:41001",
+            "connectionPath": "direct"
+        });
+
+        assert!(json_matches_runtime_peer(&value, &peer));
     }
 
     #[test]
@@ -9476,12 +9559,11 @@ fn runtime_observed_configured_peer<'a>(
         return None;
     }
     plan.peers.iter().find(|peer| {
-        peer.endpoint.parse::<SocketAddr>().ok() == Some(observed_peer)
+        endpoint_matches_socket_addr(&peer.endpoint, observed_peer)
             || peer
                 .direct_endpoint
                 .as_deref()
-                .and_then(|endpoint| endpoint.parse::<SocketAddr>().ok())
-                == Some(observed_peer)
+                .is_some_and(|endpoint| endpoint_matches_socket_addr(endpoint, observed_peer))
     })
 }
 
@@ -10558,15 +10640,15 @@ fn json_matches_runtime_peer(value: &serde_json::Value, peer: &RoomRuntimePeer) 
     else {
         return false;
     };
-    endpoint == peer.endpoint
+    endpoint_text_equivalent(endpoint, &peer.endpoint)
         || peer
             .direct_endpoint
             .as_deref()
-            .is_some_and(|direct| endpoint == direct)
+            .is_some_and(|direct| endpoint_text_equivalent(endpoint, direct))
         || peer
             .fallback_endpoint
             .as_deref()
-            .is_some_and(|fallback| endpoint == fallback)
+            .is_some_and(|fallback| endpoint_text_equivalent(endpoint, fallback))
 }
 
 fn json_matches_runtime_peer_path(

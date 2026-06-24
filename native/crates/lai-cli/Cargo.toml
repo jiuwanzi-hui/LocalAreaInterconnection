@@ -11,3 +11,4 @@ lai-core = { path = "../lai-core" }
 rand.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+socket2.workspace = true
