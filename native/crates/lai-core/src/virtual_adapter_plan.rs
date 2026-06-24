@@ -45,6 +45,7 @@ pub fn create_windows_virtual_adapter_plan(
         set_static_address_command(&adapter_name, assigned_ip, subnet_mask),
         set_mtu_command(&adapter_name, mtu),
         set_metric_command(&adapter_name, interface_metric),
+        delete_subnet_route_command(virtual_subnet, subnet_mask),
         ensure_subnet_route_command(&adapter_name, virtual_subnet, interface_metric),
         show_config_command(&adapter_name),
     ];
@@ -133,6 +134,25 @@ fn ensure_subnet_route_command(
         args,
         "Ensure the room subnet routes through the virtual adapter.",
     )
+}
+
+fn delete_subnet_route_command(
+    virtual_subnet: Ipv4Subnet,
+    subnet_mask: Ipv4Addr,
+) -> NetworkCommand {
+    let args = vec![
+        "delete".to_owned(),
+        virtual_subnet.network.to_string(),
+        "mask".to_owned(),
+        subnet_mask.to_string(),
+    ];
+    NetworkCommand {
+        tool: "route".to_owned(),
+        command: format_command("route", &args),
+        args,
+        purpose: "Remove stale room subnet routes before adding the current virtual adapter route."
+            .to_owned(),
+    }
 }
 
 fn show_config_command(adapter_name: &str) -> NetworkCommand {
@@ -239,7 +259,7 @@ mod tests {
             plan.subnet_mask,
             "255.255.255.0".parse::<Ipv4Addr>().unwrap()
         );
-        assert_eq!(plan.commands.len(), 5);
+        assert_eq!(plan.commands.len(), 6);
         assert!(plan.commands[0]
             .command
             .contains("set address name=LocalAreaInterconnection static 10.77.12.2 255.255.255.0"));
@@ -247,11 +267,14 @@ mod tests {
         assert!(plan.commands[2].command.contains("metric=5"));
         assert!(plan.commands[3]
             .command
+            .contains("route delete 10.77.12.0 mask 255.255.255.0"));
+        assert!(plan.commands[4]
+            .command
             .contains("add route prefix=10.77.12.0/24"));
-        assert!(plan.commands[3]
+        assert!(plan.commands[4]
             .command
             .contains("interface=LocalAreaInterconnection"));
-        assert!(plan.commands[3].command.contains("store=active"));
+        assert!(plan.commands[4].command.contains("store=active"));
         assert!(plan.warnings.is_empty());
     }
 

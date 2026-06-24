@@ -4095,7 +4095,7 @@ fn execute_network_command(command: &NetworkCommand) -> CommandExecutionRecord {
         Ok(output) => {
             let stdout = String::from_utf8_lossy(&output.stdout).to_string();
             let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-            let benign = is_existing_route_result(command, &stdout, &stderr);
+            let benign = is_benign_route_result(command, &stdout, &stderr);
             let succeeded = output.status.success() || benign;
             CommandExecutionRecord {
                 command: command.command.clone(),
@@ -4112,7 +4112,7 @@ fn execute_network_command(command: &NetworkCommand) -> CommandExecutionRecord {
                 next_action: if output.status.success() {
                     None
                 } else if benign {
-                    Some("The room subnet route already exists; continuing with the existing active route.".to_owned())
+                    Some("The route command reported an already-clean or already-existing route state; continuing.".to_owned())
                 } else {
                     Some("Check that the adapter name exists and rerun from an Administrator terminal.".to_owned())
                 },
@@ -4134,7 +4134,7 @@ fn execute_network_command(command: &NetworkCommand) -> CommandExecutionRecord {
     }
 }
 
-fn is_existing_route_result(command: &NetworkCommand, stdout: &str, stderr: &str) -> bool {
+fn is_benign_route_result(command: &NetworkCommand, stdout: &str, stderr: &str) -> bool {
     let is_route_add = command.tool.eq_ignore_ascii_case("netsh")
         && command
             .args
@@ -4143,14 +4143,28 @@ fn is_existing_route_result(command: &NetworkCommand, stdout: &str, stderr: &str
             .collect::<Vec<_>>()
             .windows(3)
             .any(|items| items == ["ipv4", "add", "route"]);
-    if !is_route_add {
-        return false;
-    }
+    let is_route_delete = command.tool.eq_ignore_ascii_case("route")
+        && command
+            .args
+            .first()
+            .is_some_and(|arg| arg.eq_ignore_ascii_case("delete"));
     let text = format!("{stdout}\n{stderr}").to_ascii_lowercase();
-    text.contains("already exists")
-        || text.contains("object already exists")
-        || text.contains("对象已存在")
-        || text.contains("已存在")
+    if is_route_add {
+        return text.contains("already exists")
+            || text.contains("object already exists")
+            || text.contains("对象已存在")
+            || text.contains("已存在");
+    }
+    if is_route_delete {
+        return text.contains("not found")
+            || text.contains("cannot find")
+            || text.contains("element not found")
+            || text.contains("找不到")
+            || text.contains("未找到")
+            || text.contains("没有找到")
+            || text.contains("不存在");
+    }
+    false
 }
 
 fn run_tunnel_loopback_test(
@@ -7522,11 +7536,11 @@ fn next_runtime_sequence(next_sequence: &mut u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        next_runtime_sequence, runtime_peer_from_bootstrap_result,
+        is_benign_route_result, next_runtime_sequence, runtime_peer_from_bootstrap_result,
         runtime_targets_for_virtual_packet_destination, trim_event_log, RuntimeSendTarget,
     };
     use lai_core::{
-        RoomRuntimePeer, RoomRuntimePlan, RuntimePortBinding, RuntimeTunnelPlan,
+        NetworkCommand, RoomRuntimePeer, RoomRuntimePlan, RuntimePortBinding, RuntimeTunnelPlan,
         RuntimeUdpForwardPlan,
     };
     use std::net::Ipv4Addr;
@@ -7615,6 +7629,49 @@ mod tests {
             peer.fallback_endpoint,
             Some("203.0.113.10:39091".to_owned())
         );
+    }
+
+    #[test]
+    fn route_command_results_treat_expected_idempotent_states_as_benign() {
+        let add_route = NetworkCommand {
+            tool: "netsh".to_owned(),
+            args: vec![
+                "interface".to_owned(),
+                "ipv4".to_owned(),
+                "add".to_owned(),
+                "route".to_owned(),
+                "prefix=10.77.12.0/24".to_owned(),
+            ],
+            command: "netsh interface ipv4 add route prefix=10.77.12.0/24".to_owned(),
+            purpose: "add route".to_owned(),
+        };
+        let delete_route = NetworkCommand {
+            tool: "route".to_owned(),
+            args: vec![
+                "delete".to_owned(),
+                "10.77.12.0".to_owned(),
+                "mask".to_owned(),
+                "255.255.255.0".to_owned(),
+            ],
+            command: "route delete 10.77.12.0 mask 255.255.255.0".to_owned(),
+            purpose: "delete stale route".to_owned(),
+        };
+
+        assert!(is_benign_route_result(
+            &add_route,
+            "",
+            "The object already exists."
+        ));
+        assert!(is_benign_route_result(
+            &delete_route,
+            "",
+            "The route specified was not found."
+        ));
+        assert!(!is_benign_route_result(
+            &delete_route,
+            "",
+            "Access is denied."
+        ));
     }
 
     #[test]
