@@ -57,6 +57,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 const RUNTIME_PEER_CONNECTED_WINDOW_MS: u64 = 5_000;
 const RUNTIME_HTTP_RELAY_PACKET_MAX_AGE_MS: u128 = 5_000;
 const RUNTIME_RELAY_REGISTRATION_INTERVAL_MS: u64 = 2_000;
+const RUNTIME_DIRECT_RESTORE_CONFIRMATIONS: u8 = 2;
+const RUNTIME_DIRECT_RESTORE_WINDOW_MS: u64 = 3_000;
 const RUNTIME_TUNNEL_READ_TIMEOUT_MS: u64 = 1;
 const RUNTIME_WINTUN_DRAIN_LIMIT: usize = 64;
 const RUNTIME_HEARTBEAT_EVENT_LOG_LIMIT: usize = 20_000;
@@ -5796,6 +5798,9 @@ fn run_room_runtime(
     };
     let mut using_relay_fallback_targets = false;
     let mut relay_fallback_events = Vec::new();
+    let mut direct_restore_probe_endpoint = String::new();
+    let mut direct_restore_probe_count = 0u8;
+    let mut direct_restore_probe_started_at = None::<Instant>;
     let mut heartbeat_targets =
         runtime_heartbeat_targets(plan, self_probe, tunnel_endpoint, false)?;
     let relay_registration_targets = runtime_heartbeat_targets(plan, false, tunnel_endpoint, true)?
@@ -6192,6 +6197,9 @@ fn run_room_runtime(
                         })
                     {
                         using_relay_fallback_targets = true;
+                        direct_restore_probe_endpoint.clear();
+                        direct_restore_probe_count = 0;
+                        direct_restore_probe_started_at = None;
                         heartbeat_targets =
                             runtime_heartbeat_targets(plan, self_probe, tunnel_endpoint, true)?;
                         forward_targets_by_port = runtime_forward_targets(
@@ -6273,24 +6281,54 @@ fn run_room_runtime(
                             && using_relay_fallback_targets
                             && observed_remote_peer
                         {
-                            using_relay_fallback_targets = false;
-                            heartbeat_targets = runtime_direct_heartbeat_targets(
-                                plan,
-                                self_probe,
-                                tunnel_endpoint,
-                            )?;
-                            forward_targets_by_port = runtime_direct_forward_targets(
-                                plan,
-                                &actual_broadcast_ports,
-                                forward_self_probe,
-                                tunnel_endpoint,
-                            )?;
+                            let direct_endpoint = peer.to_string();
+                            let restore_window_expired = direct_restore_probe_started_at
+                                .map(|started| {
+                                    Instant::now().saturating_duration_since(started)
+                                        > Duration::from_millis(RUNTIME_DIRECT_RESTORE_WINDOW_MS)
+                                })
+                                .unwrap_or(true);
+                            if direct_restore_probe_endpoint != direct_endpoint
+                                || restore_window_expired
+                            {
+                                direct_restore_probe_endpoint = direct_endpoint.clone();
+                                direct_restore_probe_count = 0;
+                                direct_restore_probe_started_at = Some(Instant::now());
+                            }
+                            direct_restore_probe_count =
+                                direct_restore_probe_count.saturating_add(1);
                             relay_fallback_events.push(serde_json::json!({
-                                "status": "restored-direct",
+                                "status": "direct-restore-probe",
                                 "reason": "direct-packet-received",
-                                "restoredAtMs": received_at_ms,
-                                "endpoint": peer.to_string(),
+                                "observedAtMs": received_at_ms,
+                                "endpoint": direct_endpoint,
+                                "confirmationCount": direct_restore_probe_count,
+                                "requiredConfirmations": RUNTIME_DIRECT_RESTORE_CONFIRMATIONS,
                             }));
+                            if direct_restore_probe_count >= RUNTIME_DIRECT_RESTORE_CONFIRMATIONS {
+                                using_relay_fallback_targets = false;
+                                direct_restore_probe_endpoint.clear();
+                                direct_restore_probe_count = 0;
+                                direct_restore_probe_started_at = None;
+                                heartbeat_targets = runtime_direct_heartbeat_targets(
+                                    plan,
+                                    self_probe,
+                                    tunnel_endpoint,
+                                )?;
+                                forward_targets_by_port = runtime_direct_forward_targets(
+                                    plan,
+                                    &actual_broadcast_ports,
+                                    forward_self_probe,
+                                    tunnel_endpoint,
+                                )?;
+                                relay_fallback_events.push(serde_json::json!({
+                                    "status": "restored-direct",
+                                    "reason": "direct-packet-confirmed",
+                                    "restoredAtMs": received_at_ms,
+                                    "endpoint": peer.to_string(),
+                                    "confirmations": RUNTIME_DIRECT_RESTORE_CONFIRMATIONS,
+                                }));
+                            }
                         }
                         let was_peer_timed_out = peer_timed_out;
                         if observed_remote_peer {
