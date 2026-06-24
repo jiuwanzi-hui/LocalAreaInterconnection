@@ -825,6 +825,11 @@ fn run_main() -> Result<(), Box<dyn std::error::Error>> {
                 .get("actualTunnelEndpoint")
                 .and_then(serde_json::Value::as_str)
                 .map(str::to_owned);
+            let force_active_path = result
+                .get("relayFallbackActive")
+                .and_then(serde_json::Value::as_bool)
+                .filter(|active| *active)
+                .map(|_| "relay");
             let runtime_peer_summary_values = runtime_peer_summaries(
                 &plan,
                 &connection_path_reports,
@@ -836,6 +841,7 @@ fn run_main() -> Result<(), Box<dyn std::error::Error>> {
                     .get("tunnelServiceSnapshot")
                     .and_then(|snapshot| snapshot.get("connection_path"))
                     .and_then(serde_json::Value::as_str),
+                force_active_path,
                 actual_tunnel_endpoint.as_deref(),
             );
             refresh_runtime_network_observation(
@@ -6061,11 +6067,15 @@ fn run_room_runtime(
         {
             if now >= next_snapshot {
                 let tunnel_endpoint_text = tunnel_endpoint.to_string();
-                let snapshot_observed_connection_path =
+                let snapshot_observed_connection_path_from_packets =
                     runtime_observed_connection_path_from_packets(
                         &tunnel_packets,
                         &heartbeat_ack_packets,
                     );
+                let snapshot_active_connection_path = runtime_active_connection_path(
+                    snapshot_observed_connection_path_from_packets.as_deref(),
+                    using_relay_fallback_targets,
+                );
                 let snapshot_peer_summaries = runtime_peer_summaries(
                     plan,
                     &[],
@@ -6073,7 +6083,8 @@ fn run_room_runtime(
                     &forwarded_packets,
                     &heartbeat_packets,
                     &heartbeat_ack_packets,
-                    snapshot_observed_connection_path.as_deref(),
+                    snapshot_active_connection_path.as_deref(),
+                    using_relay_fallback_targets.then_some("relay"),
                     Some(tunnel_endpoint_text.as_str()),
                 );
                 let snapshot_connected_peer_count =
@@ -7331,6 +7342,10 @@ fn run_room_runtime(
 
     let observed_connection_path_from_packets =
         runtime_observed_connection_path_from_packets(&tunnel_packets, &heartbeat_ack_packets);
+    let active_connection_path = runtime_active_connection_path(
+        observed_connection_path_from_packets.as_deref(),
+        using_relay_fallback_targets,
+    );
     let tunnel_endpoint_text = tunnel_endpoint.to_string();
     let runtime_peer_summary_values = runtime_peer_summaries(
         plan,
@@ -7339,13 +7354,14 @@ fn run_room_runtime(
         &forwarded_packets,
         &heartbeat_packets,
         &heartbeat_ack_packets,
-        observed_connection_path_from_packets.as_deref(),
+        active_connection_path.as_deref(),
+        using_relay_fallback_targets.then_some("relay"),
         Some(tunnel_endpoint_text.as_str()),
     );
     let connected_peer_count =
         runtime_connected_peer_count_from_summaries(&runtime_peer_summary_values);
     let observed_connection_path = if connected_peer_count > 0 {
-        observed_connection_path_from_packets
+        active_connection_path
     } else {
         None
     };
@@ -7693,9 +7709,10 @@ fn next_runtime_sequence(next_sequence: &mut u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        best_direct_candidate_endpoint, is_benign_route_result, latest_runtime_traffic_at_ms,
-        next_runtime_sequence, runtime_connected_peer_count_from_summaries,
-        runtime_peer_from_bootstrap_result, runtime_reply_target,
+        best_direct_candidate_endpoint, current_epoch_ms, is_benign_route_result,
+        latest_runtime_traffic_at_ms, next_runtime_sequence, runtime_active_connection_path,
+        runtime_connected_peer_count_from_summaries, runtime_peer_from_bootstrap_result,
+        runtime_peer_summaries, runtime_reply_target,
         runtime_targets_for_virtual_packet_destination, trim_event_log, RuntimeSendTarget,
     };
     use lai_core::{
@@ -7974,6 +7991,92 @@ mod tests {
             "lastSeenAtMs": 1000
         })];
         assert_eq!(runtime_connected_peer_count_from_summaries(&self_probe), 0);
+    }
+
+    #[test]
+    fn runtime_peer_summary_keeps_relay_active_during_direct_restore_probe() {
+        let direct_endpoint = "127.0.0.1:41001";
+        let relay_endpoint = "203.0.113.10:39091";
+        let plan = RoomRuntimePlan {
+            room_id: "room".to_owned(),
+            local_peer_id: "peer_a".to_owned(),
+            local_virtual_ip: Ipv4Addr::new(10, 77, 12, 2),
+            tunnel: RuntimeTunnelPlan {
+                bind_endpoint: "127.0.0.1:0".to_owned(),
+                encryption: "psk".to_owned(),
+                handshake: "p2p".to_owned(),
+                peer_count: 1,
+            },
+            peers: vec![RoomRuntimePeer {
+                peer_id: "peer_b".to_owned(),
+                virtual_ip: Ipv4Addr::new(10, 77, 12, 3),
+                endpoint: relay_endpoint.to_owned(),
+                connection_path: "relay".to_owned(),
+                direct_endpoint: Some(direct_endpoint.to_owned()),
+                fallback_endpoint: Some(relay_endpoint.to_owned()),
+            }],
+            capture_ports: Vec::<RuntimePortBinding>::new(),
+            udp_forwarders: Vec::<RuntimeUdpForwardPlan>::new(),
+            diagnostic_outputs: Vec::new(),
+            warnings: Vec::new(),
+        };
+        let now_ms = current_epoch_ms() as u64;
+        let heartbeat_ack_packets = vec![
+            serde_json::json!({
+                "direction": "received",
+                "peer": relay_endpoint,
+                "peerId": "peer_b",
+                "connectionPath": "relay",
+                "bytesReceived": 90,
+                "receivedAtMs": now_ms.saturating_sub(20),
+                "roundTripMs": 40,
+            }),
+            serde_json::json!({
+                "direction": "received",
+                "peer": direct_endpoint,
+                "peerId": "peer_b",
+                "connectionPath": "direct",
+                "bytesReceived": 50,
+                "receivedAtMs": now_ms,
+                "roundTripMs": 4,
+            }),
+        ];
+
+        assert_eq!(
+            runtime_active_connection_path(Some("p2p"), true),
+            Some("relay".to_owned())
+        );
+        let relay_summary = runtime_peer_summaries(
+            &plan,
+            &[],
+            &[],
+            &[],
+            &[],
+            &heartbeat_ack_packets,
+            Some("relay"),
+            Some("relay"),
+            None,
+        );
+        let direct_probe_summary = runtime_peer_summaries(
+            &plan,
+            &[],
+            &[],
+            &[],
+            &[],
+            &heartbeat_ack_packets,
+            Some("p2p"),
+            None,
+            None,
+        );
+
+        assert_eq!(relay_summary[0]["selectedPath"], "relay");
+        assert_eq!(relay_summary[0]["pathKind"], "relay");
+        assert_eq!(relay_summary[0]["connectionPathStatus"], "relay-ready");
+        assert_eq!(relay_summary[0]["latencyMs"], 40);
+        assert_eq!(relay_summary[0]["heartbeatAckPacketsReceived"], 1);
+        assert_eq!(direct_probe_summary[0]["selectedPath"], "direct");
+        assert_eq!(direct_probe_summary[0]["pathKind"], "direct");
+        assert_eq!(direct_probe_summary[0]["latencyMs"], 4);
     }
 
     #[test]
@@ -9113,6 +9216,7 @@ fn runtime_peer_summaries(
     heartbeat_packets: &[serde_json::Value],
     heartbeat_ack_packets: &[serde_json::Value],
     runtime_path: Option<&str>,
+    force_active_path: Option<&str>,
     local_endpoint: Option<&str>,
 ) -> Vec<serde_json::Value> {
     runtime_observed_peers(
@@ -9136,8 +9240,9 @@ fn runtime_peer_summaries(
             .and_then(|report| report.get("selected_path"))
             .and_then(serde_json::Value::as_str)
             .map(str::to_owned);
-        let selected_path = observed_path
-            .clone()
+        let selected_path = force_active_path
+            .map(str::to_owned)
+            .or(observed_path.clone())
             .or_else(|| {
                 runtime_path
                     .filter(|_| peer_has_tunnel_packets(tunnel_packets, &peer.endpoint))
@@ -9145,9 +9250,21 @@ fn runtime_peer_summaries(
             })
             .or(report_selected_path.clone())
             .unwrap_or_else(|| "unknown".to_owned());
-        let connection_path_status = report
-            .and_then(|report| report.get("status"))
-            .and_then(serde_json::Value::as_str)
+        let forced_connection_path_status = force_active_path.and_then(|path| {
+            if path.eq_ignore_ascii_case("relay") || path.eq_ignore_ascii_case("relayed") {
+                Some("relay-ready")
+            } else if path.eq_ignore_ascii_case("direct") || path.eq_ignore_ascii_case("p2p") {
+                Some("observed")
+            } else {
+                None
+            }
+        });
+        let connection_path_status = forced_connection_path_status
+            .or_else(|| {
+                report
+                    .and_then(|report| report.get("status"))
+                    .and_then(serde_json::Value::as_str)
+            })
             .or_else(|| {
                 if selected_path == "relay" {
                     Some("relay-ready")
@@ -9848,6 +9965,17 @@ fn runtime_observed_connection_path_from_packets(
             tunnel_packets,
             heartbeat_ack_packets,
         ))
+    }
+}
+
+fn runtime_active_connection_path(
+    observed_connection_path: Option<&str>,
+    relay_fallback_active: bool,
+) -> Option<String> {
+    if relay_fallback_active {
+        Some("relay".to_owned())
+    } else {
+        observed_connection_path.map(str::to_owned)
     }
 }
 
