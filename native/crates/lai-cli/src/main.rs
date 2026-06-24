@@ -5749,6 +5749,8 @@ fn run_room_runtime(
         .map(|_| started_at + Duration::from_millis(1));
     let mut heartbeat_packets = Vec::new();
     let mut heartbeat_ack_packets = Vec::new();
+    let mut next_heartbeat_sequence = 1u64;
+    let mut next_forward_sequence = 1u64;
     let mut coordination_monitor_reports = Vec::new();
     let mut snapshot_write_count = 0u32;
     let mut last_peer_packet_at = None;
@@ -5846,7 +5848,7 @@ fn run_room_runtime(
                 heartbeat_targets.clone()
             };
             for target in &heartbeat_targets_for_tick {
-                let sequence = heartbeat_packets.len() as u64 + 1;
+                let sequence = next_runtime_sequence(&mut next_heartbeat_sequence);
                 let sent_at_ms = current_epoch_ms();
                 let heartbeat = serde_json::json!({
                     "room_id": plan.room_id,
@@ -6377,7 +6379,8 @@ fn run_room_runtime(
                                             observed_peer,
                                             opened.relay.as_ref(),
                                         );
-                                        let sequence = forwarded_packets.len() as u64 + 1;
+                                        let sequence =
+                                            next_runtime_sequence(&mut next_forward_sequence);
                                         match runtime_send_icmp_echo_reply(
                                             &tunnel_socket,
                                             key,
@@ -6590,15 +6593,15 @@ fn run_room_runtime(
                                         packet.destination_ip, packet.destination_port
                                     ));
                             }
+                            let sequence = next_runtime_sequence(&mut next_forward_sequence);
                             let envelope = seal_tunnel_payload(
                                 key,
                                 "runtime-udp-forward",
-                                forwarded_packets.len() as u64 + 1,
+                                sequence,
                                 current_epoch_ms(),
                                 serde_json::to_string(&forward_payload)?.as_bytes(),
                             )?;
                             let wire = serde_json::to_vec(&envelope)?;
-                            let sequence = forwarded_packets.len() as u64 + 1;
                             match runtime_send_wire_to_target(
                                 &tunnel_socket,
                                 key,
@@ -6759,15 +6762,16 @@ fn run_room_runtime(
                                         "virtual_source": format!("{}:{}", udp_packet.source_ip, udp_packet.source_port),
                                         "virtual_destination": format!("{}:{}", udp_packet.destination_ip, udp_packet.destination_port),
                                     });
+                                    let sequence =
+                                        next_runtime_sequence(&mut next_forward_sequence);
                                     let envelope = seal_tunnel_payload(
                                         key,
                                         "runtime-udp-forward",
-                                        forwarded_packets.len() as u64 + 1,
+                                        sequence,
                                         current_epoch_ms(),
                                         serde_json::to_string(&forward_payload)?.as_bytes(),
                                     )?;
                                     let wire = serde_json::to_vec(&envelope)?;
-                                    let sequence = forwarded_packets.len() as u64 + 1;
                                     match runtime_send_wire_to_target(
                                         &tunnel_socket,
                                         key,
@@ -6870,15 +6874,16 @@ fn run_room_runtime(
                                         "ipv4_protocol": summary.protocol.clone(),
                                         "ipv4_protocol_number": summary.protocol_number,
                                     });
+                                    let sequence =
+                                        next_runtime_sequence(&mut next_forward_sequence);
                                     let envelope = seal_tunnel_payload(
                                         key,
                                         "runtime-ipv4-forward",
-                                        forwarded_packets.len() as u64 + 1,
+                                        sequence,
                                         current_epoch_ms(),
                                         serde_json::to_string(&forward_payload)?.as_bytes(),
                                     )?;
                                     let wire = serde_json::to_vec(&envelope)?;
-                                    let sequence = forwarded_packets.len() as u64 + 1;
                                     match runtime_send_wire_to_target(
                                         &tunnel_socket,
                                         key,
@@ -6977,15 +6982,16 @@ fn run_room_runtime(
                                         "ipv4_protocol": summary.protocol.clone(),
                                         "ipv4_protocol_number": summary.protocol_number,
                                     });
+                                    let sequence =
+                                        next_runtime_sequence(&mut next_forward_sequence);
                                     let envelope = seal_tunnel_payload(
                                         key,
                                         "runtime-ipv4-forward",
-                                        forwarded_packets.len() as u64 + 1,
+                                        sequence,
                                         current_epoch_ms(),
                                         serde_json::to_string(&forward_payload)?.as_bytes(),
                                     )?;
                                     let wire = serde_json::to_vec(&envelope)?;
-                                    let sequence = forwarded_packets.len() as u64 + 1;
                                     match runtime_send_wire_to_target(
                                         &tunnel_socket,
                                         key,
@@ -7389,10 +7395,17 @@ fn trim_event_log<T>(items: &mut Vec<T>, limit: usize) {
     }
 }
 
+fn next_runtime_sequence(next_sequence: &mut u64) -> u64 {
+    let sequence = *next_sequence;
+    *next_sequence = (*next_sequence).saturating_add(1);
+    sequence
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        runtime_targets_for_virtual_packet_destination, trim_event_log, RuntimeSendTarget,
+        next_runtime_sequence, runtime_targets_for_virtual_packet_destination, trim_event_log,
+        RuntimeSendTarget,
     };
     use lai_core::{
         RoomRuntimePeer, RoomRuntimePlan, RuntimePortBinding, RuntimeTunnelPlan,
@@ -7408,6 +7421,19 @@ mod tests {
 
         trim_event_log(&mut values, 0);
         assert!(values.is_empty());
+    }
+
+    #[test]
+    fn runtime_sequence_is_independent_from_trimmed_logs() {
+        let mut next_sequence = 1u64;
+        let mut retained_events = Vec::new();
+        for _ in 0..5 {
+            retained_events.push(next_runtime_sequence(&mut next_sequence));
+            trim_event_log(&mut retained_events, 2);
+        }
+
+        assert_eq!(retained_events, vec![4, 5]);
+        assert_eq!(next_runtime_sequence(&mut next_sequence), 6);
     }
 
     #[test]
