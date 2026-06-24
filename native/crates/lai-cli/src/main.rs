@@ -6774,23 +6774,60 @@ fn run_room_runtime(
                         } else {
                             &[]
                         };
+                        let gate_source_ip = if source_ip == Ipv4Addr::LOCALHOST
+                            && forward_self_probe
+                            && forward_capture_broadcast
+                        {
+                            plan.local_virtual_ip
+                        } else {
+                            source_ip
+                        };
+                        let broadcast_decision = forward_capture_broadcast.then(|| {
+                            broadcast_gate.decide(
+                                &lai_core::BroadcastPacket {
+                                    protocol: "udp".to_owned(),
+                                    source_ip: gate_source_ip,
+                                    destination_ip: runtime_broadcast_ip(plan.local_virtual_ip),
+                                    destination_port: destination.port(),
+                                },
+                                current_epoch_ms(),
+                            )
+                        });
+                        let should_forward_broadcast = forward_capture_broadcast
+                            && broadcast_decision
+                                .as_ref()
+                                .map(|decision| decision.forward)
+                                .unwrap_or(false)
+                            && !targets.is_empty();
                         broadcast_forward_events.push(lai_core::BroadcastForwardEvent {
                             protocol: "udp".to_owned(),
                             source_ip,
                             destination_ip: socket_addr_ipv4(destination),
                             destination_port: destination.port(),
-                            forwarded: !targets.is_empty(),
+                            forwarded: should_forward_broadcast,
                             reason: if !forward_capture_broadcast {
                                 "remote-source-loop-prevention".to_owned()
+                            } else if let Some(decision) = broadcast_decision
+                                .as_ref()
+                                .filter(|decision| !decision.forward)
+                            {
+                                decision.reason.clone()
                             } else if targets.is_empty() {
                                 "no-forward-targets".to_owned()
                             } else {
                                 "userspace-capture-forwarded".to_owned()
                             },
-                            target_count: targets.len(),
+                            target_count: if should_forward_broadcast {
+                                targets.len()
+                            } else {
+                                0
+                            },
                             packet_io_backend: packet_io_backend.to_owned(),
                         });
                         for target in targets {
+                            if !should_forward_broadcast {
+                                break;
+                            }
                             let raw_virtual_packet = if forward_raw_ipv4 {
                                 Some(runtime_virtual_udp_packet(
                                     plan,
@@ -7322,6 +7359,7 @@ fn run_room_runtime(
             &mut heartbeat_packets,
             &mut heartbeat_ack_packets,
             &mut tunnel_packets,
+            &mut broadcast_forward_events,
             &mut capture_summaries,
             &mut observation_lines,
             &mut forwarded_packets,
@@ -7649,6 +7687,7 @@ fn trim_runtime_diagnostic_buffers(
     heartbeat_packets: &mut Vec<serde_json::Value>,
     heartbeat_ack_packets: &mut Vec<serde_json::Value>,
     tunnel_packets: &mut Vec<serde_json::Value>,
+    broadcast_forward_events: &mut Vec<lai_core::BroadcastForwardEvent>,
     capture_summaries: &mut Vec<PacketCaptureSummary>,
     observation_lines: &mut Vec<String>,
     forwarded_packets: &mut Vec<serde_json::Value>,
@@ -7664,6 +7703,7 @@ fn trim_runtime_diagnostic_buffers(
     trim_event_log(heartbeat_packets, RUNTIME_HEARTBEAT_EVENT_LOG_LIMIT);
     trim_event_log(heartbeat_ack_packets, RUNTIME_HEARTBEAT_EVENT_LOG_LIMIT);
     trim_event_log(tunnel_packets, RUNTIME_DIAGNOSTIC_EVENT_LOG_LIMIT);
+    trim_event_log(broadcast_forward_events, RUNTIME_DIAGNOSTIC_EVENT_LOG_LIMIT);
     trim_event_log(capture_summaries, RUNTIME_DIAGNOSTIC_EVENT_LOG_LIMIT);
     trim_event_log(observation_lines, RUNTIME_SMALL_DIAGNOSTIC_EVENT_LOG_LIMIT);
     trim_event_log(forwarded_packets, RUNTIME_DIAGNOSTIC_EVENT_LOG_LIMIT);

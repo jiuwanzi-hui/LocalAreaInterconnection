@@ -856,11 +856,6 @@ public partial class LocalAreaInterconnectionDesktop
         }
 
         string observePath = packetObservations.Text.Trim();
-        if (observePath.Length == 0)
-        {
-            observePath = RuntimeFilePath("runtime-packets", "txt");
-            packetObservations.Text = observePath;
-        }
         latestRuntimeObservationFile = observePath;
         latestRuntimeSnapshot = RuntimeFilePath("runtime-snapshot", "json");
         runtimeStopFile = RuntimeFilePath("runtime", "stop");
@@ -885,15 +880,10 @@ public partial class LocalAreaInterconnectionDesktop
             + " --broadcast-ports " + broadcastPort
             + " --duration-ms 3600000"
             + " --peer-timeout-ms 5000"
-            + " --self-probe true"
-            + " --capture-self-probe true"
-            + " --forward-self-probe true"
-            + " --inject-self-probe true"
             + " --packet-io-backend wintun"
             + " --forward-raw-ipv4 true"
             + " --wintun-runtime true"
             + " --heartbeat-interval-ms 500"
-            + " --observe-file " + Quote(observePath)
             + " --snapshot-out " + Quote(latestRuntimeSnapshot)
             + " --snapshot-interval-ms 1000"
             + " --stop-file " + Quote(runtimeStopFile)
@@ -906,6 +896,10 @@ public partial class LocalAreaInterconnectionDesktop
             + RuntimeCoordinationPublishArgs(coordinationServerValue)
             + RuntimeCoordinationArgs()
             + RuntimeCoordinationMonitorArgs();
+        if (observePath.Length > 0)
+        {
+            args += " --observe-file " + Quote(observePath);
+        }
 
         runtimeOutput.Length = 0;
         lastRuntimeLogLength = 0;

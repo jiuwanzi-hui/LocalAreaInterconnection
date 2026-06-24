@@ -2888,6 +2888,70 @@ fn room_runtime_run_outputs_snapshots_and_packet_observations() {
 }
 
 #[test]
+fn room_runtime_rate_limits_userspace_capture_broadcasts() {
+    let probe = UdpSocket::bind("127.0.0.1:0").expect("reserve capture port");
+    let capture_port = probe.local_addr().unwrap().port();
+    drop(probe);
+    let capture_port_text = capture_port.to_string();
+    let runtime = Command::new(env!("CARGO_BIN_EXE_lai-cli"))
+        .args([
+            "room-runtime-run",
+            "--room-id",
+            "room_capture_rate_limit",
+            "--peer-id",
+            "peer_a",
+            "--virtual-ip",
+            "10.77.12.2",
+            "--bind",
+            "127.0.0.1:0",
+            "--key",
+            "test-room-key",
+            "--game-ports",
+            "0",
+            "--broadcast-ports",
+            &capture_port_text,
+            "--duration-ms",
+            "320",
+            "--forward-self-probe",
+            "true",
+            "--max-broadcast-packets-per-second",
+            "1",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn runtime");
+    std::thread::sleep(Duration::from_millis(80));
+
+    let sender = UdpSocket::bind("127.0.0.1:0").expect("bind sender");
+    let target = format!("127.0.0.1:{capture_port}");
+    for _ in 0..5 {
+        sender
+            .send_to(b"discover", &target)
+            .expect("send capture broadcast");
+    }
+
+    let output = runtime.wait_with_output().expect("runtime exits");
+    assert!(
+        output.status.success(),
+        "runtime failed\nstatus: {}\nstdout: {}\nstderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: Value = serde_json::from_slice(&output.stdout).expect("runtime json");
+
+    assert_eq!(value["broadcastForwardReport"]["forwarded_event_count"], 1);
+    assert!(
+        value["broadcastForwardReport"]["rate_limited_count"]
+            .as_u64()
+            .unwrap_or_default()
+            >= 1
+    );
+    assert_eq!(value["forwardedPackets"].as_array().unwrap().len(), 1);
+}
+
+#[test]
 fn runtime_cleanup_plan_can_include_adapter_restore_commands() {
     let value = run_cli(&[
         "runtime-cleanup-plan",
