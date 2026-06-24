@@ -6266,7 +6266,12 @@ fn run_room_runtime(
                     &wintun_runtime_received_packets,
                     &wintun_runtime_sent_packets,
                 );
-                let idle = latest_traffic
+                let latest_non_icmp_traffic = latest_runtime_non_icmp_traffic_at_ms(
+                    &forwarded_packets,
+                    &wintun_runtime_received_packets,
+                    &wintun_runtime_sent_packets,
+                );
+                let idle = latest_non_icmp_traffic
                     .map(|latest| {
                         current_epoch_ms().saturating_sub(latest as u128)
                             >= RUNTIME_P2P_REFRESH_IDLE_MS as u128
@@ -6350,6 +6355,7 @@ fn run_room_runtime(
                         "reason": if using_relay_fallback_targets { "recent-traffic" } else { "not-on-relay-fallback" },
                         "checkedAtMs": current_epoch_ms(),
                         "latestTrafficAtMs": latest_traffic,
+                        "latestNonIcmpTrafficAtMs": latest_non_icmp_traffic,
                     }));
                     trim_event_log(
                         &mut coordination_p2p_refresh_reports,
@@ -7028,6 +7034,7 @@ fn run_room_runtime(
                                         "bytesSent": sent,
                                         "payloadBytes": received,
                                         "rawIpv4PacketBytes": raw_ipv4_packet.as_ref().map(Vec::len),
+                                        "protocol": "udp",
                                         "sentAtMs": current_epoch_ms(),
                                     }));
                                 }
@@ -7201,6 +7208,7 @@ fn run_room_runtime(
                                             "payloadBytes": udp_packet.payload.len(),
                                             "rawIpv4PacketBytes": packet.packet_bytes,
                                             "packetIoBackend": "wintun",
+                                            "protocol": "udp",
                                             "sentAtMs": current_epoch_ms(),
                                         }));
                                         }
@@ -7915,6 +7923,48 @@ fn latest_runtime_traffic_at_ms(
         .max()
 }
 
+fn latest_runtime_non_icmp_traffic_at_ms(
+    forwarded_packets: &[serde_json::Value],
+    wintun_runtime_received_packets: &[serde_json::Value],
+    wintun_runtime_sent_packets: &[serde_json::Value],
+) -> Option<u64> {
+    forwarded_packets
+        .iter()
+        .filter(|event| json_protocol(event) != Some("icmp"))
+        .filter_map(|event| event.get("sentAtMs").and_then(serde_json::Value::as_u64))
+        .chain(wintun_runtime_received_packets.iter().filter_map(|event| {
+            if !event
+                .get("forwarded")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+                || json_protocol(event) == Some("icmp")
+            {
+                return None;
+            }
+            event
+                .get("receivedAtMs")
+                .or_else(|| event.get("sentAtMs"))
+                .and_then(serde_json::Value::as_u64)
+        }))
+        .chain(wintun_runtime_sent_packets.iter().filter_map(|event| {
+            if json_protocol(event) == Some("icmp") {
+                return None;
+            }
+            event
+                .get("sentAtMs")
+                .or_else(|| event.get("receivedAtMs"))
+                .and_then(serde_json::Value::as_u64)
+        }))
+        .max()
+}
+
+fn json_protocol(value: &serde_json::Value) -> Option<&str> {
+    value
+        .get("protocol")
+        .or_else(|| value.get("ipv4_protocol"))
+        .and_then(serde_json::Value::as_str)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn trim_runtime_diagnostic_buffers(
     heartbeat_packets: &mut Vec<serde_json::Value>,
@@ -7983,9 +8033,9 @@ fn next_runtime_sequence(next_sequence: &mut u64) -> u64 {
 mod tests {
     use super::{
         best_direct_candidate_endpoint, current_epoch_ms, is_benign_route_result,
-        latest_runtime_traffic_at_ms, next_runtime_sequence, runtime_active_connection_path,
-        runtime_connected_peer_count_from_summaries, runtime_peer_from_bootstrap_result,
-        runtime_peer_summaries, runtime_reply_target,
+        latest_runtime_non_icmp_traffic_at_ms, latest_runtime_traffic_at_ms, next_runtime_sequence,
+        runtime_active_connection_path, runtime_connected_peer_count_from_summaries,
+        runtime_peer_from_bootstrap_result, runtime_peer_summaries, runtime_reply_target,
         runtime_targets_for_virtual_packet_destination, runtime_update_active_peer_direct_endpoint,
         trim_event_log, RuntimeSendTarget,
     };
@@ -8041,6 +8091,39 @@ mod tests {
                 &forwarded_packets,
                 &icmp_echo_requests,
                 &icmp_echo_replies,
+                &wintun_received,
+                &wintun_sent,
+            ),
+            Some(400)
+        );
+    }
+
+    #[test]
+    fn latest_runtime_non_icmp_traffic_ignores_ping_diagnostics() {
+        let forwarded_packets = vec![
+            serde_json::json!({ "protocol": "icmp", "sentAtMs": 900 }),
+            serde_json::json!({ "protocol": "udp", "sentAtMs": 200 }),
+        ];
+        let wintun_received = vec![
+            serde_json::json!({
+                "forwarded": true,
+                "protocol": "icmp",
+                "receivedAtMs": 950
+            }),
+            serde_json::json!({
+                "forwarded": true,
+                "protocol": "udp",
+                "receivedAtMs": 300
+            }),
+        ];
+        let wintun_sent = vec![
+            serde_json::json!({ "protocol": "icmp", "sentAtMs": 1000 }),
+            serde_json::json!({ "protocol": "tcp", "sentAtMs": 400 }),
+        ];
+
+        assert_eq!(
+            latest_runtime_non_icmp_traffic_at_ms(
+                &forwarded_packets,
                 &wintun_received,
                 &wintun_sent,
             ),
@@ -10756,6 +10839,7 @@ fn runtime_send_icmp_echo_reply(
         "sequence": request.sequence,
         "payloadBytes": request.payload.len(),
         "rawIpv4PacketBytes": reply_bytes.len(),
+        "protocol": "icmp",
         "sentAtMs": sent_at_ms,
     });
     let forwarded_event = serde_json::json!({

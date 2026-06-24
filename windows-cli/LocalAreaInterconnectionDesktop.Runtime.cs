@@ -445,7 +445,6 @@ public partial class LocalAreaInterconnectionDesktop
         string peer = RuntimePeerId();
         string roomId = RuntimeRoomId();
         string virtualIp = ip.Text.Trim();
-        string bind = NativeRuntimeBind();
         string stun = stunServer.Text.Trim();
         string server = coordinationServer.Text.Trim();
         coordinationPresenceRefreshRunning = true;
@@ -453,8 +452,9 @@ public partial class LocalAreaInterconnectionDesktop
         {
             try
             {
-                if (latestNativeOfferBind.Length == 0 || latestNativeOfferFile.Length == 0 || !File.Exists(latestNativeOfferFile))
+                if (!LatestNativeOfferMatchesContext(roomId, peer, virtualIp))
                 {
+                    string bind = AllocateNativeRuntimeBindForStart();
                     CreateNativeOfferSnapshot(roomId, peer, virtualIp, bind, stun, false);
                 }
                 PublishNativeOfferFileIfConfigured(server, false);
@@ -496,7 +496,28 @@ public partial class LocalAreaInterconnectionDesktop
 
     string PublishNativeOfferFileIfConfigured(string server, bool showOutput)
     {
-        if (server.Length == 0 || latestNativeOfferFile.Length == 0 || !File.Exists(latestNativeOfferFile))
+        if (server.Length == 0)
+        {
+            return "";
+        }
+        string roomId = RuntimeRoomId();
+        string peer = RuntimePeerId();
+        string virtualIp = ip.Text.Trim();
+        if (!LatestNativeOfferMatchesContext(roomId, peer, virtualIp))
+        {
+            string text = CreateNativeOfferSnapshot(
+                roomId,
+                peer,
+                virtualIp,
+                AllocateNativeRuntimeBindForStart(),
+                stunServer.Text.Trim(),
+                false);
+            if (text.Length == 0)
+            {
+                return "";
+            }
+        }
+        if (latestNativeOfferFile.Length == 0 || !File.Exists(latestNativeOfferFile))
         {
             return "";
         }
@@ -717,11 +738,32 @@ public partial class LocalAreaInterconnectionDesktop
     string AllocateNativeRuntimeBindForStart()
     {
         string offerBind = latestNativeOfferBind.Trim();
-        if (offerBind.Length > 0 && CanReuseRuntimeBind(offerBind))
+        if (offerBind.Length > 0
+            && LatestNativeOfferMatchesContext(RuntimeRoomId(), RuntimePeerId(), ip.Text.Trim())
+            && CanReuseRuntimeBind(offerBind))
         {
             return offerBind;
         }
         return AllocateNativeRuntimeBind();
+    }
+
+    bool LatestNativeOfferMatchesContext(string roomId, string peer, string virtualIp)
+    {
+        if (latestNativeOfferBind.Length == 0 || latestNativeOfferFile.Length == 0 || !File.Exists(latestNativeOfferFile))
+        {
+            return false;
+        }
+        try
+        {
+            string offer = File.ReadAllText(latestNativeOfferFile, Encoding.UTF8);
+            return JsonStringValue(offer, "room_id") == roomId
+                && JsonStringValue(offer, "peer_id") == peer
+                && JsonStringValue(offer, "virtual_ip") == virtualIp;
+        }
+        catch
+        {
+            return false;
+        }
     }
 
     bool CanReuseRuntimeBind(string bind)
