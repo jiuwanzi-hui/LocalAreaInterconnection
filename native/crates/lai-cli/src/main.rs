@@ -6724,7 +6724,7 @@ fn run_room_runtime(
                                         );
                                         (Some(decision), should_forward)
                                     } else {
-                                        (None, !heartbeat_targets.is_empty())
+                                        (None, !udp_forward_targets.is_empty())
                                     };
                                 wintun_runtime_received_packets.push(serde_json::json!({
                                     "packetIndex": packet_index,
@@ -7479,6 +7479,13 @@ mod tests {
         );
         assert_eq!(unicast.len(), 1);
         assert_eq!(unicast[0].peer_id, "peer_b");
+
+        let unmatched = runtime_targets_for_virtual_packet_destination(
+            &plan,
+            &targets,
+            Ipv4Addr::new(10, 77, 12, 99),
+        );
+        assert!(unmatched.is_empty());
 
         let broadcast = runtime_targets_for_virtual_packet_destination(
             &plan,
