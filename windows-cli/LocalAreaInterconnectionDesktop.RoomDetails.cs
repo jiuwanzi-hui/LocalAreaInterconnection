@@ -56,6 +56,10 @@ public partial class LocalAreaInterconnectionDesktop
         RefreshCoordinationRoomViewPeriodically();
         if (latestRuntimeSnapshot.Length == 0 || !File.Exists(latestRuntimeSnapshot))
         {
+            if (runtimeProcess == null || runtimeProcess.HasExited)
+            {
+                heartbeatPulseActive = false;
+            }
             RefreshCoordinationRoomView(false);
             return;
         }
@@ -68,7 +72,7 @@ public partial class LocalAreaInterconnectionDesktop
         {
             return;
         }
-        if (text.Length == 0 || text == lastRuntimeSnapshotText)
+        if (text.Length == 0)
         {
             return;
         }

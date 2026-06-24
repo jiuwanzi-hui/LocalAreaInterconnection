@@ -671,23 +671,35 @@ public partial class LocalAreaInterconnectionDesktop
 
     void RunPrepareLanEnvironmentAsync(bool startRuntimeAfterPrepare, string initialText)
     {
-        RunPrepareLanEnvironmentAsync(startRuntimeAfterPrepare, initialText, roomUiMode);
+        RunPrepareLanEnvironmentAsync(startRuntimeAfterPrepare, initialText, roomUiMode, null);
     }
 
     void RunPrepareLanEnvironmentAsync(bool startRuntimeAfterPrepare, string initialText, string modeAfterFailure)
+    {
+        RunPrepareLanEnvironmentAsync(startRuntimeAfterPrepare, initialText, modeAfterFailure, null);
+    }
+
+    void RunPrepareLanEnvironmentAsync(bool startRuntimeAfterPrepare, string initialText, string modeAfterFailure, string runtimeBindForStart)
     {
         if (userActionRunning)
         {
             output.Text = T("actionAlreadyRunning");
             return;
         }
-        string[] steps = LanEnvironmentPrepareArgs();
+        if (startRuntimeAfterPrepare && runtimeBindForStart == null)
+        {
+            runtimeBindForStart = AllocateNativeRuntimeBindForStart();
+        }
+        int runtimePortForStart = startRuntimeAfterPrepare && runtimeBindForStart != null
+            ? RuntimePortFromBind(runtimeBindForStart)
+            : 0;
+        string[] steps = LanEnvironmentPrepareArgs(runtimePortForStart);
         if (steps.Length == 0)
         {
             output.Text = initialText + Environment.NewLine + T("prepareLanSkipped");
             if (startRuntimeAfterPrepare)
             {
-                StartNativeRuntime(false);
+                StartNativeRuntime(false, runtimeBindForStart);
                 if (runtimeProcess != null && !runtimeProcess.HasExited)
                 {
                     output.Text += Environment.NewLine
@@ -748,7 +760,7 @@ public partial class LocalAreaInterconnectionDesktop
                 }
                 if (startRuntimeAfterPrepare)
                 {
-                    StartNativeRuntime(false);
+                    StartNativeRuntime(false, runtimeBindForStart);
                     if (runtimeProcess != null && !runtimeProcess.HasExited)
                     {
                         output.Text += Environment.NewLine
@@ -762,13 +774,18 @@ public partial class LocalAreaInterconnectionDesktop
 
     string[] LanEnvironmentPrepareArgs()
     {
+        return LanEnvironmentPrepareArgs(0);
+    }
+
+    string[] LanEnvironmentPrepareArgs(int runtimePort)
+    {
         return new string[]
         {
             "adapter-apply --adapter-name LocalAreaInterconnection"
                 + " --subnet " + subnet.Text
                 + " --ip " + ip.Text
                 + " --yes true",
-            FirewallApplyArgs() + " --yes true",
+            FirewallApplyArgs(runtimePort) + " --yes true",
         };
     }
 
@@ -781,11 +798,43 @@ public partial class LocalAreaInterconnectionDesktop
 
     string FirewallApplyArgs()
     {
+        return FirewallApplyArgs(0);
+    }
+
+    string FirewallApplyArgs(int runtimePort)
+    {
         return "firewall-apply --game-name " + Quote(gameName.Text)
             + GameCatalogArgs()
             + " --subnet " + subnet.Text
-            + " --ports " + ports.Text
+            + " --ports " + FirewallPortsText(runtimePort)
             + " --remote-scope any";
+    }
+
+    string FirewallPortsText(int runtimePort)
+    {
+        List<string> values = new List<string>();
+        Dictionary<string, bool> seen = new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
+        string[] parts = ports.Text.Split(new char[] { ',', ';', ' ', '\t', '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries);
+        foreach (string rawPart in parts)
+        {
+            string part = rawPart.Trim();
+            if (part.Length == 0 || seen.ContainsKey(part)) continue;
+            seen[part] = true;
+            values.Add(part);
+        }
+        if (runtimePort > 0)
+        {
+            string runtimePortText = runtimePort.ToString(CultureInfo.InvariantCulture);
+            if (!seen.ContainsKey(runtimePortText))
+            {
+                values.Add(runtimePortText);
+            }
+        }
+        if (values.Count == 0)
+        {
+            values.Add(FirstPortText("27015"));
+        }
+        return String.Join(",", values.ToArray());
     }
 
     void RunNativeRuntimeSelfTest()
@@ -848,6 +897,11 @@ public partial class LocalAreaInterconnectionDesktop
 
     void StartNativeRuntime(bool showDetails)
     {
+        StartNativeRuntime(showDetails, null);
+    }
+
+    void StartNativeRuntime(bool showDetails, string preferredBind)
+    {
         EnsureRelayDefaults();
         if (runtimeProcess != null && !runtimeProcess.HasExited)
         {
@@ -863,7 +917,9 @@ public partial class LocalAreaInterconnectionDesktop
         string peer = RuntimePeerId();
         string roomId = RuntimeRoomId();
         string virtualIp = ip.Text.Trim();
-        string bind = AllocateNativeRuntimeBind();
+        string bind = preferredBind != null && preferredBind.Trim().Length > 0
+            ? preferredBind
+            : AllocateNativeRuntimeBindForStart();
         string roomKey = RuntimeRoomKey();
         string gamePort = FirstPortText("27015");
         string broadcastPort = FirstPortText("39078");

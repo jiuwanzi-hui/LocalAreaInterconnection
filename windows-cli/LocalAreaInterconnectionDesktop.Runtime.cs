@@ -453,7 +453,7 @@ public partial class LocalAreaInterconnectionDesktop
         {
             try
             {
-                if (latestNativeOfferFile.Length == 0 || !File.Exists(latestNativeOfferFile))
+                if (latestNativeOfferBind.Length == 0 || latestNativeOfferFile.Length == 0 || !File.Exists(latestNativeOfferFile))
                 {
                     CreateNativeOfferSnapshot(roomId, peer, virtualIp, bind, stun, false);
                 }
@@ -712,6 +712,22 @@ public partial class LocalAreaInterconnectionDesktop
         int preferred = NativeRuntimePort();
         int port = FirstAvailableUdpPort(preferred, 200);
         return "0.0.0.0:" + port.ToString(CultureInfo.InvariantCulture);
+    }
+
+    string AllocateNativeRuntimeBindForStart()
+    {
+        string offerBind = latestNativeOfferBind.Trim();
+        if (offerBind.Length > 0 && CanReuseRuntimeBind(offerBind))
+        {
+            return offerBind;
+        }
+        return AllocateNativeRuntimeBind();
+    }
+
+    bool CanReuseRuntimeBind(string bind)
+    {
+        int port = RuntimePortFromBind(bind);
+        return port > 0 && CanBindUdpPort(port);
     }
 
     int FirstAvailableUdpPort(int preferred, int attempts)
