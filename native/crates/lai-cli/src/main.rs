@@ -59,6 +59,9 @@ const RUNTIME_HTTP_RELAY_PACKET_MAX_AGE_MS: u128 = 5_000;
 const RUNTIME_RELAY_REGISTRATION_INTERVAL_MS: u64 = 2_000;
 const RUNTIME_TUNNEL_READ_TIMEOUT_MS: u64 = 1;
 const RUNTIME_WINTUN_DRAIN_LIMIT: usize = 64;
+const RUNTIME_HEARTBEAT_EVENT_LOG_LIMIT: usize = 20_000;
+const RUNTIME_DIAGNOSTIC_EVENT_LOG_LIMIT: usize = 2_048;
+const RUNTIME_SMALL_DIAGNOSTIC_EVENT_LOG_LIMIT: usize = 512;
 const DEFAULT_UDP_RELAY_PORT: u16 = 39091;
 const UDP_RELAY_BINARY_MAGIC: &[u8] = b"LAIR1";
 const UDP_RELAY_BINARY_REGISTER: u8 = 1;
@@ -7048,6 +7051,23 @@ fn run_room_runtime(
                 Err(err) => return Err(err.into()),
             }
         }
+
+        trim_runtime_diagnostic_buffers(
+            &mut heartbeat_packets,
+            &mut heartbeat_ack_packets,
+            &mut tunnel_packets,
+            &mut capture_summaries,
+            &mut observation_lines,
+            &mut forwarded_packets,
+            &mut injected_packets,
+            &mut injected_received_packets,
+            &mut raw_virtual_packets,
+            &mut icmp_echo_replies,
+            &mut icmp_echo_requests,
+            &mut wintun_runtime_received_packets,
+            &mut wintun_runtime_sent_packets,
+            &mut wintun_runtime_errors,
+        );
     }
 
     if last_error.is_none() && peer_timed_out {
@@ -7299,6 +7319,77 @@ fn runtime_packet_path_counters(
         "wintunPacketsSent": wintun_runtime_sent_packets.len(),
         "injectedPacketsSent": injected_packets.len(),
     })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn trim_runtime_diagnostic_buffers(
+    heartbeat_packets: &mut Vec<serde_json::Value>,
+    heartbeat_ack_packets: &mut Vec<serde_json::Value>,
+    tunnel_packets: &mut Vec<serde_json::Value>,
+    capture_summaries: &mut Vec<PacketCaptureSummary>,
+    observation_lines: &mut Vec<String>,
+    forwarded_packets: &mut Vec<serde_json::Value>,
+    injected_packets: &mut Vec<serde_json::Value>,
+    injected_received_packets: &mut Vec<serde_json::Value>,
+    raw_virtual_packets: &mut Vec<serde_json::Value>,
+    icmp_echo_replies: &mut Vec<serde_json::Value>,
+    icmp_echo_requests: &mut Vec<serde_json::Value>,
+    wintun_runtime_received_packets: &mut Vec<serde_json::Value>,
+    wintun_runtime_sent_packets: &mut Vec<serde_json::Value>,
+    wintun_runtime_errors: &mut Vec<String>,
+) {
+    trim_event_log(heartbeat_packets, RUNTIME_HEARTBEAT_EVENT_LOG_LIMIT);
+    trim_event_log(heartbeat_ack_packets, RUNTIME_HEARTBEAT_EVENT_LOG_LIMIT);
+    trim_event_log(tunnel_packets, RUNTIME_DIAGNOSTIC_EVENT_LOG_LIMIT);
+    trim_event_log(capture_summaries, RUNTIME_DIAGNOSTIC_EVENT_LOG_LIMIT);
+    trim_event_log(observation_lines, RUNTIME_SMALL_DIAGNOSTIC_EVENT_LOG_LIMIT);
+    trim_event_log(forwarded_packets, RUNTIME_DIAGNOSTIC_EVENT_LOG_LIMIT);
+    trim_event_log(injected_packets, RUNTIME_SMALL_DIAGNOSTIC_EVENT_LOG_LIMIT);
+    trim_event_log(
+        injected_received_packets,
+        RUNTIME_SMALL_DIAGNOSTIC_EVENT_LOG_LIMIT,
+    );
+    trim_event_log(raw_virtual_packets, RUNTIME_DIAGNOSTIC_EVENT_LOG_LIMIT);
+    trim_event_log(icmp_echo_replies, RUNTIME_SMALL_DIAGNOSTIC_EVENT_LOG_LIMIT);
+    trim_event_log(icmp_echo_requests, RUNTIME_SMALL_DIAGNOSTIC_EVENT_LOG_LIMIT);
+    trim_event_log(
+        wintun_runtime_received_packets,
+        RUNTIME_DIAGNOSTIC_EVENT_LOG_LIMIT,
+    );
+    trim_event_log(
+        wintun_runtime_sent_packets,
+        RUNTIME_DIAGNOSTIC_EVENT_LOG_LIMIT,
+    );
+    trim_event_log(
+        wintun_runtime_errors,
+        RUNTIME_SMALL_DIAGNOSTIC_EVENT_LOG_LIMIT,
+    );
+}
+
+fn trim_event_log<T>(items: &mut Vec<T>, limit: usize) {
+    if limit == 0 {
+        items.clear();
+        return;
+    }
+    if items.len() > limit {
+        let excess = items.len() - limit;
+        items.drain(0..excess);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::trim_event_log;
+
+    #[test]
+    fn trim_event_log_keeps_most_recent_items() {
+        let mut values = vec![1, 2, 3, 4, 5];
+        trim_event_log(&mut values, 3);
+        assert_eq!(values, vec![3, 4, 5]);
+
+        trim_event_log(&mut values, 0);
+        assert!(values.is_empty());
+    }
 }
 
 fn runtime_route_evidence(
