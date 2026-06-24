@@ -2696,6 +2696,13 @@ fn runtime_direct_endpoint_from_bootstrap_result(
     peer_id: &str,
     result: &serde_json::Value,
 ) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    if result
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|status| status != "ok")
+    {
+        return Ok(None);
+    }
     let Some(selected) = result.get("selectedPeer") else {
         return Ok(None);
     };
@@ -2722,6 +2729,13 @@ fn runtime_direct_endpoint_from_bootstrap_result(
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
     if !accepted || !nonce_matched {
+        return Ok(None);
+    }
+    let confirmed_by_ack = selected
+        .get("confirmedByAck")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(true);
+    if !confirmed_by_ack {
         return Ok(None);
     }
     selected
@@ -7508,8 +7522,8 @@ fn next_runtime_sequence(next_sequence: &mut u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        next_runtime_sequence, runtime_targets_for_virtual_packet_destination, trim_event_log,
-        RuntimeSendTarget,
+        next_runtime_sequence, runtime_peer_from_bootstrap_result,
+        runtime_targets_for_virtual_packet_destination, trim_event_log, RuntimeSendTarget,
     };
     use lai_core::{
         RoomRuntimePeer, RoomRuntimePlan, RuntimePortBinding, RuntimeTunnelPlan,
@@ -7538,6 +7552,69 @@ mod tests {
 
         assert_eq!(retained_events, vec![4, 5]);
         assert_eq!(next_runtime_sequence(&mut next_sequence), 6);
+    }
+
+    #[test]
+    fn bootstrap_peer_requires_confirmed_direct_before_using_p2p_endpoint() {
+        let result = serde_json::json!({
+            "status": "handshake-timeout",
+            "selectedPeer": {
+                "endpoint": "198.51.100.20:40000",
+                "responderPeerId": "peer_b",
+                "accepted": true,
+                "nonceMatched": true,
+                "confirmedByAck": false
+            },
+            "localOffer": {
+                "schema_version": 1,
+                "room_id": "room",
+                "peer_id": "peer_a",
+                "nonce": "nonce-a",
+                "created_at_ms": 1,
+                "candidates": [{
+                    "candidate_type": "relay",
+                    "transport": "udp",
+                    "endpoint": "203.0.113.10:39091",
+                    "priority": 10,
+                    "source": "relay"
+                }]
+            },
+            "remoteOffer": {
+                "schema_version": 1,
+                "room_id": "room",
+                "peer_id": "peer_b",
+                "nonce": "nonce-b",
+                "created_at_ms": 1,
+                "candidates": [
+                    {
+                        "candidate_type": "srflx",
+                        "transport": "udp",
+                        "endpoint": "198.51.100.20:40000",
+                        "priority": 90,
+                        "source": "stun"
+                    },
+                    {
+                        "candidate_type": "relay",
+                        "transport": "udp",
+                        "endpoint": "203.0.113.10:39091",
+                        "priority": 10,
+                        "source": "relay"
+                    }
+                ]
+            }
+        });
+
+        let peer =
+            runtime_peer_from_bootstrap_result("peer_b", Ipv4Addr::new(10, 77, 12, 3), &result)
+                .unwrap();
+
+        assert_eq!(peer.endpoint, "203.0.113.10:39091");
+        assert_eq!(peer.connection_path, "relay");
+        assert_eq!(peer.direct_endpoint, Some("198.51.100.20:40000".to_owned()));
+        assert_eq!(
+            peer.fallback_endpoint,
+            Some("203.0.113.10:39091".to_owned())
+        );
     }
 
     #[test]
