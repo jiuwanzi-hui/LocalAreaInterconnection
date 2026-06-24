@@ -6011,11 +6011,30 @@ fn run_room_runtime(
         {
             if now >= next_snapshot {
                 let tunnel_endpoint_text = tunnel_endpoint.to_string();
+                let snapshot_observed_connection_path =
+                    runtime_observed_connection_path_from_packets(
+                        &tunnel_packets,
+                        &heartbeat_ack_packets,
+                    );
+                let snapshot_peer_summaries = runtime_peer_summaries(
+                    plan,
+                    &[],
+                    &tunnel_packets,
+                    &forwarded_packets,
+                    &heartbeat_packets,
+                    &heartbeat_ack_packets,
+                    snapshot_observed_connection_path.as_deref(),
+                    Some(tunnel_endpoint_text.as_str()),
+                );
+                let snapshot_connected_peer_count =
+                    runtime_connected_peer_count_from_summaries(&snapshot_peer_summaries);
                 let tick = serde_json::json!({
                     "status": "running",
                     "startedAtMs": started_at_ms,
                     "updatedAtMs": current_epoch_ms(),
                     "actualTunnelEndpoint": tunnel_endpoint_text.clone(),
+                    "connected_peer_count": snapshot_connected_peer_count,
+                    "connectedPeerCount": snapshot_connected_peer_count,
                     "captureBindErrors": capture_bind_errors.clone(),
                     "bytesSent": bytes_sent,
                     "bytesReceived": bytes_received,
@@ -6045,16 +6064,7 @@ fn run_room_runtime(
                     "adapterReadStatus": packet_io_probe["adapterReadStatus"].clone(),
                     "wintunRuntime": wintun_runtime_open.clone(),
                     "runtimeCleanupPlan": runtime_cleanup_plan.clone(),
-                    "runtimePeerSummaries": runtime_peer_summaries(
-                        plan,
-                        &[],
-                        &tunnel_packets,
-                        &forwarded_packets,
-                        &heartbeat_packets,
-                        &heartbeat_ack_packets,
-                        if connected_peer_count > 0 { Some("p2p") } else { None },
-                        Some(tunnel_endpoint_text.as_str()),
-                    ),
+                    "runtimePeerSummaries": snapshot_peer_summaries,
                     "coordinationMonitorReports": coordination_monitor_reports.clone(),
                     "coordinationPublishReports": coordination_publish_reports.clone(),
                     "relayFallbackActive": using_relay_fallback_targets,
@@ -7223,14 +7233,8 @@ fn run_room_runtime(
         last_error = Some("Runtime tunnel peer timed out before the runtime stopped.".to_owned());
     }
 
-    let observed_connection_path = if connected_peer_count > 0 {
-        Some(runtime_connection_path_from_packets(
-            &tunnel_packets,
-            &heartbeat_ack_packets,
-        ))
-    } else {
-        None
-    };
+    let observed_connection_path_from_packets =
+        runtime_observed_connection_path_from_packets(&tunnel_packets, &heartbeat_ack_packets);
     let tunnel_endpoint_text = tunnel_endpoint.to_string();
     let runtime_peer_summary_values = runtime_peer_summaries(
         plan,
@@ -7239,9 +7243,16 @@ fn run_room_runtime(
         &forwarded_packets,
         &heartbeat_packets,
         &heartbeat_ack_packets,
-        observed_connection_path.as_deref(),
+        observed_connection_path_from_packets.as_deref(),
         Some(tunnel_endpoint_text.as_str()),
     );
+    let connected_peer_count =
+        runtime_connected_peer_count_from_summaries(&runtime_peer_summary_values);
+    let observed_connection_path = if connected_peer_count > 0 {
+        observed_connection_path_from_packets
+    } else {
+        None
+    };
     if runtime_timeout_error_has_recovered(last_error.as_deref(), &runtime_peer_summary_values) {
         last_error = None;
     }
@@ -7536,8 +7547,9 @@ fn next_runtime_sequence(next_sequence: &mut u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        is_benign_route_result, next_runtime_sequence, runtime_peer_from_bootstrap_result,
-        runtime_targets_for_virtual_packet_destination, trim_event_log, RuntimeSendTarget,
+        is_benign_route_result, next_runtime_sequence, runtime_connected_peer_count_from_summaries,
+        runtime_peer_from_bootstrap_result, runtime_targets_for_virtual_packet_destination,
+        trim_event_log, RuntimeSendTarget,
     };
     use lai_core::{
         NetworkCommand, RoomRuntimePeer, RoomRuntimePlan, RuntimePortBinding, RuntimeTunnelPlan,
@@ -7672,6 +7684,38 @@ mod tests {
             "",
             "Access is denied."
         ));
+    }
+
+    #[test]
+    fn connected_peer_count_uses_current_summary_state() {
+        let summaries = vec![
+            serde_json::json!({
+                "peerId": "peer_b",
+                "connected": true,
+                "lastSeenAtMs": 1000
+            }),
+            serde_json::json!({
+                "peerId": "peer_c",
+                "connected": false,
+                "lastSeenAtMs": 10
+            }),
+        ];
+
+        assert_eq!(runtime_connected_peer_count_from_summaries(&summaries), 1);
+
+        let stale = vec![serde_json::json!({
+            "peerId": "peer_b",
+            "connected": false,
+            "lastSeenAtMs": 10
+        })];
+        assert_eq!(runtime_connected_peer_count_from_summaries(&stale), 0);
+
+        let self_probe = vec![serde_json::json!({
+            "peerId": "peer_a-self-probe",
+            "connected": true,
+            "lastSeenAtMs": 1000
+        })];
+        assert_eq!(runtime_connected_peer_count_from_summaries(&self_probe), 0);
     }
 
     #[test]
@@ -9533,6 +9577,40 @@ fn runtime_connection_path_from_packets(
             }
         })
         .unwrap_or_else(|| "p2p".to_owned())
+}
+
+fn runtime_observed_connection_path_from_packets(
+    tunnel_packets: &[serde_json::Value],
+    heartbeat_ack_packets: &[serde_json::Value],
+) -> Option<String> {
+    if tunnel_packets.is_empty() && heartbeat_ack_packets.is_empty() {
+        None
+    } else {
+        Some(runtime_connection_path_from_packets(
+            tunnel_packets,
+            heartbeat_ack_packets,
+        ))
+    }
+}
+
+fn runtime_connected_peer_count_from_summaries(summaries: &[serde_json::Value]) -> u16 {
+    summaries
+        .iter()
+        .filter(|summary| {
+            let peer_id = summary
+                .get("peerId")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            peer_id != "self-probe" && !peer_id.ends_with("-self-probe")
+        })
+        .filter(|summary| {
+            summary
+                .get("connected")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+        })
+        .count()
+        .min(u16::MAX as usize) as u16
 }
 
 fn runtime_packet_path_sample(packet: &serde_json::Value) -> Option<(u64, String)> {
