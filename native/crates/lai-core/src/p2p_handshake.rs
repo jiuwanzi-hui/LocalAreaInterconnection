@@ -24,6 +24,16 @@ pub struct P2pHandshakeAck {
     pub message: String,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct P2pHandshakeConfirm {
+    pub version: u16,
+    pub room_id: String,
+    pub confirmer_peer_id: String,
+    pub responder_peer_id: String,
+    pub nonce: String,
+    pub sent_at_ms: u128,
+}
+
 pub fn create_p2p_handshake_hello(
     room_id: impl Into<String>,
     peer_id: impl Into<String>,
@@ -61,6 +71,23 @@ pub fn create_p2p_handshake_ack(
     }
 }
 
+pub fn create_p2p_handshake_confirm(
+    room_id: impl Into<String>,
+    confirmer_peer_id: impl Into<String>,
+    responder_peer_id: impl Into<String>,
+    nonce: impl Into<String>,
+    sent_at_ms: u128,
+) -> P2pHandshakeConfirm {
+    P2pHandshakeConfirm {
+        version: 1,
+        room_id: room_id.into(),
+        confirmer_peer_id: confirmer_peer_id.into(),
+        responder_peer_id: responder_peer_id.into(),
+        nonce: nonce.into(),
+        sent_at_ms,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -82,5 +109,18 @@ mod tests {
         assert_eq!(ack.nonce, "nonce-1");
         assert!(ack.accepted);
         assert_eq!(ack.responder_peer_id, "peer_b");
+
+        let confirm = create_p2p_handshake_confirm(
+            &ack.room_id,
+            "peer_a",
+            &ack.responder_peer_id,
+            &ack.nonce,
+            130,
+        );
+        assert_eq!(confirm.version, 1);
+        assert_eq!(confirm.room_id, "room_1");
+        assert_eq!(confirm.confirmer_peer_id, "peer_a");
+        assert_eq!(confirm.responder_peer_id, "peer_b");
+        assert_eq!(confirm.nonce, "nonce-1");
     }
 }

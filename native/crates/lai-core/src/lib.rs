@@ -114,7 +114,8 @@ pub use network_observation::{
     RuntimePeerObservation, TunnelObservation,
 };
 pub use p2p_handshake::{
-    create_p2p_handshake_ack, create_p2p_handshake_hello, P2pHandshakeAck, P2pHandshakeHello,
+    create_p2p_handshake_ack, create_p2p_handshake_confirm, create_p2p_handshake_hello,
+    P2pHandshakeAck, P2pHandshakeConfirm, P2pHandshakeHello,
 };
 pub use packet_observation_parser::{
     parse_packet_observation_line, parse_packet_observation_lines,

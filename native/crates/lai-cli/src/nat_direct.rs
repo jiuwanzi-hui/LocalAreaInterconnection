@@ -1,6 +1,7 @@
 use lai_core::{
-    create_p2p_handshake_ack, create_p2p_handshake_hello, open_tunnel_payload, seal_tunnel_payload,
-    P2pHandshakeAck, P2pHandshakeHello, TunnelEnvelope,
+    create_p2p_handshake_ack, create_p2p_handshake_confirm, create_p2p_handshake_hello,
+    open_tunnel_payload, seal_tunnel_payload, P2pHandshakeAck, P2pHandshakeConfirm,
+    P2pHandshakeHello, TunnelEnvelope,
 };
 use rand::RngCore;
 use serde::Serialize;
@@ -561,6 +562,7 @@ pub fn run_nat_p2p_bootstrap_on_socket(
     let mut handshake_packets = Vec::new();
     let mut ignored_packets = Vec::new();
     let mut selected_peer = None;
+    let mut answered_hello_nonce = None::<String>;
     let mut buffer = vec![0u8; 65_535];
 
     if plan.status == "ready" {
@@ -647,6 +649,15 @@ pub fn run_nat_p2p_bootstrap_on_socket(
                             serde_json::from_slice(&payload.plaintext)?;
                         let remote_hello_matches = remote_hello.room_id == room_id
                             && remote_hello.peer_id == remote_offer.peer_id;
+                        if !remote_hello_matches {
+                            ignored_packets.push(serde_json::json!({
+                                "peer": peer.to_string(),
+                                "bytes": received,
+                                "reason": "invalid-handshake-hello",
+                                "packetKind": payload.metadata.packet_kind,
+                            }));
+                            continue;
+                        }
                         let ack_sent_at_ms = current_epoch_ms();
                         let ack = create_p2p_handshake_ack(
                             &remote_hello,
@@ -675,17 +686,44 @@ pub fn run_nat_p2p_bootstrap_on_socket(
                             "reason": "answered-remote-handshake-hello",
                             "packetKind": payload.metadata.packet_kind,
                         }));
-                        if remote_hello_matches {
+                        answered_hello_nonce = Some(remote_hello.nonce.clone());
+                        selected_peer = Some(serde_json::json!({
+                            "endpoint": peer.to_string(),
+                            "responderPeerId": remote_hello.peer_id,
+                            "observedEndpoint": peer.to_string(),
+                            "nonceMatched": true,
+                            "accepted": true,
+                            "handshakeRole": "answered-remote-hello",
+                            "confirmedByAck": false,
+                            "latencyMs": current_epoch_ms().saturating_sub(started_at_ms),
+                        }));
+                        continue;
+                    }
+                    if payload.metadata.packet_kind == "p2p-handshake-confirm" {
+                        let confirm: P2pHandshakeConfirm =
+                            serde_json::from_slice(&payload.plaintext)?;
+                        let confirmed = confirm.room_id == room_id
+                            && confirm.confirmer_peer_id == remote_offer.peer_id
+                            && confirm.responder_peer_id == peer_id
+                            && answered_hello_nonce.as_deref() == Some(confirm.nonce.as_str());
+                        ignored_packets.push(serde_json::json!({
+                            "peer": peer.to_string(),
+                            "bytes": received,
+                            "reason": if confirmed { "confirmed-remote-handshake" } else { "invalid-handshake-confirm" },
+                            "packetKind": payload.metadata.packet_kind,
+                        }));
+                        if confirmed {
                             selected_peer = Some(serde_json::json!({
                                 "endpoint": peer.to_string(),
-                                "responderPeerId": remote_hello.peer_id,
+                                "responderPeerId": confirm.confirmer_peer_id,
                                 "observedEndpoint": peer.to_string(),
                                 "nonceMatched": true,
                                 "accepted": true,
                                 "handshakeRole": "answered-remote-hello",
-                                "confirmedByAck": false,
+                                "confirmedByAck": true,
                                 "latencyMs": current_epoch_ms().saturating_sub(started_at_ms),
                             }));
+                            break;
                         }
                         continue;
                     }
@@ -700,17 +738,48 @@ pub fn run_nat_p2p_bootstrap_on_socket(
                     }
                     let ack: P2pHandshakeAck = serde_json::from_slice(&payload.plaintext)?;
                     let nonce_matched = ack.nonce == hello.nonce;
+                    let ack_room_matched = ack.room_id == room_id;
+                    let ack_responder_matched = ack.responder_peer_id == remote_offer.peer_id;
+                    let ack_confirmed =
+                        ack.accepted && nonce_matched && ack_room_matched && ack_responder_matched;
+                    if ack_confirmed {
+                        let confirm_sent_at_ms = current_epoch_ms();
+                        let confirm = create_p2p_handshake_confirm(
+                            &ack.room_id,
+                            peer_id,
+                            &ack.responder_peer_id,
+                            &ack.nonce,
+                            confirm_sent_at_ms,
+                        );
+                        let confirm_bytes = serde_json::to_vec(&confirm)?;
+                        let confirm_envelope = seal_tunnel_payload(
+                            key,
+                            "p2p-handshake-confirm",
+                            handshake_packets.len() as u64 + 1,
+                            confirm_sent_at_ms,
+                            &confirm_bytes,
+                        )?;
+                        let confirm_wire = serde_json::to_vec(&confirm_envelope)?;
+                        let sent = socket.send_to(&confirm_wire, peer)?;
+                        handshake_packets.push(serde_json::json!({
+                            "target": peer.to_string(),
+                            "packetKind": "p2p-handshake-confirm",
+                            "bytes": sent,
+                        }));
+                    }
                     selected_peer = Some(serde_json::json!({
                         "endpoint": peer.to_string(),
                         "responderPeerId": ack.responder_peer_id,
                         "observedEndpoint": ack.observed_endpoint,
                         "nonceMatched": nonce_matched,
                         "accepted": ack.accepted,
+                        "roomMatched": ack_room_matched,
+                        "responderMatched": ack_responder_matched,
                         "handshakeRole": "received-ack",
-                        "confirmedByAck": ack.accepted && nonce_matched,
+                        "confirmedByAck": ack_confirmed,
                         "latencyMs": current_epoch_ms().saturating_sub(started_at_ms),
                     }));
-                    if ack.accepted && nonce_matched {
+                    if ack_confirmed {
                         break;
                     }
                 }
@@ -736,6 +805,10 @@ pub fn run_nat_p2p_bootstrap_on_socket(
         && selected_peer
             .as_ref()
             .and_then(|peer| peer["nonceMatched"].as_bool())
+            .unwrap_or(false)
+        && selected_peer
+            .as_ref()
+            .and_then(|peer| peer["confirmedByAck"].as_bool())
             .unwrap_or(false)
     {
         "ok".to_owned()

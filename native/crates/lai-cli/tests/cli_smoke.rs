@@ -5724,7 +5724,7 @@ fn nat_p2p_bootstrap_punches_then_completes_encrypted_handshake() {
     assert_eq!(bootstrap["selectedPeer"]["handshakeRole"], "received-ack");
     assert_eq!(bootstrap["selectedPeer"]["confirmedByAck"], true);
     assert_eq!(bootstrap["punchPackets"].as_array().unwrap().len(), 1);
-    assert_eq!(bootstrap["handshakePackets"].as_array().unwrap().len(), 1);
+    assert_eq!(bootstrap["handshakePackets"].as_array().unwrap().len(), 2);
     assert!(
         listener_output.status.success(),
         "listener failed\nstatus: {}\nstdout: {}\nstderr: {}",
@@ -5864,6 +5864,7 @@ fn nat_p2p_bootstrap_can_complete_when_both_peers_start_together() {
         value_a["selectedPeer"]["handshakeRole"] == "received-ack"
             || value_a["selectedPeer"]["handshakeRole"] == "answered-remote-hello"
     );
+    assert_eq!(value_a["selectedPeer"]["confirmedByAck"], true);
     assert_eq!(value_b["status"], "ok");
     assert_eq!(value_b["localEndpoint"], addr_b.to_string());
     assert_eq!(value_b["selectedPeer"]["responderPeerId"], "peer_a");
@@ -5872,10 +5873,7 @@ fn nat_p2p_bootstrap_can_complete_when_both_peers_start_together() {
         value_b["selectedPeer"]["handshakeRole"] == "received-ack"
             || value_b["selectedPeer"]["handshakeRole"] == "answered-remote-hello"
     );
-    assert!(
-        value_a["selectedPeer"]["confirmedByAck"] == true
-            || value_b["selectedPeer"]["confirmedByAck"] == true
-    );
+    assert_eq!(value_b["selectedPeer"]["confirmedByAck"], true);
 }
 
 #[test]
