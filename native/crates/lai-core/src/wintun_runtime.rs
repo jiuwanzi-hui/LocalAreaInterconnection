@@ -10,6 +10,7 @@ const MAX_RING_CAPACITY: u32 = 64 * 1024 * 1024;
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct WintunPacketIoConfig {
     pub adapter_name: String,
+    pub tunnel_type: String,
     pub ring_capacity: u32,
 }
 
@@ -19,6 +20,7 @@ pub struct WintunPacketIoOpenReport {
     pub adapter_name: Option<String>,
     pub ring_capacity: u32,
     pub opened: bool,
+    pub created: bool,
     pub session_started: bool,
     pub closed: bool,
     pub error: Option<String>,
@@ -79,6 +81,12 @@ impl std::fmt::Debug for WintunPacketIoSession {
 #[cfg(windows)]
 type WintunOpenAdapterFn = unsafe extern "system" fn(*const u16) -> *mut std::ffi::c_void;
 #[cfg(windows)]
+type WintunCreateAdapterFn = unsafe extern "system" fn(
+    *const u16,
+    *const u16,
+    *const winapi::shared::guiddef::GUID,
+) -> *mut std::ffi::c_void;
+#[cfg(windows)]
 type WintunCloseAdapterFn = unsafe extern "system" fn(*mut std::ffi::c_void);
 #[cfg(windows)]
 type WintunStartSessionFn =
@@ -108,6 +116,7 @@ pub fn open_wintun_packet_io_session(
             false,
             false,
             false,
+            false,
             error,
         ));
     }
@@ -122,11 +131,13 @@ pub fn open_wintun_packet_io_session(
                 false,
                 false,
                 false,
+                false,
                 "wintun.dll not found".to_owned(),
             ));
         }
 
         let open_func = load_wintun_function(dll, "WintunOpenAdapter");
+        let create_func = load_wintun_function(dll, "WintunCreateAdapter");
         let close_func = load_wintun_function(dll, "WintunCloseAdapter");
         let start_func = load_wintun_function(dll, "WintunStartSession");
         let end_func = load_wintun_function(dll, "WintunEndSession");
@@ -136,6 +147,7 @@ pub fn open_wintun_packet_io_session(
         let send_func = load_wintun_function(dll, "WintunSendPacket");
         let (
             open_func,
+            create_func,
             close_func,
             start_func,
             end_func,
@@ -145,6 +157,7 @@ pub fn open_wintun_packet_io_session(
             send_func,
         ) = match (
             open_func,
+            create_func,
             close_func,
             start_func,
             end_func,
@@ -155,6 +168,7 @@ pub fn open_wintun_packet_io_session(
         ) {
             (
                 Some(open_func),
+                Some(create_func),
                 Some(close_func),
                 Some(start_func),
                 Some(end_func),
@@ -164,6 +178,7 @@ pub fn open_wintun_packet_io_session(
                 Some(send_func),
             ) => (
                 open_func,
+                create_func,
                 close_func,
                 start_func,
                 end_func,
@@ -180,12 +195,14 @@ pub fn open_wintun_packet_io_session(
                     false,
                     false,
                     false,
+                    false,
                     "Required Wintun packet I/O function not found".to_owned(),
                 ));
             }
         };
 
         let open_adapter: WintunOpenAdapterFn = std::mem::transmute(open_func);
+        let create_adapter: WintunCreateAdapterFn = std::mem::transmute(create_func);
         let close_adapter: WintunCloseAdapterFn = std::mem::transmute(close_func);
         let start_session: WintunStartSessionFn = std::mem::transmute(start_func);
         let end_session: WintunEndSessionFn = std::mem::transmute(end_func);
@@ -200,30 +217,51 @@ pub fn open_wintun_packet_io_session(
             .encode_utf16()
             .chain(std::iter::once(0))
             .collect();
-        let adapter = open_adapter(adapter_name_wide.as_ptr());
+        let tunnel_type_wide: Vec<u16> = config
+            .tunnel_type
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        let mut adapter_created = false;
+        let mut adapter = open_adapter(adapter_name_wide.as_ptr());
         if adapter.is_null() {
-            FreeLibrary(dll);
-            return Err(open_report(
-                "open-failed",
-                &config,
-                false,
-                false,
-                false,
-                "WintunOpenAdapter returned null".to_owned(),
-            ));
+            let open_error = std::io::Error::last_os_error();
+            adapter = create_adapter(
+                adapter_name_wide.as_ptr(),
+                tunnel_type_wide.as_ptr(),
+                std::ptr::null(),
+            );
+            if adapter.is_null() {
+                let create_error = std::io::Error::last_os_error();
+                FreeLibrary(dll);
+                return Err(open_report(
+                    "create-failed",
+                    &config,
+                    false,
+                    false,
+                    false,
+                    false,
+                    format!(
+                        "WintunOpenAdapter returned null ({open_error}); WintunCreateAdapter also returned null ({create_error})."
+                    ),
+                ));
+            }
+            adapter_created = true;
         }
 
         let session = start_session(adapter, config.ring_capacity);
         if session.is_null() {
+            let session_error = std::io::Error::last_os_error();
             close_adapter(adapter);
             FreeLibrary(dll);
             return Err(open_report(
                 "session-start-failed",
                 &config,
                 true,
+                adapter_created,
                 false,
                 true,
-                "WintunStartSession returned null".to_owned(),
+                format!("WintunStartSession returned null ({session_error})."),
             ));
         }
 
@@ -263,12 +301,14 @@ pub fn open_wintun_packet_io_session(
             false,
             false,
             false,
+            false,
             error,
         ));
     }
     Err(open_report(
         "unsupported",
         &config,
+        false,
         false,
         false,
         false,
@@ -405,6 +445,7 @@ fn open_report(
     status: &str,
     config: &WintunPacketIoConfig,
     opened: bool,
+    created: bool,
     session_started: bool,
     closed: bool,
     error: String,
@@ -414,6 +455,7 @@ fn open_report(
         adapter_name: opened.then(|| config.adapter_name.clone()),
         ring_capacity: config.ring_capacity,
         opened,
+        created,
         session_started,
         closed,
         error: Some(error),
@@ -448,6 +490,7 @@ mod tests {
     fn invalid_capacity_fails_before_open() {
         let report = open_wintun_packet_io_session(WintunPacketIoConfig {
             adapter_name: "LocalAreaInterconnection".to_owned(),
+            tunnel_type: "LocalAreaInterconnection".to_owned(),
             ring_capacity: 1000,
         })
         .unwrap_err();

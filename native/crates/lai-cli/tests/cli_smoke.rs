@@ -1,3 +1,5 @@
+use base64::engine::general_purpose::STANDARD_NO_PAD;
+use base64::Engine as _;
 use serde_json::Value;
 use std::fs;
 use std::io::{Read, Write};
@@ -20,6 +22,41 @@ fn run_cli(args: &[&str]) -> Value {
         String::from_utf8_lossy(&output.stderr)
     );
     serde_json::from_slice(&output.stdout).expect("valid json stdout")
+}
+
+fn test_internet_checksum(bytes: &[u8]) -> u16 {
+    let mut sum = 0u32;
+    let mut chunks = bytes.chunks_exact(2);
+    for chunk in &mut chunks {
+        sum += u16::from_be_bytes([chunk[0], chunk[1]]) as u32;
+    }
+    if let Some(byte) = chunks.remainder().first() {
+        sum += (*byte as u32) << 8;
+    }
+    while (sum >> 16) != 0 {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    !(sum as u16)
+}
+
+fn test_icmp_echo_request(source_ip: [u8; 4], destination_ip: [u8; 4]) -> Vec<u8> {
+    let total_len = 33usize;
+    let mut bytes = vec![0u8; total_len];
+    bytes[0] = 0x45;
+    bytes[2..4].copy_from_slice(&(total_len as u16).to_be_bytes());
+    bytes[8] = 64;
+    bytes[9] = 1;
+    bytes[12..16].copy_from_slice(&source_ip);
+    bytes[16..20].copy_from_slice(&destination_ip);
+    let ipv4_checksum = test_internet_checksum(&bytes[..20]);
+    bytes[10..12].copy_from_slice(&ipv4_checksum.to_be_bytes());
+    bytes[20] = 8;
+    bytes[24..26].copy_from_slice(&0x1234u16.to_be_bytes());
+    bytes[26..28].copy_from_slice(&7u16.to_be_bytes());
+    bytes[28..].copy_from_slice(b"hello");
+    let icmp_checksum = test_internet_checksum(&bytes[20..]);
+    bytes[22..24].copy_from_slice(&icmp_checksum.to_be_bytes());
+    bytes
 }
 
 fn spawn_fake_standard_stun(response_port_delta: u16) -> (SocketAddr, JoinHandle<()>) {
@@ -607,7 +644,7 @@ fn room_runtime_run_can_bootstrap_nat_remote_peer_before_starting() {
         "schema_version": 1,
         "room_id": "room_test",
         "peer_id": "peer_b",
-        "nonce": "nonce-b",
+        "nonce": "peer_b-runtime-offer",
         "created_at_ms": 1,
         "candidates": [{
             "candidate_type": "host",
@@ -648,6 +685,7 @@ fn room_runtime_run_can_bootstrap_nat_remote_peer_before_starting() {
     let listener_output = listener.wait_with_output().expect("listener exits");
 
     assert_eq!(value["status"], "ok");
+    assert_eq!(value["natBootstrapSocketReused"], true);
     assert_eq!(value["plan"]["tunnel"]["peer_count"], 1);
     assert_eq!(value["plan"]["peers"][0]["peer_id"], "peer_b");
     assert_eq!(
@@ -656,6 +694,10 @@ fn room_runtime_run_can_bootstrap_nat_remote_peer_before_starting() {
     );
     assert_eq!(value["natBootstrapResults"][0]["status"], "ok");
     assert!(value["natBootstrapResults"][0]["localEndpoint"].is_string());
+    assert_eq!(
+        value["natBootstrapResults"][0]["localEndpoint"],
+        value["actualTunnelEndpoint"]
+    );
     assert_eq!(
         value["natBootstrapResults"][0]["selectedPeer"]["responderPeerId"],
         "peer_b"
@@ -714,6 +756,831 @@ fn room_runtime_run_can_bootstrap_nat_remote_peer_before_starting() {
         String::from_utf8_lossy(&listener_output.stdout),
         String::from_utf8_lossy(&listener_output.stderr)
     );
+}
+
+#[test]
+fn room_runtime_run_falls_back_to_udp_relay_after_p2p_timeout() {
+    let dead_listener = UdpSocket::bind("127.0.0.1:0").expect("reserve unreachable udp port");
+    let dead_addr = dead_listener.local_addr().unwrap();
+    drop(dead_listener);
+    let relay_listener = UdpSocket::bind("127.0.0.1:0").expect("reserve relay udp port");
+    let relay_addr = relay_listener.local_addr().unwrap();
+    drop(relay_listener);
+    let remote_offer = serde_json::json!({
+        "schema_version": 1,
+        "room_id": "room_test",
+        "peer_id": "peer_b",
+        "nonce": "peer_b-runtime-offer",
+        "created_at_ms": 1,
+        "candidates": [{
+            "candidate_type": "host",
+            "transport": "udp",
+            "endpoint": dead_addr.to_string(),
+            "priority": 100,
+            "source": "test-unreachable"
+        }]
+    });
+    let remote_offer = serde_json::to_string(&remote_offer).unwrap();
+
+    let value = run_cli(&[
+        "room-runtime-run",
+        "--room-id",
+        "room_test",
+        "--peer-id",
+        "peer_a",
+        "--virtual-ip",
+        "10.77.12.2",
+        "--bind",
+        "127.0.0.1:0",
+        "--key",
+        "test-room-key",
+        "--duration-ms",
+        "50",
+        "--peer-timeout-ms",
+        "0",
+        "--nat-bootstrap-remote-peer",
+        &format!("peer_b,10.77.12.3,{remote_offer}"),
+        "--relay",
+        &relay_addr.to_string(),
+        "--nat-bootstrap-attempts",
+        "1",
+        "--nat-bootstrap-interval-ms",
+        "0",
+        "--nat-bootstrap-timeout-ms",
+        "100",
+    ]);
+
+    assert_eq!(value["status"], "ok");
+    assert_eq!(
+        value["natBootstrapResults"][0]["status"],
+        "handshake-timeout"
+    );
+    assert_eq!(value["plan"]["peers"][0]["peer_id"], "peer_b");
+    assert_eq!(
+        value["plan"]["peers"][0]["endpoint"],
+        relay_addr.to_string()
+    );
+    assert_eq!(value["plan"]["peers"][0]["connection_path"], "relay");
+    assert_eq!(
+        value["plan"]["peers"][0]["direct_endpoint"],
+        dead_addr.to_string()
+    );
+    assert_eq!(
+        value["plan"]["peers"][0]["fallback_endpoint"],
+        relay_addr.to_string()
+    );
+    assert_eq!(
+        value["connectionPathReports"][0]["report"]["selected_path"],
+        "relay"
+    );
+    assert_eq!(
+        value["connectionPathReports"][0]["report"]["relay_fallback"]["selected_relay_endpoints"]
+            [0],
+        relay_addr.to_string()
+    );
+    assert!(value["heartbeatPackets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|packet| packet["connectionPath"] == "relay"));
+    assert!(value["heartbeatPackets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|packet| {
+            packet["connectionPath"] == "direct" && packet["target"] == dead_addr.to_string()
+        }));
+    assert!(
+        value["runtimePeerSummaries"][0]["selectedPath"] == "p2p"
+            || value["runtimePeerSummaries"][0]["selectedPath"] == "relay"
+    );
+}
+
+#[test]
+fn room_runtime_run_falls_back_to_http_relay_candidate_after_p2p_timeout() {
+    let dead_listener = UdpSocket::bind("127.0.0.1:0").expect("reserve unreachable udp port");
+    let dead_addr = dead_listener.local_addr().unwrap();
+    drop(dead_listener);
+    let remote_offer = serde_json::json!({
+        "schema_version": 1,
+        "room_id": "room_test",
+        "peer_id": "peer_b",
+        "nonce": "peer_b-runtime-offer",
+        "created_at_ms": 1,
+        "candidates": [{
+            "candidate_type": "host",
+            "transport": "udp",
+            "endpoint": dead_addr.to_string(),
+            "priority": 100,
+            "source": "test-unreachable"
+        }]
+    });
+    let remote_offer = serde_json::to_string(&remote_offer).unwrap();
+
+    let value = run_cli(&[
+        "room-runtime-run",
+        "--room-id",
+        "room_test",
+        "--peer-id",
+        "peer_a",
+        "--virtual-ip",
+        "10.77.12.2",
+        "--bind",
+        "127.0.0.1:0",
+        "--key",
+        "test-room-key",
+        "--duration-ms",
+        "50",
+        "--peer-timeout-ms",
+        "0",
+        "--nat-bootstrap-remote-peer",
+        &format!("peer_b,10.77.12.3,{remote_offer}"),
+        "--relay",
+        "http://127.0.0.1",
+        "--nat-bootstrap-attempts",
+        "1",
+        "--nat-bootstrap-interval-ms",
+        "0",
+        "--nat-bootstrap-timeout-ms",
+        "100",
+    ]);
+
+    assert_eq!(value["status"], "ok");
+    assert_eq!(
+        value["natBootstrapResults"][0]["status"],
+        "handshake-timeout"
+    );
+    assert_eq!(value["plan"]["peers"][0]["endpoint"], "http://127.0.0.1");
+    assert_eq!(value["plan"]["peers"][0]["connection_path"], "relay");
+    assert_eq!(
+        value["plan"]["peers"][0]["direct_endpoint"],
+        dead_addr.to_string()
+    );
+    assert_eq!(
+        value["plan"]["peers"][0]["fallback_endpoint"],
+        "http://127.0.0.1"
+    );
+    assert_eq!(
+        value["connectionPathReports"][0]["report"]["selected_path"],
+        "relay"
+    );
+    assert_eq!(
+        value["connectionPathReports"][0]["report"]["relay_fallback"]["selected_relay_endpoints"]
+            [0],
+        "http://127.0.0.1"
+    );
+    assert_eq!(value["runtimePeerSummaries"][0]["pathKind"], "relay");
+}
+
+#[test]
+fn room_runtime_run_activates_relay_fallback_after_direct_peer_timeout() {
+    let relay_listener = UdpSocket::bind("127.0.0.1:0").expect("reserve relay udp port");
+    let relay_addr = relay_listener.local_addr().unwrap();
+    drop(relay_listener);
+    let remote_offer = serde_json::json!({
+        "schema_version": 1,
+        "room_id": "room_test",
+        "peer_id": "peer_b",
+        "nonce": "nonce-b",
+        "created_at_ms": 1,
+        "candidates": [
+            {
+                "candidate_type": "host",
+                "transport": "udp",
+                "endpoint": "127.0.0.1:9",
+                "priority": 100,
+                "source": "test-direct"
+            },
+            {
+                "candidate_type": "relay",
+                "transport": "udp",
+                "endpoint": relay_addr.to_string(),
+                "priority": 10,
+                "source": "test-relay"
+            }
+        ]
+    });
+    let local_offer = serde_json::json!({
+        "schema_version": 1,
+        "room_id": "room_test",
+        "peer_id": "peer_a",
+        "nonce": "nonce-a",
+        "created_at_ms": 1,
+        "candidates": [{
+            "candidate_type": "host",
+            "transport": "udp",
+            "endpoint": "127.0.0.1:39090",
+            "priority": 100,
+            "source": "test-local"
+        }]
+    });
+    let bootstrap_result = serde_json::json!({
+        "status": "ok",
+        "localEndpoint": "127.0.0.1:39090",
+        "localOffer": local_offer,
+        "remoteOffer": remote_offer,
+        "selectedPeer": {
+            "endpoint": "127.0.0.1:9",
+            "responderPeerId": "peer_b",
+            "observedEndpoint": "127.0.0.1:9",
+            "nonceMatched": true,
+            "accepted": true,
+            "handshakeRole": "received-ack",
+            "confirmedByAck": true,
+            "latencyMs": 1
+        }
+    });
+    let bootstrap_result = serde_json::to_string(&bootstrap_result).unwrap();
+
+    let value = run_cli(&[
+        "room-runtime-run",
+        "--room-id",
+        "room_test",
+        "--peer-id",
+        "peer_a",
+        "--virtual-ip",
+        "10.77.12.2",
+        "--bind",
+        "127.0.0.1:0",
+        "--key",
+        "test-room-key",
+        "--duration-ms",
+        "320",
+        "--heartbeat-interval-ms",
+        "50",
+        "--peer-timeout-ms",
+        "80",
+        "--nat-bootstrap-peer",
+        &format!("peer_b,10.77.12.3,{bootstrap_result}"),
+    ]);
+
+    assert_eq!(value["plan"]["peers"][0]["endpoint"], "127.0.0.1:9");
+    assert_eq!(
+        value["plan"]["peers"][0]["fallback_endpoint"],
+        relay_addr.to_string()
+    );
+    assert_eq!(value["relayFallbackActive"], true);
+    assert_eq!(value["relayFallbackEvents"][0]["status"], "activated");
+    assert_eq!(value["status"], "degraded");
+    assert!(value["tunnelServiceSnapshot"]["last_error"]
+        .as_str()
+        .is_some_and(|error| error.contains("No runtime tunnel packets")));
+    assert!(value["heartbeatTargets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|endpoint| endpoint.as_str() == Some(relay_addr.to_string().as_str())));
+    assert!(value["heartbeatPackets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|packet| packet["connectionPath"] == "relay"));
+}
+
+#[test]
+fn room_runtime_run_does_not_restore_direct_from_self_probe() {
+    let relay_listener = UdpSocket::bind("127.0.0.1:0").expect("reserve relay udp port");
+    let relay_addr = relay_listener.local_addr().unwrap();
+    drop(relay_listener);
+    let remote_offer = serde_json::json!({
+        "schema_version": 1,
+        "room_id": "room_self_probe_fallback",
+        "peer_id": "peer_b",
+        "nonce": "nonce-b",
+        "created_at_ms": 1,
+        "candidates": [
+            {
+                "candidate_type": "host",
+                "transport": "udp",
+                "endpoint": "127.0.0.1:9",
+                "priority": 100,
+                "source": "test-direct"
+            },
+            {
+                "candidate_type": "relay",
+                "transport": "udp",
+                "endpoint": relay_addr.to_string(),
+                "priority": 10,
+                "source": "test-relay"
+            }
+        ]
+    });
+    let local_offer = serde_json::json!({
+        "schema_version": 1,
+        "room_id": "room_self_probe_fallback",
+        "peer_id": "peer_a",
+        "nonce": "nonce-a",
+        "created_at_ms": 1,
+        "candidates": [{
+            "candidate_type": "host",
+            "transport": "udp",
+            "endpoint": "127.0.0.1:39090",
+            "priority": 100,
+            "source": "test-local"
+        }]
+    });
+    let bootstrap_result = serde_json::json!({
+        "status": "ok",
+        "localEndpoint": "127.0.0.1:39090",
+        "localOffer": local_offer,
+        "remoteOffer": remote_offer,
+        "selectedPeer": {
+            "endpoint": "127.0.0.1:9",
+            "responderPeerId": "peer_b",
+            "observedEndpoint": "127.0.0.1:9",
+            "nonceMatched": true,
+            "accepted": true,
+            "handshakeRole": "received-ack",
+            "confirmedByAck": true,
+            "latencyMs": 1
+        }
+    });
+    let bootstrap_result = serde_json::to_string(&bootstrap_result).unwrap();
+
+    let value = run_cli(&[
+        "room-runtime-run",
+        "--room-id",
+        "room_self_probe_fallback",
+        "--peer-id",
+        "peer_a",
+        "--virtual-ip",
+        "10.77.12.2",
+        "--bind",
+        "127.0.0.1:0",
+        "--key",
+        "test-room-key",
+        "--duration-ms",
+        "260",
+        "--heartbeat-interval-ms",
+        "50",
+        "--peer-timeout-ms",
+        "80",
+        "--self-probe",
+        "true",
+        "--nat-bootstrap-peer",
+        &format!("peer_b,10.77.12.3,{bootstrap_result}"),
+    ]);
+
+    assert_eq!(value["relayFallbackActive"], true);
+    assert_eq!(
+        value["tunnelServiceSnapshot"]["connected_peer_count"].as_u64(),
+        Some(0)
+    );
+    assert!(value["relayFallbackEvents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|event| event["status"] == "activated"));
+    assert!(!value["relayFallbackEvents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|event| event["status"] == "restored-direct"));
+    assert!(value["heartbeatPackets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|packet| packet["targetPeerId"] == "self-probe"));
+    assert!(value["heartbeatAckPackets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|packet| packet["peer"] == value["actualTunnelEndpoint"]));
+}
+
+#[test]
+fn room_runtime_run_recovers_after_relay_fallback_receives_acks() {
+    let probe = UdpSocket::bind("127.0.0.1:0").expect("reserve relay udp port");
+    let relay_addr = probe.local_addr().unwrap();
+    drop(probe);
+    let room_id = "room_fallback_recover";
+    let key = "test-room-key";
+    let peer_a_out = std::env::temp_dir().join(format!(
+        "lai-peer-a-fallback-recover-{}.json",
+        std::process::id()
+    ));
+    let peer_b_out = std::env::temp_dir().join(format!(
+        "lai-peer-b-fallback-recover-{}.json",
+        std::process::id()
+    ));
+    fs::remove_file(&peer_a_out).ok();
+    fs::remove_file(&peer_b_out).ok();
+    let peer_a_out_string = peer_a_out.display().to_string();
+    let peer_b_out_string = peer_b_out.display().to_string();
+
+    let relay = Command::new(env!("CARGO_BIN_EXE_lai-cli"))
+        .args([
+            "relay-udp-server",
+            "--bind",
+            &relay_addr.to_string(),
+            "--key",
+            key,
+            "--room-id",
+            room_id,
+            "--allowed-peer",
+            "peer_a",
+            "--allowed-peer",
+            "peer_b",
+            "--max-packets",
+            "20",
+            "--timeout-ms",
+            "5000",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn relay server");
+    std::thread::sleep(Duration::from_millis(80));
+
+    let local_offer_a = serde_json::json!({
+        "schema_version": 1,
+        "room_id": room_id,
+        "peer_id": "peer_a",
+        "nonce": "nonce-a",
+        "created_at_ms": 1,
+        "candidates": [{
+            "candidate_type": "host",
+            "transport": "udp",
+            "endpoint": "127.0.0.1:39090",
+            "priority": 100,
+            "source": "test-local"
+        }]
+    });
+    let local_offer_b = serde_json::json!({
+        "schema_version": 1,
+        "room_id": room_id,
+        "peer_id": "peer_b",
+        "nonce": "nonce-b",
+        "created_at_ms": 1,
+        "candidates": [{
+            "candidate_type": "host",
+            "transport": "udp",
+            "endpoint": "127.0.0.1:39091",
+            "priority": 100,
+            "source": "test-local"
+        }]
+    });
+    let remote_offer_a = serde_json::json!({
+        "schema_version": 1,
+        "room_id": room_id,
+        "peer_id": "peer_b",
+        "nonce": "nonce-b",
+        "created_at_ms": 1,
+        "candidates": [
+            {
+                "candidate_type": "host",
+                "transport": "udp",
+                "endpoint": "127.0.0.1:9",
+                "priority": 100,
+                "source": "test-direct"
+            },
+            {
+                "candidate_type": "relay",
+                "transport": "udp",
+                "endpoint": relay_addr.to_string(),
+                "priority": 10,
+                "source": "test-relay"
+            }
+        ]
+    });
+    let remote_offer_b = serde_json::json!({
+        "schema_version": 1,
+        "room_id": room_id,
+        "peer_id": "peer_a",
+        "nonce": "nonce-a",
+        "created_at_ms": 1,
+        "candidates": [
+            {
+                "candidate_type": "host",
+                "transport": "udp",
+                "endpoint": "127.0.0.1:9",
+                "priority": 100,
+                "source": "test-direct"
+            },
+            {
+                "candidate_type": "relay",
+                "transport": "udp",
+                "endpoint": relay_addr.to_string(),
+                "priority": 10,
+                "source": "test-relay"
+            }
+        ]
+    });
+    let bootstrap_a = serde_json::json!({
+        "status": "ok",
+        "localEndpoint": "127.0.0.1:39090",
+        "localOffer": local_offer_a,
+        "remoteOffer": remote_offer_a,
+        "selectedPeer": {
+            "endpoint": "127.0.0.1:9",
+            "responderPeerId": "peer_b",
+            "observedEndpoint": "127.0.0.1:9",
+            "nonceMatched": true,
+            "accepted": true,
+            "handshakeRole": "received-ack",
+            "confirmedByAck": true,
+            "latencyMs": 1
+        }
+    });
+    let bootstrap_b = serde_json::json!({
+        "status": "ok",
+        "localEndpoint": "127.0.0.1:39091",
+        "localOffer": local_offer_b,
+        "remoteOffer": remote_offer_b,
+        "selectedPeer": {
+            "endpoint": "127.0.0.1:9",
+            "responderPeerId": "peer_a",
+            "observedEndpoint": "127.0.0.1:9",
+            "nonceMatched": true,
+            "accepted": true,
+            "handshakeRole": "received-ack",
+            "confirmedByAck": true,
+            "latencyMs": 1
+        }
+    });
+    let bootstrap_a = serde_json::to_string(&bootstrap_a).unwrap();
+    let bootstrap_b = serde_json::to_string(&bootstrap_b).unwrap();
+
+    let peer_a = Command::new(env!("CARGO_BIN_EXE_lai-cli"))
+        .args([
+            "room-runtime-run",
+            "--room-id",
+            room_id,
+            "--peer-id",
+            "peer_a",
+            "--virtual-ip",
+            "10.77.12.2",
+            "--bind",
+            "127.0.0.1:0",
+            "--key",
+            key,
+            "--duration-ms",
+            "650",
+            "--heartbeat-interval-ms",
+            "50",
+            "--peer-timeout-ms",
+            "200",
+            "--nat-bootstrap-peer",
+            &format!("peer_b,10.77.12.3,{bootstrap_a}"),
+            "--snapshot-out",
+            &peer_a_out_string,
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn peer a runtime");
+    let peer_b = Command::new(env!("CARGO_BIN_EXE_lai-cli"))
+        .args([
+            "room-runtime-run",
+            "--room-id",
+            room_id,
+            "--peer-id",
+            "peer_b",
+            "--virtual-ip",
+            "10.77.12.3",
+            "--bind",
+            "127.0.0.1:0",
+            "--key",
+            key,
+            "--duration-ms",
+            "650",
+            "--heartbeat-interval-ms",
+            "50",
+            "--peer-timeout-ms",
+            "200",
+            "--nat-bootstrap-peer",
+            &format!("peer_a,10.77.12.2,{bootstrap_b}"),
+            "--snapshot-out",
+            &peer_b_out_string,
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn peer b runtime");
+
+    let output_a = peer_a.wait_with_output().expect("peer a exits");
+    let output_b = peer_b.wait_with_output().expect("peer b exits");
+    let relay_output = relay.wait_with_output().expect("relay exits");
+    fs::remove_file(&peer_a_out).ok();
+    fs::remove_file(&peer_b_out).ok();
+
+    assert!(
+        output_a.status.success(),
+        "peer a failed\nstatus: {}\nstdout: {}\nstderr: {}",
+        output_a.status,
+        String::from_utf8_lossy(&output_a.stdout),
+        String::from_utf8_lossy(&output_a.stderr)
+    );
+    assert!(
+        output_b.status.success(),
+        "peer b failed\nstatus: {}\nstdout: {}\nstderr: {}",
+        output_b.status,
+        String::from_utf8_lossy(&output_b.stdout),
+        String::from_utf8_lossy(&output_b.stderr)
+    );
+    assert!(
+        relay_output.status.success(),
+        "relay failed\nstatus: {}\nstdout: {}\nstderr: {}",
+        relay_output.status,
+        String::from_utf8_lossy(&relay_output.stdout),
+        String::from_utf8_lossy(&relay_output.stderr)
+    );
+    let value_a: Value = serde_json::from_slice(&output_a.stdout).expect("peer a json");
+    let value_b: Value = serde_json::from_slice(&output_b.stdout).expect("peer b json");
+    let relay_value: Value = serde_json::from_slice(&relay_output.stdout).expect("relay json");
+
+    for value in [&value_a, &value_b] {
+        assert_eq!(value["relayFallbackActive"], true);
+        assert_eq!(value["status"], "ok");
+        assert_eq!(value["tunnelServiceSnapshot"]["last_error"], Value::Null);
+        assert!(value["relayFallbackEvents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|event| event["status"] == "activated"));
+        assert!(value["relayFallbackEvents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|event| event["status"] == "recovered"));
+        assert!(
+            value["heartbeatAckPackets"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|packet| packet["direction"] == "received"
+                    && packet["connectionPath"] == "relay")
+        );
+        assert_eq!(value["runtimePeerSummaries"][0]["pathKind"], "relay");
+        assert_ne!(
+            value["runtimePeerSummaries"][0]["health"]["status"],
+            "needs-attention"
+        );
+        assert!(
+            value["runtimePeerSummaries"][0]["heartbeatLossWindowPercent"]
+                .as_f64()
+                .unwrap_or_default()
+                < 50.0
+        );
+    }
+    assert!(relay_value["forwardedPackets"].as_u64().unwrap_or_default() > 0);
+}
+
+#[test]
+fn room_runtime_run_restores_direct_path_after_relay_fallback() {
+    let direct_probe = UdpSocket::bind("127.0.0.1:0").expect("reserve delayed direct endpoint");
+    let direct_addr = direct_probe.local_addr().unwrap();
+    drop(direct_probe);
+    let relay_probe = UdpSocket::bind("127.0.0.1:0").expect("reserve relay endpoint");
+    let relay_addr = relay_probe.local_addr().unwrap();
+    drop(relay_probe);
+    let room_id = "room_direct_restore";
+    let key = "test-room-key";
+    let local_offer = serde_json::json!({
+        "schema_version": 1,
+        "room_id": room_id,
+        "peer_id": "peer_a",
+        "nonce": "nonce-a",
+        "created_at_ms": 1,
+        "candidates": [{
+            "candidate_type": "host",
+            "transport": "udp",
+            "endpoint": "127.0.0.1:39090",
+            "priority": 100,
+            "source": "test-local"
+        }]
+    });
+    let remote_offer = serde_json::json!({
+        "schema_version": 1,
+        "room_id": room_id,
+        "peer_id": "peer_b",
+        "nonce": "nonce-b",
+        "created_at_ms": 1,
+        "candidates": [
+            {
+                "candidate_type": "host",
+                "transport": "udp",
+                "endpoint": direct_addr.to_string(),
+                "priority": 100,
+                "source": "test-direct"
+            },
+            {
+                "candidate_type": "relay",
+                "transport": "udp",
+                "endpoint": relay_addr.to_string(),
+                "priority": 10,
+                "source": "test-relay"
+            }
+        ]
+    });
+    let bootstrap_result = serde_json::json!({
+        "status": "ok",
+        "localEndpoint": "127.0.0.1:39090",
+        "localOffer": local_offer,
+        "remoteOffer": remote_offer,
+        "selectedPeer": {
+            "endpoint": direct_addr.to_string(),
+            "responderPeerId": "peer_b",
+            "observedEndpoint": direct_addr.to_string(),
+            "nonceMatched": true,
+            "accepted": true,
+            "handshakeRole": "received-ack",
+            "confirmedByAck": true,
+            "latencyMs": 1
+        }
+    });
+    let bootstrap_result = serde_json::to_string(&bootstrap_result).unwrap();
+
+    let peer_a = Command::new(env!("CARGO_BIN_EXE_lai-cli"))
+        .args([
+            "room-runtime-run",
+            "--room-id",
+            room_id,
+            "--peer-id",
+            "peer_a",
+            "--virtual-ip",
+            "10.77.12.2",
+            "--bind",
+            "127.0.0.1:0",
+            "--key",
+            key,
+            "--duration-ms",
+            "900",
+            "--heartbeat-interval-ms",
+            "50",
+            "--peer-timeout-ms",
+            "180",
+            "--nat-bootstrap-peer",
+            &format!("peer_b,10.77.12.3,{bootstrap_result}"),
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn peer a runtime");
+
+    std::thread::sleep(Duration::from_millis(320));
+    let peer_b = Command::new(env!("CARGO_BIN_EXE_lai-cli"))
+        .args([
+            "room-runtime-run",
+            "--room-id",
+            room_id,
+            "--peer-id",
+            "peer_b",
+            "--virtual-ip",
+            "10.77.12.3",
+            "--bind",
+            &direct_addr.to_string(),
+            "--key",
+            key,
+            "--duration-ms",
+            "450",
+            "--heartbeat-interval-ms",
+            "50",
+            "--peer-timeout-ms",
+            "0",
+            "--peer",
+            "peer_a,10.77.12.2,127.0.0.1:9",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn delayed peer b runtime");
+
+    let output_a = peer_a.wait_with_output().expect("peer a exits");
+    let output_b = peer_b.wait_with_output().expect("peer b exits");
+    assert!(
+        output_a.status.success(),
+        "peer a failed\nstatus: {}\nstdout: {}\nstderr: {}",
+        output_a.status,
+        String::from_utf8_lossy(&output_a.stdout),
+        String::from_utf8_lossy(&output_a.stderr)
+    );
+    assert!(
+        output_b.status.success(),
+        "peer b failed\nstatus: {}\nstdout: {}\nstderr: {}",
+        output_b.status,
+        String::from_utf8_lossy(&output_b.stdout),
+        String::from_utf8_lossy(&output_b.stderr)
+    );
+    let value_a: Value = serde_json::from_slice(&output_a.stdout).expect("peer a json");
+    assert_eq!(value_a["status"], "ok");
+    assert_eq!(value_a["relayFallbackActive"], false);
+    assert_eq!(value_a["tunnelServiceSnapshot"]["last_error"], Value::Null);
+    assert!(value_a["relayFallbackEvents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|event| event["status"] == "activated"));
+    assert!(value_a["relayFallbackEvents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|event| event["status"] == "restored-direct"));
+    assert!(value_a["heartbeatAckPackets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|packet| packet["direction"] == "received" && packet["connectionPath"] == "direct"));
 }
 
 #[test]
@@ -788,7 +1655,7 @@ fn room_runtime_run_can_use_stun_for_nat_bootstrap_remote_peer() {
         "schema_version": 1,
         "room_id": "room_test",
         "peer_id": "peer_b",
-        "nonce": "nonce-b",
+        "nonce": "peer_b-runtime-offer",
         "created_at_ms": 1,
         "candidates": [{
             "candidate_type": "host",
@@ -1453,9 +2320,9 @@ fn room_runtime_run_fetches_http_coordination_offer_before_bootstrap() {
             "--store",
             &store_path_string,
             "--max-requests",
-            "2",
+            "20",
             "--request-timeout-ms",
-            "5000",
+            "10000",
         ])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1488,7 +2355,7 @@ fn room_runtime_run_fetches_http_coordination_offer_before_bootstrap() {
         "schema_version": 1,
         "room_id": "room_test",
         "peer_id": "peer_b",
-        "nonce": "nonce-b",
+        "nonce": "peer_b-runtime-offer",
         "created_at_ms": 1,
         "candidates": [{
             "candidate_type": "host",
@@ -1537,7 +2404,16 @@ fn room_runtime_run_fetches_http_coordination_offer_before_bootstrap() {
         "2000",
     ]);
     let listener_output = listener.wait_with_output().expect("listener exits");
-    let server_output = server.wait_with_output().expect("server exits");
+    let mut server = server;
+    let mut server_was_killed = false;
+    let server_output = match server.try_wait().expect("server wait check") {
+        Some(_) => server.wait_with_output().expect("server exits"),
+        None => {
+            server_was_killed = true;
+            server.kill().ok();
+            server.wait_with_output().expect("server killed")
+        }
+    };
     fs::remove_file(&store_path).ok();
 
     assert_eq!(value["status"], "ok");
@@ -1562,7 +2438,191 @@ fn room_runtime_run_fetches_http_coordination_offer_before_bootstrap() {
         String::from_utf8_lossy(&listener_output.stderr)
     );
     assert!(
-        server_output.status.success(),
+        server_was_killed || server_output.status.success(),
+        "server failed\nstatus: {}\nstdout: {}\nstderr: {}",
+        server_output.status,
+        String::from_utf8_lossy(&server_output.stdout),
+        String::from_utf8_lossy(&server_output.stderr)
+    );
+}
+
+#[test]
+fn room_runtime_run_waits_for_delayed_http_coordination_offer() {
+    let http_probe = TcpListener::bind("127.0.0.1:0").expect("free local port");
+    let server_addr = http_probe.local_addr().unwrap();
+    drop(http_probe);
+    let handshake_probe = UdpSocket::bind("127.0.0.1:0").expect("free udp port");
+    let listener_addr = handshake_probe.local_addr().unwrap();
+    drop(handshake_probe);
+    let store_path = std::env::temp_dir().join(format!(
+        "lai-cli-runtime-coordination-http-wait-store-{}.json",
+        std::process::id()
+    ));
+    let store_path_string = store_path.display().to_string();
+    fs::remove_file(&store_path).ok();
+
+    let server = Command::new(env!("CARGO_BIN_EXE_lai-cli"))
+        .args([
+            "coordination-http-serve",
+            "--bind",
+            &server_addr.to_string(),
+            "--store",
+            &store_path_string,
+            "--max-requests",
+            "8",
+            "--request-timeout-ms",
+            "5000",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn coordination http server");
+    std::thread::sleep(Duration::from_millis(100));
+
+    let listener = Command::new(env!("CARGO_BIN_EXE_lai-cli"))
+        .args([
+            "p2p-handshake-listen",
+            "--bind",
+            &listener_addr.to_string(),
+            "--key",
+            "test-room-key",
+            "--responder-peer-id",
+            "peer_b",
+            "--max-packets",
+            "1",
+            "--timeout-ms",
+            "3000",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn p2p listener");
+    std::thread::sleep(Duration::from_millis(80));
+
+    let server_url = format!("http://{server_addr}");
+    let stale_addr = "127.0.0.1:9";
+    let stale_offer = serde_json::json!({
+        "schema_version": 1,
+        "room_id": "room_wait_test",
+        "peer_id": "peer_b",
+        "nonce": "peer_b-desktop-offer",
+        "created_at_ms": 1,
+        "candidates": [{
+            "candidate_type": "host",
+            "transport": "udp",
+            "endpoint": stale_addr,
+            "priority": 100,
+            "source": "test-stale-desktop"
+        }]
+    });
+    let stale_offer = serde_json::to_string(&stale_offer).unwrap();
+    run_cli(&[
+        "coordination-http-offer-publish",
+        "--server",
+        &server_url,
+        "--offer",
+        &stale_offer,
+        "--ttl-ms",
+        "30000",
+    ]);
+
+    let remote_offer = serde_json::json!({
+        "schema_version": 1,
+        "room_id": "room_wait_test",
+        "peer_id": "peer_b",
+        "nonce": "peer_b-runtime-offer",
+        "created_at_ms": 1,
+        "candidates": [{
+            "candidate_type": "host",
+            "transport": "udp",
+            "endpoint": listener_addr.to_string(),
+            "priority": 100,
+            "source": "test-listener"
+        }]
+    });
+    let remote_offer = serde_json::to_string(&remote_offer).unwrap();
+    let publish_server_url = server_url.clone();
+    let publisher = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(350));
+        run_cli(&[
+            "coordination-http-offer-publish",
+            "--server",
+            &publish_server_url,
+            "--offer",
+            &remote_offer,
+            "--ttl-ms",
+            "30000",
+        ])
+    });
+
+    let value = run_cli(&[
+        "room-runtime-run",
+        "--room-id",
+        "room_wait_test",
+        "--peer-id",
+        "peer_a",
+        "--virtual-ip",
+        "10.77.12.2",
+        "--bind",
+        "127.0.0.1:0",
+        "--key",
+        "test-room-key",
+        "--duration-ms",
+        "50",
+        "--peer-timeout-ms",
+        "0",
+        "--coordination-server",
+        &server_url,
+        "--coordination-peer",
+        "peer_b,10.77.12.3",
+        "--nat-bootstrap-attempts",
+        "1",
+        "--nat-bootstrap-interval-ms",
+        "100",
+        "--nat-bootstrap-timeout-ms",
+        "2500",
+    ]);
+    let publish_value = publisher.join().expect("publisher joins");
+    let listener_output = listener.wait_with_output().expect("listener exits");
+    let mut server = server;
+    let mut server_was_killed = false;
+    let server_output = match server.try_wait().expect("server wait check") {
+        Some(_) => server.wait_with_output().expect("server exits"),
+        None => {
+            server_was_killed = true;
+            server.kill().ok();
+            server.wait_with_output().expect("server killed")
+        }
+    };
+    fs::remove_file(&store_path).ok();
+
+    assert_eq!(publish_value["status"], "ok");
+    assert_eq!(value["status"], "ok");
+    assert_eq!(value["plan"]["tunnel"]["peer_count"], 1);
+    assert_eq!(
+        value["plan"]["peers"][0]["endpoint"],
+        listener_addr.to_string()
+    );
+    assert_eq!(
+        value["coordinationBootstrapResults"][0]["fetchAttempts"]
+            .as_u64()
+            .unwrap_or_default()
+            > 1,
+        true
+    );
+    assert_eq!(
+        value["coordinationBootstrapResults"][1]["result"]["selectedPeer"]["responderPeerId"],
+        "peer_b"
+    );
+    assert!(
+        listener_output.status.success(),
+        "listener failed\nstatus: {}\nstdout: {}\nstderr: {}",
+        listener_output.status,
+        String::from_utf8_lossy(&listener_output.stdout),
+        String::from_utf8_lossy(&listener_output.stderr)
+    );
+    assert!(
+        server_was_killed || server_output.status.success(),
         "server failed\nstatus: {}\nstdout: {}\nstderr: {}",
         server_output.status,
         String::from_utf8_lossy(&server_output.stdout),
@@ -1766,10 +2826,10 @@ fn room_runtime_run_outputs_snapshots_and_packet_observations() {
 
     assert_eq!(value["status"], "ok");
     assert_eq!(value["tunnelServiceSnapshot"]["service_running"], true);
-    assert_eq!(value["tunnelServiceSnapshot"]["connected_peer_count"], 1);
+    assert_eq!(value["tunnelServiceSnapshot"]["connected_peer_count"], 0);
     assert_eq!(
         value["networkObservation"]["diagnostic_snapshot"]["p2p"],
-        "ok"
+        "failed"
     );
     assert_eq!(
         value["networkObservation"]["diagnostic_snapshot"]["game_traffic"],
@@ -2570,6 +3630,80 @@ fn game_readiness_can_use_catalog_profile_ports() {
 }
 
 #[test]
+fn room_runtime_run_publishes_coordination_offer_from_runtime_socket() {
+    let http_probe = TcpListener::bind("127.0.0.1:0").expect("free local port");
+    let server_addr = http_probe.local_addr().unwrap();
+    drop(http_probe);
+    let store_path = std::env::temp_dir().join(format!(
+        "lai-cli-runtime-publish-http-store-{}.json",
+        std::process::id()
+    ));
+    let store_path_string = store_path.display().to_string();
+    fs::remove_file(&store_path).ok();
+
+    let server = Command::new(env!("CARGO_BIN_EXE_lai-cli"))
+        .args([
+            "coordination-http-serve",
+            "--bind",
+            &server_addr.to_string(),
+            "--store",
+            &store_path_string,
+            "--max-requests",
+            "1",
+            "--request-timeout-ms",
+            "5000",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn coordination http server");
+    std::thread::sleep(Duration::from_millis(100));
+
+    let server_url = format!("http://{server_addr}");
+    let value = run_cli(&[
+        "room-runtime-run",
+        "--room-id",
+        "room_publish_socket",
+        "--peer-id",
+        "peer_a",
+        "--virtual-ip",
+        "10.77.12.2",
+        "--bind",
+        "127.0.0.1:0",
+        "--key",
+        "test-room-key",
+        "--duration-ms",
+        "50",
+        "--peer-timeout-ms",
+        "0",
+        "--coordination-server",
+        &server_url,
+        "--coordination-publish-ttl-ms",
+        "30000",
+    ]);
+    let server_output = server.wait_with_output().expect("server exits");
+    fs::remove_file(&store_path).ok();
+
+    assert_eq!(value["status"], "ok");
+    assert_eq!(value["runtimePublishedOffer"]["status"], "ok");
+    assert_eq!(
+        value["runtimePublishedOffer"]["localEndpoint"],
+        value["actualTunnelEndpoint"]
+    );
+    assert_eq!(
+        value["runtimePublishedOffer"]["offer"]["candidates"][0]["endpoint"],
+        value["actualTunnelEndpoint"]
+    );
+    assert!(
+        server_output.status.success(),
+        "server failed\nstatus: {}\nstdout: {}\nstderr: {}",
+        server_output.status,
+        String::from_utf8_lossy(&server_output.stdout),
+        String::from_utf8_lossy(&server_output.stderr)
+    );
+}
+
+#[test]
 fn room_runtime_run_can_inject_to_explicit_udp_target() {
     let listener = UdpSocket::bind("127.0.0.1:0").expect("inject listener");
     listener
@@ -2685,6 +3819,133 @@ fn room_runtime_run_can_forward_raw_ipv4_packet_payloads() {
             .unwrap()
             >= 29
     );
+}
+
+#[test]
+fn room_runtime_run_replies_to_icmp_echo_request_inside_tunnel() {
+    let fake_peer = UdpSocket::bind("127.0.0.1:0").expect("bind fake peer");
+    fake_peer
+        .set_read_timeout(Some(Duration::from_millis(1500)))
+        .unwrap();
+    let runtime_probe = UdpSocket::bind("127.0.0.1:0").expect("reserve runtime port");
+    let runtime_addr = runtime_probe.local_addr().unwrap();
+    drop(runtime_probe);
+    let room_id = "room_icmp_echo";
+    let key = "test-room-key";
+
+    let runtime = Command::new(env!("CARGO_BIN_EXE_lai-cli"))
+        .args([
+            "room-runtime-run",
+            "--room-id",
+            room_id,
+            "--peer-id",
+            "peer_b",
+            "--virtual-ip",
+            "10.77.12.3",
+            "--bind",
+            &runtime_addr.to_string(),
+            "--key",
+            key,
+            "--duration-ms",
+            "900",
+            "--heartbeat-interval-ms",
+            "200",
+            "--peer-timeout-ms",
+            "0",
+            "--peer",
+            &format!("peer_a,10.77.12.2,{}", fake_peer.local_addr().unwrap()),
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn runtime");
+    std::thread::sleep(Duration::from_millis(80));
+
+    let request = test_icmp_echo_request([10, 77, 12, 2], [10, 77, 12, 3]);
+    let forward_payload = serde_json::json!({
+        "room_id": room_id,
+        "peer_id": "peer_a",
+        "kind": "runtime-ipv4-forward",
+        "source": "10.77.12.2",
+        "destination": "10.77.12.3",
+        "broadcast": false,
+        "payload_encoding": "raw-ipv4",
+        "raw_ipv4_packet": STANDARD_NO_PAD.encode(&request),
+        "raw_ipv4_packet_bytes": request.len(),
+        "ipv4_protocol": "icmp",
+        "ipv4_protocol_number": 1,
+    });
+    let sealed = run_cli(&[
+        "tunnel-seal",
+        "--key",
+        key,
+        "--packet-kind",
+        "runtime-ipv4-forward",
+        "--sequence",
+        "1",
+        "--message",
+        &serde_json::to_string(&forward_payload).unwrap(),
+    ]);
+    let wire = serde_json::to_vec(&sealed).unwrap();
+    fake_peer
+        .send_to(&wire, runtime_addr)
+        .expect("send echo request");
+
+    let mut buffer = [0u8; 4096];
+    let mut reply_bytes = None;
+    for _ in 0..8 {
+        let (received, _) = fake_peer.recv_from(&mut buffer).expect("runtime reply");
+        let envelope = std::str::from_utf8(&buffer[..received]).unwrap().to_owned();
+        let opened = run_cli(&["tunnel-open", "--key", key, "--envelope", &envelope]);
+        if opened["metadata"]["packet_kind"] != "runtime-ipv4-forward" {
+            continue;
+        }
+        let message: Value =
+            serde_json::from_str(opened["message"].as_str().unwrap()).expect("forward json");
+        if message["icmp_echo_reply"] != true {
+            continue;
+        }
+        let encoded = message["raw_ipv4_packet"].as_str().unwrap();
+        reply_bytes = Some(STANDARD_NO_PAD.decode(encoded).unwrap());
+        break;
+    }
+    let reply = reply_bytes.expect("icmp echo reply");
+    let summary = lai_core::parse_ipv4_packet_summary(&reply).unwrap();
+
+    let output = runtime.wait_with_output().expect("runtime exits");
+    assert!(
+        output.status.success(),
+        "runtime failed\nstatus: {}\nstdout: {}\nstderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: Value = serde_json::from_slice(&output.stdout).expect("runtime json");
+
+    assert_eq!(summary.protocol, "icmp");
+    assert_eq!(summary.source_ip.to_string(), "10.77.12.3");
+    assert_eq!(summary.destination_ip.to_string(), "10.77.12.2");
+    assert_eq!(reply[20], 0);
+    assert_eq!(reply[21], 0);
+    assert_eq!(&reply[24..26], &0x1234u16.to_be_bytes());
+    assert_eq!(&reply[26..28], &7u16.to_be_bytes());
+    assert_eq!(&reply[28..], b"hello");
+    assert_eq!(value["icmpEchoReplies"].as_array().unwrap().len(), 1);
+    assert_eq!(value["packetPathCounters"]["icmpEchoRepliesSent"], 1);
+    assert_eq!(value["packetPathCounters"]["rawVirtualPacketsReceived"], 1);
+    assert!(
+        value["packetPathCounters"]["forwardedPacketsSent"]
+            .as_u64()
+            .unwrap_or_default()
+            >= 1
+    );
+    assert!(value["forwardedPackets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|packet| {
+            packet["packetIoBackend"] == "icmp-responder" && packet["protocol"] == "icmp"
+        }));
 }
 
 #[test]
@@ -2846,9 +4107,13 @@ fn room_runtime_run_emits_periodic_heartbeats_and_snapshots() {
             >= 1
     );
 
-    let snapshot = fs::read_to_string(&snapshot_path).expect("runtime snapshot");
+    let snapshot: Value =
+        serde_json::from_str(&fs::read_to_string(&snapshot_path).expect("runtime snapshot"))
+            .expect("snapshot json");
     fs::remove_file(&snapshot_path).ok();
-    assert!(snapshot.contains("\"snapshotWriteCount\""));
+    assert!(snapshot["snapshotWriteCount"].is_number());
+    assert!(snapshot["packetPathCounters"]["tunnelPacketsReceived"].is_number());
+    assert!(snapshot["packetPathCounters"]["forwardedPacketsSent"].is_number());
 }
 
 #[test]
@@ -3240,7 +4505,7 @@ fn nat_candidates_and_plan_exchange_endpoints() {
 }
 
 #[test]
-fn nat_plan_orders_routable_candidates_before_private_host() {
+fn nat_plan_orders_routable_candidates_before_private_host_and_excludes_relay() {
     let local_offer = serde_json::json!({
         "schema_version": 1,
         "room_id": "room_test",
@@ -3311,8 +4576,7 @@ fn nat_plan_orders_routable_candidates_before_private_host() {
         serde_json::json!([
             "198.51.100.20:39090",
             "198.51.100.20:44000",
-            "192.168.1.20:39090",
-            "203.0.113.10:39091"
+            "192.168.1.20:39090"
         ])
     );
 }

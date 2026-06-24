@@ -42,12 +42,14 @@ public partial class LocalAreaInterconnectionDesktop
 
     void QuickHostRoom()
     {
+        EnsureRelayDefaults();
         if (roomName.Text.Trim().Length == 0 || hostName.Text.Trim().Length == 0)
         {
             output.Text = T("hostNeedsName");
             return;
         }
         CreateRoom();
+        string publishOutput = PublishNativeOfferIfConfigured(RuntimePeerId(), false);
         if (invite.Text.Trim().Length > 0)
         {
             bool copied = TryCopyToClipboard(invite.Text.Trim());
@@ -57,10 +59,25 @@ public partial class LocalAreaInterconnectionDesktop
                 + Environment.NewLine
                 + T("quickNextHost");
         }
+        if (CoordinationPublishLooksSuccessful(publishOutput))
+        {
+            output.Text += Environment.NewLine + Environment.NewLine + T("coordinationOfferPublished");
+        }
+        else if (publishOutput.Length > 0)
+        {
+            output.Text += Environment.NewLine + Environment.NewLine + T("coordinationPublishFailed")
+                + Environment.NewLine + publishOutput
+                + Environment.NewLine
+                + T("coordinationManualOfferFallback");
+        }
+        roomUiMode = "host";
+        UpdateHomeActionButtons();
+        RefreshCoordinationRoomView(false);
     }
 
     void QuickJoinRoom()
     {
+        EnsureRelayDefaults();
         if (invite.Text.Trim().Length == 0)
         {
             output.Text = T("joinNeedsInvite");
@@ -68,13 +85,29 @@ public partial class LocalAreaInterconnectionDesktop
         }
         DecodeInvite();
         JoinRoom();
+        string publishOutput = PublishNativeOfferIfConfigured(RuntimePeerId(), false);
         output.Text += Environment.NewLine
             + Environment.NewLine
             + T("quickJoinedNext");
+        if (CoordinationPublishLooksSuccessful(publishOutput))
+        {
+            output.Text += Environment.NewLine + T("coordinationOfferPublished");
+        }
+        else if (publishOutput.Length > 0)
+        {
+            output.Text += Environment.NewLine + T("coordinationPublishFailed")
+                + Environment.NewLine + publishOutput
+                + Environment.NewLine
+                + T("coordinationManualOfferFallback");
+        }
+        roomUiMode = "joined";
+        UpdateHomeActionButtons();
+        RefreshCoordinationRoomView(false);
     }
 
     void StartLanSession()
     {
+        EnsureRelayDefaults();
         if (invite.Text.Trim().Length == 0)
         {
             output.Text = T("startNeedsRoom");
@@ -88,18 +121,54 @@ public partial class LocalAreaInterconnectionDesktop
             out directPeerId,
             out directVirtualIp,
             out directOffer);
+        string coordinationPeerId;
+        string coordinationVirtualIp;
+        bool hasCoordinationPeer = TryParseCoordinationPeerSpec(
+            remotePeer.Text.Trim(),
+            out coordinationPeerId,
+            out coordinationVirtualIp);
+        if (!hasDirectOffer && !hasCoordinationPeer && coordinationServer.Text.Trim().Length > 0)
+        {
+            string discovered = ConfigureRemotePeerFromCoordinationNow();
+            hasDirectOffer = TryParseRemotePeerOfferSpec(
+                remotePeer.Text.Trim(),
+                out directPeerId,
+                out directVirtualIp,
+                out directOffer);
+            hasCoordinationPeer = TryParseCoordinationPeerSpec(
+                remotePeer.Text.Trim(),
+                out coordinationPeerId,
+                out coordinationVirtualIp);
+            if (!hasDirectOffer && !hasCoordinationPeer && discovered.Length > 0)
+            {
+                output.Text = discovered;
+                return;
+            }
+        }
         if (coordinationServer.Text.Trim().Length == 0 && !hasDirectOffer)
         {
             output.Text = T("directRemoteOfferRequired");
             return;
         }
+        if (coordinationServer.Text.Trim().Length > 0 && !hasDirectOffer && !hasCoordinationPeer)
+        {
+            output.Text = T("coordinationWaitingForPeer");
+            return;
+        }
         string startText = T("quickLanStarting");
+        string modeBeforeStart = roomUiMode == "host" ? "host" : "joined";
         if (hasDirectOffer)
         {
             startText += Environment.NewLine + T("directBootstrapStarting") + " " + directPeerId + " @ " + directVirtualIp;
         }
+        else if (hasCoordinationPeer)
+        {
+            startText += Environment.NewLine + T("coordinationBootstrapStarting") + " " + coordinationPeerId + " @ " + coordinationVirtualIp;
+        }
         output.Text = startText;
-        RunPrepareLanEnvironmentAsync(true, startText);
+        roomUiMode = "running";
+        UpdateHomeActionButtons();
+        RunPrepareLanEnvironmentAsync(true, startText, modeBeforeStart);
     }
 
     void DecodeInvite()
@@ -181,27 +250,164 @@ public partial class LocalAreaInterconnectionDesktop
             output.Text = messageKey == "inviteCopied" ? T("copyInviteNeedsRoom") : T("nothingToCopy");
             return;
         }
-        if (TryCopyToClipboard(value.Trim()))
+        string text = value.Trim();
+        if (TryCopyToClipboard(text))
         {
-            output.Text = T(messageKey) + Environment.NewLine + value.Trim();
+            output.Text = T(messageKey);
         }
         else
         {
-            output.Text = T("clipboardCopyFailed") + Environment.NewLine + value.Trim();
+            output.Text = T("clipboardCopyFailed") + Environment.NewLine + text;
+        }
+    }
+
+    void EnsureRelayDefaults()
+    {
+        if (coordinationServer != null && coordinationServer.Text.Trim().Length == 0)
+        {
+            coordinationServer.Text = DefaultCoordinationServer();
+        }
+        else if (coordinationServer != null)
+        {
+            coordinationServer.Text = NormalizeCoordinationServer(coordinationServer.Text);
+        }
+        if (relayServer != null && relayServer.Text.Trim().Length == 0)
+        {
+            relayServer.Text = DefaultRelayServer();
+        }
+        else if (relayServer != null)
+        {
+            relayServer.Text = NormalizeRelayServer(relayServer.Text);
+        }
+        if (stunServer != null && stunServer.Text.Trim().Length == 0)
+        {
+            stunServer.Text = DefaultStunServer();
         }
     }
 
     bool TryCopyToClipboard(string value)
     {
+        for (int attempt = 0; attempt < 5; attempt++)
+        {
+            try
+            {
+                Clipboard.Clear();
+                Clipboard.SetText(value, TextDataFormat.UnicodeText);
+                if (ClipboardTextMatches(value)) return true;
+            }
+            catch
+            {
+                try
+                {
+                    Clipboard.SetDataObject(value, true, 10, 150);
+                    if (ClipboardTextMatches(value)) return true;
+                }
+                catch
+                {
+                    System.Threading.Thread.Sleep(80);
+                }
+            }
+        }
+        if (TryCopyToClipboardWithWin32(value)) return true;
+        return TryCopyToClipboardWithPowerShell(value);
+    }
+
+    bool ClipboardTextMatches(string value)
+    {
         try
         {
-            Clipboard.SetText(value);
-            return true;
+            return Clipboard.ContainsText() && Clipboard.GetText(TextDataFormat.UnicodeText) == value;
         }
         catch
         {
             return false;
         }
+    }
+
+    bool TryCopyToClipboardWithPowerShell(string value)
+    {
+        string path = "";
+        try
+        {
+            path = Path.Combine(LogDirectory(), "clipboard-" + DateTime.UtcNow.ToString("yyyyMMddHHmmssfff") + ".txt");
+            File.WriteAllText(path, value, new UTF8Encoding(false));
+            ProcessStartInfo start = new ProcessStartInfo();
+            start.FileName = "powershell.exe";
+            start.Arguments = "-NoProfile -ExecutionPolicy Bypass -Command \"$text = Get-Content -Raw -LiteralPath "
+                + PowerShellSingleQuoted(path)
+                + "; Set-Clipboard -Value $text\"";
+            start.UseShellExecute = false;
+            start.CreateNoWindow = true;
+            using (Process process = Process.Start(start))
+            {
+                if (process == null) return false;
+                if (!process.WaitForExit(5000)) return false;
+            }
+            System.Threading.Thread.Sleep(120);
+            return ClipboardTextMatches(value);
+        }
+        catch
+        {
+            return false;
+        }
+        finally
+        {
+            try
+            {
+                if (path.Length > 0 && File.Exists(path)) File.Delete(path);
+            }
+            catch
+            {
+            }
+        }
+    }
+
+    bool TryCopyToClipboardWithWin32(string value)
+    {
+        IntPtr global = IntPtr.Zero;
+        IntPtr locked = IntPtr.Zero;
+        bool opened = false;
+        try
+        {
+            byte[] bytes = Encoding.Unicode.GetBytes(value + "\0");
+            global = Native.GlobalAlloc(Native.GmemMoveable, (UIntPtr)bytes.Length);
+            if (global == IntPtr.Zero) return false;
+            locked = Native.GlobalLock(global);
+            if (locked == IntPtr.Zero) return false;
+            Marshal.Copy(bytes, 0, locked, bytes.Length);
+            Native.GlobalUnlock(global);
+            locked = IntPtr.Zero;
+
+            for (int attempt = 0; attempt < 8; attempt++)
+            {
+                opened = Native.OpenClipboard(Handle);
+                if (opened) break;
+                System.Threading.Thread.Sleep(60);
+            }
+            if (!opened) return false;
+            if (!Native.EmptyClipboard()) return false;
+            if (Native.SetClipboardData(Native.CfUnicodeText, global) == IntPtr.Zero) return false;
+            global = IntPtr.Zero;
+            Native.CloseClipboard();
+            opened = false;
+            System.Threading.Thread.Sleep(80);
+            return ClipboardTextMatches(value);
+        }
+        catch
+        {
+            return false;
+        }
+        finally
+        {
+            if (opened) Native.CloseClipboard();
+            if (locked != IntPtr.Zero) Native.GlobalUnlock(global);
+            if (global != IntPtr.Zero) Native.GlobalFree(global);
+        }
+    }
+
+    string PowerShellSingleQuoted(string value)
+    {
+        return "'" + value.Replace("'", "''") + "'";
     }
 
     void RunNetworkDiagnose()
@@ -285,35 +491,27 @@ public partial class LocalAreaInterconnectionDesktop
 
     void ExportDiagnostics()
     {
-        using (SaveFileDialog dialog = new SaveFileDialog())
-        {
-            dialog.Title = T("saveDiagnosticBundle");
-            dialog.Filter = T("jsonFilesFilter");
-            dialog.FileName = "local-area-interconnection-diagnostic.json";
-            if (dialog.ShowDialog(this) != DialogResult.OK)
-            {
-                return;
-            }
-
-            RunNativeCli("diagnostic-export --out " + Quote(dialog.FileName)
-                + " --adapter-name LocalAreaInterconnection"
-                + " --expected-ip " + ip.Text
-                + " --subnet " + subnet.Text
-                + PingArgs()
-                + PacketObservationArgs()
-                + RuntimeSnapshotArgs()
-                + " --broadcast-ports " + ports.Text
-                + " --game-ports " + ports.Text
-                + " --game-name " + Quote(gameName.Text)
-                + GameCatalogArgs()
-                + " --ports " + ports.Text
-                + " --packet-io-backend wintun"
-                + " --route-scan true"
-                + " --netstat-scan true"
-                + RelayExportArgs()
-                + NetshExportArgs());
-            UpdateRoomDetailsFromDiagnosticBundle(dialog.FileName);
-        }
+        string path = Path.Combine(
+            LogDirectory(),
+            "local-area-interconnection-diagnostic-" + DateTime.UtcNow.ToString("yyyyMMddHHmmssfff") + ".json");
+        RunNativeCli("diagnostic-export --out " + Quote(path)
+            + " --adapter-name LocalAreaInterconnection"
+            + " --expected-ip " + ip.Text
+            + " --subnet " + subnet.Text
+            + PingArgs()
+            + PacketObservationArgs()
+            + RuntimeSnapshotArgs()
+            + " --broadcast-ports " + ports.Text
+            + " --game-ports " + ports.Text
+            + " --game-name " + Quote(gameName.Text)
+            + GameCatalogArgs()
+            + " --ports " + ports.Text
+            + " --packet-io-backend wintun"
+            + " --route-scan true"
+            + " --netstat-scan true"
+            + RelayExportArgs()
+            + NetshExportArgs());
+        UpdateRoomDetailsFromDiagnosticBundle(path);
     }
 
     void RunGameProfilePlan()
@@ -388,7 +586,7 @@ public partial class LocalAreaInterconnectionDesktop
         {
             return "";
         }
-        string networkPath = Path.Combine(AppDataDirectory(), "game-readiness-network.json");
+        string networkPath = Path.Combine(LogDirectory(), "game-readiness-network.json");
         File.WriteAllText(networkPath, network, Encoding.UTF8);
         string text = RunNativeCliCapture("game-readiness"
             + " --network-report " + Quote(networkPath)
@@ -451,6 +649,11 @@ public partial class LocalAreaInterconnectionDesktop
     bool PrepareLanEnvironmentForStart()
     {
         string[] steps = LanEnvironmentPrepareArgs();
+        if (steps.Length == 0)
+        {
+            output.Text = T("prepareLanSkipped");
+            return true;
+        }
         if (!ConfirmAdminAction("prepareLanConfirm", "prepareLanEnvironment"))
         {
             output.Text = T("prepareLanCancelled");
@@ -458,19 +661,40 @@ public partial class LocalAreaInterconnectionDesktop
         }
         string text = RunNativeCliElevatedBatch(steps, "prepare-lan");
         output.Text = T("prepareLanFinished") + Environment.NewLine + text;
-        return ElevatedTextLooksSuccessful(text);
+        return ElevatedTextLooksSuccessful(text) || FirewallPrepareFailureCanContinue(text);
     }
 
     void RunPrepareLanEnvironment()
     {
-        RunPrepareLanEnvironmentAsync(false, T("prepareLanStarting"));
+        RunPrepareLanEnvironmentAsync(false, T("prepareLanStarting"), roomUiMode);
     }
 
     void RunPrepareLanEnvironmentAsync(bool startRuntimeAfterPrepare, string initialText)
     {
+        RunPrepareLanEnvironmentAsync(startRuntimeAfterPrepare, initialText, roomUiMode);
+    }
+
+    void RunPrepareLanEnvironmentAsync(bool startRuntimeAfterPrepare, string initialText, string modeAfterFailure)
+    {
         if (userActionRunning)
         {
             output.Text = T("actionAlreadyRunning");
+            return;
+        }
+        string[] steps = LanEnvironmentPrepareArgs();
+        if (steps.Length == 0)
+        {
+            output.Text = initialText + Environment.NewLine + T("prepareLanSkipped");
+            if (startRuntimeAfterPrepare)
+            {
+                StartNativeRuntime(false);
+                if (runtimeProcess != null && !runtimeProcess.HasExited)
+                {
+                    output.Text += Environment.NewLine
+                        + Environment.NewLine
+                        + T("quickLanStarted");
+                }
+            }
             return;
         }
         if (!ConfirmAdminAction("prepareLanConfirm", "prepareLanEnvironment"))
@@ -481,7 +705,6 @@ public partial class LocalAreaInterconnectionDesktop
         userActionRunning = true;
         SetActionButtonsEnabled(false);
         output.Text = initialText;
-        string[] steps = LanEnvironmentPrepareArgs();
         Task.Factory.StartNew(delegate
         {
             string prepareText = "";
@@ -505,14 +728,23 @@ public partial class LocalAreaInterconnectionDesktop
                 if (error != null)
                 {
                     ShowActionError("prepareLanEnvironment", error);
+                    roomUiMode = modeAfterFailure;
+                    UpdateHomeActionButtons();
                     return;
                 }
                 bool prepared = ElevatedTextLooksSuccessful(prepareText);
+                bool firewallWarningOnly = !prepared && FirewallPrepareFailureCanContinue(prepareText);
                 output.Text = T("prepareLanFinished") + Environment.NewLine + prepareText;
-                if (!prepared)
+                if (!prepared && !firewallWarningOnly)
                 {
                     output.Text += Environment.NewLine + Environment.NewLine + T("prepareLanFailed");
+                    roomUiMode = modeAfterFailure;
+                    UpdateHomeActionButtons();
                     return;
+                }
+                if (firewallWarningOnly)
+                {
+                    output.Text += Environment.NewLine + Environment.NewLine + T("prepareLanFirewallWarningContinue");
                 }
                 if (startRuntimeAfterPrepare)
                 {
@@ -532,19 +764,19 @@ public partial class LocalAreaInterconnectionDesktop
     {
         return new string[]
         {
-            "wintun-adapter-ensure --adapter-name LocalAreaInterconnection --tunnel-type LocalAreaInterconnection --yes true",
-            "adapter-ensure --adapter-name LocalAreaInterconnection"
+            "adapter-apply --adapter-name LocalAreaInterconnection"
                 + " --subnet " + subnet.Text
                 + " --ip " + ip.Text
-                + " --adapter-scan true"
                 + " --yes true",
             FirewallApplyArgs() + " --yes true",
-            "firewall-apply --game-name " + Quote("LocalAreaInterconnection Runtime")
-                + " --subnet " + subnet.Text
-                + " --ports " + NativeRuntimePort().ToString(CultureInfo.InvariantCulture)
-                + " --remote-scope any"
-                + " --yes true"
         };
+    }
+
+    bool FirewallPrepareFailureCanContinue(string text)
+    {
+        if (ElevatedExitCode(text) != "1") return false;
+        return text.IndexOf("advfirewall", StringComparison.OrdinalIgnoreCase) >= 0
+            || text.IndexOf("firewall apply did not complete", StringComparison.OrdinalIgnoreCase) >= 0;
     }
 
     string FirewallApplyArgs()
@@ -552,7 +784,8 @@ public partial class LocalAreaInterconnectionDesktop
         return "firewall-apply --game-name " + Quote(gameName.Text)
             + GameCatalogArgs()
             + " --subnet " + subnet.Text
-            + " --ports " + ports.Text;
+            + " --ports " + ports.Text
+            + " --remote-scope any";
     }
 
     void RunNativeRuntimeSelfTest()
@@ -605,11 +838,17 @@ public partial class LocalAreaInterconnectionDesktop
 
     void StartNativeRuntime()
     {
-        StartNativeRuntime(true);
+        if (runtimeProcess != null && !runtimeProcess.HasExited)
+        {
+            output.Text = T("runtimeAlreadyRunning") + Environment.NewLine + RuntimeStatusText();
+            return;
+        }
+        RunPrepareLanEnvironmentAsync(true, T("prepareLanStarting"));
     }
 
     void StartNativeRuntime(bool showDetails)
     {
+        EnsureRelayDefaults();
         if (runtimeProcess != null && !runtimeProcess.HasExited)
         {
             output.Text = T("runtimeAlreadyRunning") + Environment.NewLine + RuntimeStatusText();
@@ -629,13 +868,13 @@ public partial class LocalAreaInterconnectionDesktop
         string peer = RuntimePeerId();
         string roomId = RuntimeRoomId();
         string virtualIp = ip.Text.Trim();
-        string bind = NativeRuntimeBind();
+        string bind = AllocateNativeRuntimeBind();
         string roomKey = RuntimeRoomKey();
         string gamePort = FirstPortText("27015");
         string broadcastPort = FirstPortText("39078");
         string coordinationServerValue = coordinationServer.Text.Trim();
         string stunServerValue = stunServer.Text.Trim();
-        int runtimePort = NativeRuntimePort();
+        int runtimePort = RuntimePortFromBind(bind);
         string args = "room-runtime-run"
             + " --room-id " + Quote(roomId)
             + " --peer-id " + Quote(peer)
@@ -645,7 +884,7 @@ public partial class LocalAreaInterconnectionDesktop
             + " --game-ports " + gamePort
             + " --broadcast-ports " + broadcastPort
             + " --duration-ms 3600000"
-            + " --peer-timeout-ms 0"
+            + " --peer-timeout-ms 5000"
             + " --self-probe true"
             + " --capture-self-probe true"
             + " --forward-self-probe true"
@@ -653,13 +892,18 @@ public partial class LocalAreaInterconnectionDesktop
             + " --packet-io-backend wintun"
             + " --forward-raw-ipv4 true"
             + " --wintun-runtime true"
-            + " --heartbeat-interval-ms 1000"
+            + " --heartbeat-interval-ms 500"
             + " --observe-file " + Quote(observePath)
             + " --snapshot-out " + Quote(latestRuntimeSnapshot)
             + " --snapshot-interval-ms 1000"
             + " --stop-file " + Quote(runtimeStopFile)
+            + " --nat-bootstrap-attempts 24"
+            + " --nat-bootstrap-interval-ms 100"
+            + " --nat-bootstrap-timeout-ms 8000"
             + RuntimeNatBootstrapStunArgs(stunServerValue)
             + RuntimeNatBootstrapUpnpArgs()
+            + RelayCandidateArgs()
+            + RuntimeCoordinationPublishArgs(coordinationServerValue)
             + RuntimeCoordinationArgs()
             + RuntimeCoordinationMonitorArgs();
 
@@ -672,6 +916,7 @@ public partial class LocalAreaInterconnectionDesktop
         }
         output.Text = T("runtimeStarted")
             + Environment.NewLine + RuntimeStatusText()
+            + Environment.NewLine + "UDP bind: " + bind
             + Environment.NewLine + T("runtimeSnapshotPath") + latestRuntimeSnapshot
             + Environment.NewLine + T("runtimeObservationPath") + observePath;
         string directPeerId;
@@ -680,6 +925,16 @@ public partial class LocalAreaInterconnectionDesktop
         if (TryParseRemotePeerOfferSpec(remotePeer.Text.Trim(), out directPeerId, out directVirtualIp, out directOffer))
         {
             output.Text += Environment.NewLine + T("directBootstrapStarting") + " " + directPeerId + " @ " + directVirtualIp;
+        }
+        else
+        {
+            string coordinationPeerId;
+            string coordinationVirtualIp;
+            if (TryParseCoordinationPeerSpec(remotePeer.Text.Trim(), out coordinationPeerId, out coordinationVirtualIp)
+                && coordinationServer.Text.Trim().Length > 0)
+            {
+                output.Text += Environment.NewLine + T("coordinationBootstrapStarting") + " " + coordinationPeerId + " @ " + coordinationVirtualIp;
+            }
         }
         if (latestNativeOfferFile.Length > 0)
         {
@@ -708,6 +963,7 @@ public partial class LocalAreaInterconnectionDesktop
             File.WriteAllText(runtimeStopFile, "stop");
         }
         StopRuntimeProcess(5000);
+        heartbeatPulseActive = false;
         output.Text = T("runtimeStopped")
             + Environment.NewLine + RuntimeStatusText()
             + Environment.NewLine + runtimeOutput.ToString();
@@ -720,6 +976,8 @@ public partial class LocalAreaInterconnectionDesktop
             output.Text += Environment.NewLine + T("runtimeSnapshotReady") + latestRuntimeSnapshot;
             RefreshRuntimeStatus();
         }
+        roomUiMode = hostRuntimePeerId.Length > 0 && RuntimePeerId() == hostRuntimePeerId ? "host" : "joined";
+        UpdateHomeActionButtons();
     }
 
     void RunRuntimeCleanupPlan()
@@ -927,18 +1185,17 @@ public partial class LocalAreaInterconnectionDesktop
     void RunDirectOffer()
     {
         string peer = RuntimePeerId();
-        string result = CreateNativeOffer(peer, false);
-        if (result.Length == 0 || latestNativeOfferFile.Length == 0 || !File.Exists(latestNativeOfferFile))
+        string spec;
+        string result = CreateDirectOfferSpec(peer, out spec);
+        if (result.Length == 0 || spec.Length == 0)
         {
-            output.Text = T("directOfferFailed");
+            output.Text = DirectOfferFailureText(result);
             return;
         }
-        string offer = CompactJson(File.ReadAllText(latestNativeOfferFile, Encoding.UTF8).Trim());
-        string spec = peer + "," + ip.Text.Trim() + "," + offer;
         bool copied = TryCopyToClipboard(spec);
         output.Text = T("directOfferReady")
             + Environment.NewLine
-            + T(copied ? "quickInviteCopied" : "quickInviteCopyFailed")
+            + T(copied ? "directOfferCopied" : "directOfferCopyFailed")
             + Environment.NewLine
             + StunMappingText(result)
             + Environment.NewLine
@@ -948,6 +1205,97 @@ public partial class LocalAreaInterconnectionDesktop
             + Environment.NewLine
             + Environment.NewLine
             + T("directOfferNext");
+    }
+
+    void CopyDirectCode()
+    {
+        string peer = RuntimePeerId();
+        string spec;
+        string result = CreateDirectOfferSpec(peer, out spec);
+        if (result.Length == 0 || spec.Length == 0)
+        {
+            output.Text = DirectOfferFailureText(result);
+            return;
+        }
+        bool copied = TryCopyToClipboard(spec);
+        output.Text = T(copied ? "directCodeCopied" : "directCodeCopyFailed")
+            + Environment.NewLine
+            + StunMappingText(result)
+            + Environment.NewLine
+            + T("directCodeNext");
+        if (!copied)
+        {
+            output.Text += Environment.NewLine
+                + Environment.NewLine
+                + spec;
+        }
+    }
+
+    string CreateDirectOfferSpec(string peer, out string spec)
+    {
+        spec = "";
+        string result = CreateNativeOffer(peer, false);
+        if (result.Length == 0 || latestNativeOfferFile.Length == 0 || !File.Exists(latestNativeOfferFile))
+        {
+            return "";
+        }
+        string offer = CompactJson(File.ReadAllText(latestNativeOfferFile, Encoding.UTF8).Trim());
+        if (OfferCandidateCount(offer) == 0)
+        {
+            return result;
+        }
+        spec = peer + "," + ip.Text.Trim() + "," + offer;
+        return result;
+    }
+
+    int OfferCandidateCount(string offer)
+    {
+        string candidates = JsonArrayValue(offer, "candidates");
+        if (candidates.Length == 0) return 0;
+        int count = 0;
+        int search = 0;
+        while (search < candidates.Length)
+        {
+            int start = candidates.IndexOf('{', search);
+            if (start < 0) break;
+            int end = MatchingJsonBrace(candidates, start);
+            if (end < 0) break;
+            count++;
+            search = end + 1;
+        }
+        return count;
+    }
+
+    string DirectOfferFailureText(string result)
+    {
+        string text = T("directOfferFailed");
+        string trimmed = result.Trim();
+        if (trimmed.StartsWith("{", StringComparison.Ordinal))
+        {
+            string offer = JsonObjectValue(trimmed, "offer");
+            string candidateCount = offer.Length > 0 ? OfferCandidateCount(CompactJson(offer)).ToString(CultureInfo.InvariantCulture) : "0";
+            text += Environment.NewLine
+                + T("directCandidateCount") + " " + candidateCount
+                + Environment.NewLine
+                + StunMappingText(trimmed)
+                + Environment.NewLine
+                + UpnpMappingText(trimmed);
+            if (candidateCount == "0")
+            {
+                text += Environment.NewLine
+                    + T("directNoCandidatesHint");
+            }
+        }
+        else if (trimmed.Length > 0)
+        {
+            text += Environment.NewLine + Environment.NewLine + trimmed;
+        }
+        text += Environment.NewLine
+            + T("directOfferFailureHint")
+            + " bind=" + NativeRuntimeBind()
+            + ", peer=" + RuntimePeerId()
+            + ", ip=" + ip.Text.Trim();
+        return text;
     }
 
     void RunDirectSelfTest()
@@ -1041,9 +1389,9 @@ public partial class LocalAreaInterconnectionDesktop
             + " --key " + Quote(RuntimeRoomKey())
             + " --bind " + Quote(NativeRuntimeBind())
             + " --remote-offer " + Quote(preparedOffer)
-            + " --punch-attempts 8"
-            + " --punch-interval-ms 50"
-            + " --handshake-timeout-ms 5000"
+            + " --punch-attempts 24"
+            + " --punch-interval-ms 100"
+            + " --handshake-timeout-ms 30000"
             + StunArgs(stunServer.Text.Trim())
             + UpnpPortMapArgs();
         try
@@ -1107,6 +1455,20 @@ public partial class LocalAreaInterconnectionDesktop
             output.Text += Environment.NewLine + Environment.NewLine + firewallOutput;
         }
         RefreshCoordinationRoomView(false);
+    }
+
+    bool EnsureLocalCoordinationServerForRoom()
+    {
+        if (coordinationServer.Text.Trim().Length == 0)
+        {
+            coordinationServer.Text = LocalCoordinationEndpoint();
+        }
+        if (coordinationProcess != null && !coordinationProcess.HasExited)
+        {
+            return true;
+        }
+        StartLocalCoordinationServer();
+        return coordinationProcess != null && !coordinationProcess.HasExited;
     }
 
     void StopLocalCoordinationServer()
@@ -1193,6 +1555,37 @@ public partial class LocalAreaInterconnectionDesktop
                 coordinationRoomRefreshRunning = false;
             }
         });
+    }
+
+    string ConfigureRemotePeerFromCoordinationNow()
+    {
+        string currentSubnet = subnet.Text.Trim();
+        string server = coordinationServer.Text.Trim();
+        if (currentSubnet.Length == 0 || server.Length == 0)
+        {
+            return "";
+        }
+        string peer = RuntimePeerId();
+        string arguments = "coordination-http-room-view"
+            + " --server " + Quote(server)
+            + " --room-id " + Quote(RuntimeRoomId())
+            + " --peer-id " + Quote(peer)
+            + " --subnet " + Quote(currentSubnet);
+        try
+        {
+            string text = RunNativeCliCapture(arguments);
+            UpdateRoomDetailsFromCoordinationView(text);
+            AutoConfigureRemotePeerFromCoordinationView(text);
+            if (remotePeer.Text.Trim().Length == 0)
+            {
+                return T("coordinationWaitingForPeer") + Environment.NewLine + text;
+            }
+            return text;
+        }
+        catch (Exception ex)
+        {
+            return T("coordinationFetchFailed") + Environment.NewLine + ex.Message;
+        }
     }
 
     void RunTcpTest()

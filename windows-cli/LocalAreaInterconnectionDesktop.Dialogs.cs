@@ -18,6 +18,7 @@ public partial class LocalAreaInterconnectionDesktop
         {
             dialog.Title = T("selectNetshOutput");
             dialog.Filter = T("textFilesFilter");
+            dialog.InitialDirectory = LogDirectory();
             if (dialog.ShowDialog(this) == DialogResult.OK)
             {
                 netshOutput.Text = dialog.FileName;
@@ -31,6 +32,7 @@ public partial class LocalAreaInterconnectionDesktop
         {
             dialog.Title = T("selectPacketObservations");
             dialog.Filter = T("textFilesFilter");
+            dialog.InitialDirectory = LogDirectory();
             dialog.FileName = "packets.txt";
             if (dialog.ShowDialog(this) == DialogResult.OK)
             {
@@ -45,6 +47,7 @@ public partial class LocalAreaInterconnectionDesktop
         {
             dialog.Title = T("selectGameCatalog");
             dialog.Filter = T("jsonFilesFilter");
+            dialog.InitialDirectory = AppDomain.CurrentDomain.BaseDirectory;
             if (dialog.ShowDialog(this) == DialogResult.OK)
             {
                 gameCatalog.Text = dialog.FileName;

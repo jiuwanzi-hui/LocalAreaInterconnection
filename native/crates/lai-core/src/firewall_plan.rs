@@ -1,5 +1,6 @@
 use crate::game_network_plan::FirewallRule;
 use serde::{Deserialize, Serialize};
+use std::net::Ipv4Addr;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct WindowsFirewallPlan {
@@ -65,7 +66,7 @@ pub fn create_windows_firewall_plan(
 
 fn create_add_rule_command(
     rule: &FirewallRule,
-    group_name: &str,
+    _group_name: &str,
     program_path: Option<&str>,
 ) -> FirewallCommand {
     let mut args = vec![
@@ -79,8 +80,7 @@ fn create_add_rule_command(
         assignment("protocol", &rule.protocol.to_uppercase()),
         assignment("localport", &rule.port.to_string()),
         assignment("profile", &rule.profile),
-        assignment("remoteip", &rule.remote_scope),
-        assignment("group", group_name),
+        assignment("remoteip", &netsh_remote_scope(&rule.remote_scope)),
     ];
     if let Some(program_path) = program_path {
         args.push(assignment("program", program_path));
@@ -143,6 +143,26 @@ fn assignment(key: &str, value: &str) -> String {
     format!("{key}={}", quote_netsh_value(value))
 }
 
+fn netsh_remote_scope(value: &str) -> String {
+    if let Some((network, prefix)) = value.split_once('/') {
+        if let (Ok(network), Ok(prefix)) = (network.parse::<Ipv4Addr>(), prefix.parse::<u8>()) {
+            if prefix <= 32 {
+                return format!("{network}/{}", prefix_to_subnet_mask(prefix));
+            }
+        }
+    }
+    value.to_owned()
+}
+
+fn prefix_to_subnet_mask(prefix: u8) -> Ipv4Addr {
+    let mask = if prefix == 0 {
+        0
+    } else {
+        u32::MAX << (32 - u32::from(prefix))
+    };
+    Ipv4Addr::from(mask)
+}
+
 fn quote_netsh_value(value: &str) -> String {
     if value
         .chars()
@@ -193,7 +213,9 @@ mod tests {
         assert!(plan.commands[0]
             .command
             .contains("name=\"Example Game UDP 7777\""));
-        assert!(plan.commands[0].command.contains("remoteip=10.77.12.0/24"));
+        assert!(plan.commands[0]
+            .command
+            .contains("remoteip=10.77.12.0/255.255.255.0"));
         assert!(plan.commands[0]
             .command
             .contains("program=\"C:\\Games\\Example Game\\game.exe\""));

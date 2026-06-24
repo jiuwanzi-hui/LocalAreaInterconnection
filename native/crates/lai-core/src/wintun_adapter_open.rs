@@ -84,13 +84,14 @@ fn open_wintun_adapter_windows(request: WintunAdapterOpenRequest) -> WintunAdapt
         let adapter = open_adapter(adapter_name_wide.as_ptr());
 
         if adapter.is_null() {
+            let error = std::io::Error::last_os_error();
             FreeLibrary(dll);
             WintunAdapterOpenReport {
                 status: "open-failed".to_owned(),
                 adapter_name: None,
                 opened: false,
                 closed: false,
-                error: Some("WintunOpenAdapter returned null".to_owned()),
+                error: Some(format!("WintunOpenAdapter returned null ({error}).")),
             }
         } else {
             type WintunCloseAdapterFn = unsafe extern "system" fn(*mut std::ffi::c_void);

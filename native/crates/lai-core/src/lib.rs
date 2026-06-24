@@ -152,10 +152,11 @@ pub use virtual_adapter_plan::{
     create_windows_virtual_adapter_plan, AdapterPlanWarning, NetworkCommand, VirtualAdapterPlan,
 };
 pub use virtual_packet_io::{
-    build_ipv4_tcp_packet, build_ipv4_udp_packet, create_virtual_packet_io_plan,
-    parse_ipv4_packet_summary, parse_ipv4_tcp_packet, parse_ipv4_udp_packet,
-    tcp_observation_from_virtual_packet, udp_observation_from_virtual_packet,
-    VirtualIpv4PacketSummary, VirtualPacketIoPlan, VirtualTcpPacket, VirtualUdpPacket,
+    build_ipv4_icmp_echo_reply, build_ipv4_tcp_packet, build_ipv4_udp_packet,
+    create_virtual_packet_io_plan, parse_ipv4_icmp_echo_request, parse_ipv4_packet_summary,
+    parse_ipv4_tcp_packet, parse_ipv4_udp_packet, tcp_observation_from_virtual_packet,
+    udp_observation_from_virtual_packet, VirtualIcmpEchoPacket, VirtualIpv4PacketSummary,
+    VirtualPacketIoPlan, VirtualTcpPacket, VirtualUdpPacket,
 };
 pub use windows_adapter_parser::parse_netsh_adapter_observation;
 pub use windows_firewall_parser::parse_netsh_firewall_rules;

@@ -91,6 +91,7 @@ public partial class LocalAreaInterconnectionDesktop
     string CoordinationMembersText(string json)
     {
         string array = JsonArrayValue(json, "members");
+        if (array.Length == 0) array = JsonArrayValue(json, "peers");
         if (array.Length == 0) return "";
         List<string> members = new List<string>();
         int search = 0;
@@ -102,9 +103,12 @@ public partial class LocalAreaInterconnectionDesktop
             if (end < 0) break;
             string member = array.Substring(start, end - start + 1);
             string peer = JsonStringValue(member, "peer_id");
+            if (peer.Length == 0) peer = JsonStringValue(member, "peerId");
             string virtualIp = JsonStringValue(member, "virtual_ip");
+            if (virtualIp.Length == 0) virtualIp = JsonStringValue(member, "virtualIp");
             string status = JsonStringValue(member, "status");
             bool isHost = JsonBoolValue(member, "is_host");
+            if (!isHost) isHost = JsonBoolValue(member, "isHost");
             if (peer.Length > 0)
             {
                 string text = peer;
@@ -121,6 +125,44 @@ public partial class LocalAreaInterconnectionDesktop
             members.Add("+" + (memberCount - members.Count).ToString());
         }
         return String.Join(Environment.NewLine, members.ToArray());
+    }
+
+    int JsonObjectArrayCount(string json, string key)
+    {
+        string array = JsonArrayValue(json, key);
+        if (array.Length == 0) return 0;
+        int count = 0;
+        int search = 0;
+        while (search < array.Length)
+        {
+            int start = array.IndexOf('{', search);
+            if (start < 0) break;
+            int end = MatchingJsonBrace(array, start);
+            if (end < 0) break;
+            count++;
+            search = end + 1;
+        }
+        return count;
+    }
+
+    int JsonObjectArrayStatusCount(string json, string key, string statusValue)
+    {
+        string array = JsonArrayValue(json, key);
+        if (array.Length == 0) return 0;
+        int count = 0;
+        int search = 0;
+        while (search < array.Length)
+        {
+            int start = array.IndexOf('{', search);
+            if (start < 0) break;
+            int end = MatchingJsonBrace(array, start);
+            if (end < 0) break;
+            string item = array.Substring(start, end - start + 1);
+            string status = JsonStringValue(item, "status");
+            if (status == statusValue) count++;
+            search = end + 1;
+        }
+        return count;
     }
 
     string RuntimePeersText(string json)
@@ -331,6 +373,454 @@ public partial class LocalAreaInterconnectionDesktop
         return String.Join(Environment.NewLine, plans.ToArray());
     }
 
+    string RuntimeLinkStateText(string json)
+    {
+        if (RuntimeHasConnectedPeer(json)) return T("runtimeConnected");
+        if (RuntimeHasUnstablePeer(json)) return T("runtimePeerUnstable");
+        if (RuntimeHasPeer(json)) return T("runtimePeerDisconnected");
+        return RuntimeStatusText();
+    }
+
+    bool RuntimeHasConnectedPeer(string json)
+    {
+        string array = JsonArrayValue(json, "runtimePeerSummaries");
+        if (array.Length == 0) array = JsonArrayValue(json, "summaries");
+        if (array.Length == 0)
+        {
+            return false;
+        }
+        int search = 0;
+        while (search < array.Length)
+        {
+            int start = array.IndexOf('{', search);
+            if (start < 0) break;
+            int end = MatchingJsonBrace(array, start);
+            if (end < 0) break;
+            string peer = array.Substring(start, end - start + 1);
+            if (RuntimePeerRecentlySeen(peer))
+            {
+                return true;
+            }
+            search = end + 1;
+        }
+        return false;
+    }
+
+    bool RuntimeHasUnstablePeer(string json)
+    {
+        string array = JsonArrayValue(json, "runtimePeerSummaries");
+        if (array.Length == 0) array = JsonArrayValue(json, "summaries");
+        if (array.Length == 0)
+        {
+            return false;
+        }
+        int search = 0;
+        while (search < array.Length)
+        {
+            int start = array.IndexOf('{', search);
+            if (start < 0) break;
+            int end = MatchingJsonBrace(array, start);
+            if (end < 0) break;
+            string peer = array.Substring(start, end - start + 1);
+            if (RuntimePeerUnstable(peer))
+            {
+                return true;
+            }
+            search = end + 1;
+        }
+        return false;
+    }
+
+    bool RuntimeHasPeer(string json)
+    {
+        string array = JsonArrayValue(json, "runtimePeerSummaries");
+        if (array.Length == 0) array = JsonArrayValue(json, "summaries");
+        return FirstJsonObject(array).Length > 0;
+    }
+
+    string RuntimePrimaryPathText(string json)
+    {
+        string array = JsonArrayValue(json, "runtimePeerSummaries");
+        if (array.Length == 0) array = JsonArrayValue(json, "summaries");
+        if (array.Length == 0) return "";
+        bool hasRelay = false;
+        bool hasDirect = false;
+        bool hasP2p = false;
+        int search = 0;
+        while (search < array.Length)
+        {
+            int start = array.IndexOf('{', search);
+            if (start < 0) break;
+            int end = MatchingJsonBrace(array, start);
+            if (end < 0) break;
+            string peer = array.Substring(start, end - start + 1);
+            string path = JsonStringValue(peer, "pathKind");
+            if (path.Length == 0) path = JsonStringValue(peer, "selectedPath");
+            if (path == "relay") hasRelay = true;
+            else if (path == "direct") hasDirect = true;
+            else if (path == "p2p") hasP2p = true;
+            search = end + 1;
+        }
+        if (hasRelay) return T("technologyUdpRelay");
+        if (hasDirect) return T("technologyUdpP2p");
+        if (hasP2p) return T("technologyUdpP2p");
+        return "";
+    }
+
+    string RuntimeHeartbeatAckText(string json)
+    {
+        string array = JsonArrayValue(json, "runtimePeerSummaries");
+        if (array.Length == 0) array = JsonArrayValue(json, "summaries");
+        int total = 0;
+        int search = 0;
+        while (search < array.Length)
+        {
+            int start = array.IndexOf('{', search);
+            if (start < 0) break;
+            int end = MatchingJsonBrace(array, start);
+            if (end < 0) break;
+            string peer = array.Substring(start, end - start + 1);
+            int count;
+            if (Int32.TryParse(JsonNumberValue(peer, "heartbeatAckPacketsReceived"), NumberStyles.Integer, CultureInfo.InvariantCulture, out count))
+            {
+                total += count;
+            }
+            search = end + 1;
+        }
+        return total > 0 ? total.ToString(CultureInfo.InvariantCulture) : "";
+    }
+
+    string RuntimeMetricsText(string json)
+    {
+        bool connected = RuntimeHasConnectedPeer(json);
+        double latency = RuntimeBestLatencyMs(json);
+        double loss = RuntimeBestLossPercent(json);
+        int heartbeat = RuntimeHeartbeatAckCount(json);
+        long sent = 0;
+        long received = 0;
+        RuntimeByteTotals(json, out sent, out received);
+        double seconds = connected ? RuntimeElapsedSeconds(json) : 0;
+        double sentPerSecond = connected && seconds > 0 ? sent / seconds : 0;
+        double receivedPerSecond = connected && seconds > 0 ? received / seconds : 0;
+        string latencyText = "--";
+        if (connected && latency >= 0)
+        {
+            latencyText = ShortNumber(latency.ToString(CultureInfo.InvariantCulture)) + "ms";
+            if (RuntimeRelayQueueingLikely(json, latency))
+            {
+                latencyText += " " + T("relayQueueing");
+            }
+        }
+
+        return T("metricLatency") + " " + latencyText
+            + " | " + T("metricUptime") + " " + (connected ? RuntimeElapsedText(seconds) : "--")
+            + " | " + T("metricBandwidth") + " ↑" + FormatBytesPerSecond(sentPerSecond) + " ↓" + FormatBytesPerSecond(receivedPerSecond)
+            + " | " + T("metricHeartbeat") + " " + heartbeat.ToString(CultureInfo.InvariantCulture)
+            + " | " + T("metricLoss") + " " + (connected && loss >= 0 ? loss.ToString("0.0", CultureInfo.InvariantCulture) + "%" : "--");
+    }
+
+    string RuntimePacketCountersText(string json)
+    {
+        string counters = JsonObjectValue(json, "packetPathCounters");
+        if (counters.Length == 0) return "";
+        int tunnel = JsonIntValue(counters, "tunnelPacketsReceived");
+        int forwarded = JsonIntValue(counters, "forwardedPacketsSent");
+        int raw = JsonIntValue(counters, "rawVirtualPacketsReceived");
+        int icmpRequests = JsonIntValue(counters, "icmpEchoRequestsSeen");
+        int icmpReplies = JsonIntValue(counters, "icmpEchoRepliesSent");
+        int wintunIn = JsonIntValue(counters, "wintunPacketsReceived");
+        int wintunOut = JsonIntValue(counters, "wintunPacketsSent");
+        if (tunnel + forwarded + raw + icmpRequests + icmpReplies + wintunIn + wintunOut == 0) return "";
+        return T("metricPackets")
+            + " W↓" + wintunIn.ToString(CultureInfo.InvariantCulture)
+            + " T↑" + forwarded.ToString(CultureInfo.InvariantCulture)
+            + " R↓" + raw.ToString(CultureInfo.InvariantCulture)
+            + " Ping↓" + icmpRequests.ToString(CultureInfo.InvariantCulture)
+            + " Ping↑" + icmpReplies.ToString(CultureInfo.InvariantCulture)
+            + " W↑" + wintunOut.ToString(CultureInfo.InvariantCulture);
+    }
+
+    string RuntimeNextActionText(string json, string linkState, string adapter, string tunnel, string p2p, string broadcast, string gameTraffic)
+    {
+        if (linkState == T("runtimeConnected"))
+        {
+            return T("nextHealthy");
+        }
+        string counters = JsonObjectValue(json, "packetPathCounters");
+        if (counters.Length > 0)
+        {
+            int wintunIn = JsonIntValue(counters, "wintunPacketsReceived");
+            int forwarded = JsonIntValue(counters, "forwardedPacketsSent");
+            int tunnelIn = JsonIntValue(counters, "tunnelPacketsReceived");
+            int pingRequests = JsonIntValue(counters, "icmpEchoRequestsSeen");
+            int pingReplies = JsonIntValue(counters, "icmpEchoRepliesSent");
+            int wintunOut = JsonIntValue(counters, "wintunPacketsSent");
+            if (wintunIn == 0)
+            {
+                string routeStatus = JsonStringValue(JsonObjectValue(json, "runtimeRouteEvidence"), "status");
+                if (routeStatus == "missing-route" || routeStatus == "route-mismatch" || routeStatus == "adapter-ip-mismatch")
+                {
+                    return T("runtimeDiagRouteMismatch");
+                }
+                return T("runtimeDiagNoWintunIn");
+            }
+            if (forwarded == 0)
+            {
+                return T("runtimeDiagNoForward");
+            }
+            if (tunnelIn == 0)
+            {
+                return T("runtimeDiagNoTunnelIn");
+            }
+            if (pingRequests > 0 && pingReplies == 0)
+            {
+                return T("runtimeDiagNoPingReply");
+            }
+            if (pingReplies > 0 && wintunOut == 0)
+            {
+                return T("runtimeDiagNoWintunOut");
+            }
+        }
+        return DiagnosticNextAction(adapter, tunnel, p2p, broadcast, gameTraffic);
+    }
+
+    string RuntimeCompactPeersText(string json)
+    {
+        string array = JsonArrayValue(json, "runtimePeerSummaries");
+        if (array.Length == 0) array = JsonArrayValue(json, "summaries");
+        if (array.Length == 0) return "";
+        List<string> peers = new List<string>();
+        int search = 0;
+        while (search < array.Length && peers.Count < 3)
+        {
+            int start = array.IndexOf('{', search);
+            if (start < 0) break;
+            int end = MatchingJsonBrace(array, start);
+            if (end < 0) break;
+            string peer = array.Substring(start, end - start + 1);
+            string peerId = JsonStringValue(peer, "peerId");
+            string virtualIp = JsonStringValue(peer, "virtualIp");
+            string path = JsonStringValue(peer, "pathKind");
+            if (path.Length == 0) path = JsonStringValue(peer, "selectedPath");
+            string latency = JsonNumberValue(peer, "latencyMs");
+            int heartbeat = 0;
+            Int32.TryParse(JsonNumberValue(peer, "heartbeatAckPacketsReceived"), NumberStyles.Integer, CultureInfo.InvariantCulture, out heartbeat);
+            if (peerId.Length > 0)
+            {
+                string text = peerId;
+                if (virtualIp.Length > 0) text += " @ " + virtualIp;
+                if (path.Length > 0) text += " | " + FriendlyPath(path);
+                if (latency.Length > 0) text += " | " + ShortNumber(latency) + "ms";
+                text += " | " + T("metricHeartbeat") + " " + heartbeat.ToString(CultureInfo.InvariantCulture);
+                peers.Add(text);
+            }
+            search = end + 1;
+        }
+        return String.Join(Environment.NewLine, peers.ToArray());
+    }
+
+    int RuntimeHeartbeatAckCount(string json)
+    {
+        string array = JsonArrayValue(json, "runtimePeerSummaries");
+        if (array.Length == 0) array = JsonArrayValue(json, "summaries");
+        int total = 0;
+        int search = 0;
+        while (search < array.Length)
+        {
+            int start = array.IndexOf('{', search);
+            if (start < 0) break;
+            int end = MatchingJsonBrace(array, start);
+            if (end < 0) break;
+            string peer = array.Substring(start, end - start + 1);
+            int count;
+            if (Int32.TryParse(JsonNumberValue(peer, "heartbeatAckPacketsReceived"), NumberStyles.Integer, CultureInfo.InvariantCulture, out count))
+            {
+                total += count;
+            }
+            search = end + 1;
+        }
+        return total;
+    }
+
+    double RuntimeBestLatencyMs(string json)
+    {
+        string array = JsonArrayValue(json, "runtimePeerSummaries");
+        if (array.Length == 0) array = JsonArrayValue(json, "summaries");
+        double best = -1;
+        int search = 0;
+        while (search < array.Length)
+        {
+            int start = array.IndexOf('{', search);
+            if (start < 0) break;
+            int end = MatchingJsonBrace(array, start);
+            if (end < 0) break;
+            string peer = array.Substring(start, end - start + 1);
+            double latency;
+            if (Double.TryParse(JsonNumberValue(peer, "latencyMs"), NumberStyles.Float, CultureInfo.InvariantCulture, out latency))
+            {
+                best = best < 0 ? latency : Math.Min(best, latency);
+            }
+            search = end + 1;
+        }
+        return best;
+    }
+
+    double RuntimeBestLossPercent(string json)
+    {
+        string array = JsonArrayValue(json, "runtimePeerSummaries");
+        if (array.Length == 0) array = JsonArrayValue(json, "summaries");
+        double best = -1;
+        int search = 0;
+        while (search < array.Length)
+        {
+            int start = array.IndexOf('{', search);
+            if (start < 0) break;
+            int end = MatchingJsonBrace(array, start);
+            if (end < 0) break;
+            string peer = array.Substring(start, end - start + 1);
+            string lossText = JsonNumberValue(peer, "heartbeatLossWindowPercent");
+            if (lossText.Length == 0) lossText = JsonNumberValue(peer, "heartbeatLossPercent");
+            double loss;
+            if (Double.TryParse(lossText, NumberStyles.Float, CultureInfo.InvariantCulture, out loss))
+            {
+                best = best < 0 ? loss : Math.Min(best, loss);
+            }
+            search = end + 1;
+        }
+        return best;
+    }
+
+    bool RuntimeRelayQueueingLikely(string json, double latency)
+    {
+        if (latency < 1000) return false;
+        string array = JsonArrayValue(json, "runtimePeerSummaries");
+        if (array.Length == 0) array = JsonArrayValue(json, "summaries");
+        int search = 0;
+        while (search < array.Length)
+        {
+            int start = array.IndexOf('{', search);
+            if (start < 0) break;
+            int end = MatchingJsonBrace(array, start);
+            if (end < 0) break;
+            string peer = array.Substring(start, end - start + 1);
+            string path = JsonStringValue(peer, "pathKind");
+            if (path.Length == 0) path = JsonStringValue(peer, "selectedPath");
+            if (path == "relay" || path == "relayed")
+            {
+                return true;
+            }
+            search = end + 1;
+        }
+        return false;
+    }
+
+    void RuntimeByteTotals(string json, out long sent, out long received)
+    {
+        sent = 0;
+        received = 0;
+        string array = JsonArrayValue(json, "runtimePeerSummaries");
+        if (array.Length == 0) array = JsonArrayValue(json, "summaries");
+        int search = 0;
+        while (search < array.Length)
+        {
+            int start = array.IndexOf('{', search);
+            if (start < 0) break;
+            int end = MatchingJsonBrace(array, start);
+            if (end < 0) break;
+            string peer = array.Substring(start, end - start + 1);
+            sent += LongJsonNumberValue(peer, "bytesSent");
+            received += LongJsonNumberValue(peer, "bytesReceived");
+            search = end + 1;
+        }
+    }
+
+    long LongJsonNumberValue(string json, string key)
+    {
+        double number;
+        if (!Double.TryParse(JsonNumberValue(json, key), NumberStyles.Float, CultureInfo.InvariantCulture, out number))
+        {
+            return 0;
+        }
+        return number <= 0 ? 0 : (long)Math.Round(number);
+    }
+
+    int JsonIntValue(string json, string key)
+    {
+        double number;
+        if (!Double.TryParse(JsonNumberValue(json, key), NumberStyles.Float, CultureInfo.InvariantCulture, out number))
+        {
+            return 0;
+        }
+        if (number <= 0) return 0;
+        if (number >= int.MaxValue) return int.MaxValue;
+        return (int)Math.Round(number);
+    }
+
+    double RuntimeElapsedSeconds(string json)
+    {
+        double startedAtMs;
+        if (!Double.TryParse(JsonNumberValue(json, "startedAtMs"), NumberStyles.Float, CultureInfo.InvariantCulture, out startedAtMs))
+        {
+            return 0;
+        }
+        double nowMs = (DateTime.UtcNow - new DateTime(1970, 1, 1)).TotalMilliseconds;
+        return Math.Max(0, (nowMs - startedAtMs) / 1000.0);
+    }
+
+    bool RuntimePeerRecentlySeen(string peer)
+    {
+        double lastSeenMs;
+        if (!Double.TryParse(JsonNumberValue(peer, "lastSeenAtMs"), NumberStyles.Float, CultureInfo.InvariantCulture, out lastSeenMs))
+        {
+            return false;
+        }
+        double nowMs = (DateTime.UtcNow - new DateTime(1970, 1, 1)).TotalMilliseconds;
+        return nowMs >= lastSeenMs && nowMs - lastSeenMs <= 5000;
+    }
+
+    bool RuntimePeerUnstable(string peer)
+    {
+        double lastSeenMs;
+        if (!Double.TryParse(JsonNumberValue(peer, "lastSeenAtMs"), NumberStyles.Float, CultureInfo.InvariantCulture, out lastSeenMs))
+        {
+            return false;
+        }
+        double nowMs = (DateTime.UtcNow - new DateTime(1970, 1, 1)).TotalMilliseconds;
+        double ageMs = nowMs - lastSeenMs;
+        return ageMs > 5000 && ageMs <= 10000;
+    }
+
+    string RuntimeElapsedText(double seconds)
+    {
+        if (seconds <= 0) return "--";
+        TimeSpan span = TimeSpan.FromSeconds(seconds);
+        if (span.TotalHours >= 1)
+        {
+            return ((int)span.TotalHours).ToString(CultureInfo.InvariantCulture) + ":" + span.Minutes.ToString("00") + ":" + span.Seconds.ToString("00");
+        }
+        return span.Minutes.ToString("00") + ":" + span.Seconds.ToString("00");
+    }
+
+    string FormatBytesPerSecond(double bytesPerSecond)
+    {
+        if (bytesPerSecond >= 1024 * 1024)
+        {
+            return (bytesPerSecond / (1024 * 1024)).ToString("0.0", CultureInfo.InvariantCulture) + "MB/s";
+        }
+        if (bytesPerSecond >= 1024)
+        {
+            return (bytesPerSecond / 1024).ToString("0.0", CultureInfo.InvariantCulture) + "KB/s";
+        }
+        return Math.Round(bytesPerSecond).ToString(CultureInfo.InvariantCulture) + "B/s";
+    }
+
+    string FriendlyPath(string path)
+    {
+        if (path == "relay" || path == "relayed") return T("technologyUdpRelay");
+        if (path == "direct" || path == "p2p") return T("technologyUdpP2p");
+        return path;
+    }
+
     string ShortNumber(string value)
     {
         double number;
@@ -476,6 +966,13 @@ public partial class LocalAreaInterconnectionDesktop
         int end = start;
         while (end < json.Length && (Char.IsDigit(json[end]) || json[end] == '.' || json[end] == '-')) end++;
         return end > start ? json.Substring(start, end - start) : "";
+    }
+
+    bool JsonPositiveNumberValue(string json, string key)
+    {
+        double number;
+        return Double.TryParse(JsonNumberValue(json, key), NumberStyles.Float, CultureInfo.InvariantCulture, out number)
+            && number > 0;
     }
 
     bool JsonBoolValue(string json, string key)

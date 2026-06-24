@@ -22,28 +22,32 @@ pub fn create_relay_fallback_plan(
     p2p_status: impl Into<String>,
 ) -> RelayFallbackPlan {
     let p2p_status = normalize_status(p2p_status.into());
-    let p2p_candidates = candidate_endpoints(remote_offer, |candidate_type| {
-        !candidate_type.eq_ignore_ascii_case("relay")
+    let p2p_candidates = candidate_endpoints(remote_offer, |candidate| {
+        candidate.transport.eq_ignore_ascii_case("udp")
+            && !candidate.candidate_type.eq_ignore_ascii_case("relay")
     });
-    let relay_candidates = candidate_endpoints(remote_offer, |candidate_type| {
-        candidate_type.eq_ignore_ascii_case("relay")
+    let relay_candidates = candidate_endpoints(remote_offer, |candidate| {
+        candidate.candidate_type.eq_ignore_ascii_case("relay")
     });
 
     let mut warnings = Vec::new();
-    if local_offer
+    let local_has_udp = local_offer
         .candidates
         .iter()
-        .all(|candidate| !candidate.transport.eq_ignore_ascii_case("udp"))
-    {
+        .any(|candidate| candidate.transport.eq_ignore_ascii_case("udp"));
+    let local_has_relay = local_offer
+        .candidates
+        .iter()
+        .any(|candidate| candidate.candidate_type.eq_ignore_ascii_case("relay"));
+    if !local_has_udp && !local_has_relay {
         warnings.push(
             "Local peer has no UDP candidates; refresh NAT diagnostics before retrying.".to_owned(),
         );
     }
-    if remote_offer
-        .candidates
-        .iter()
-        .any(|candidate| !candidate.transport.eq_ignore_ascii_case("udp"))
-    {
+    if remote_offer.candidates.iter().any(|candidate| {
+        !candidate.transport.eq_ignore_ascii_case("udp")
+            && !candidate.candidate_type.eq_ignore_ascii_case("relay")
+    }) {
         warnings.push("Ignored non-UDP remote candidates for game tunnel planning.".to_owned());
     }
 
@@ -116,14 +120,13 @@ pub fn create_relay_fallback_plan(
 
 fn candidate_endpoints(
     offer: &NatTraversalOffer,
-    include_candidate_type: impl Fn(&str) -> bool,
+    include_candidate: impl Fn(&crate::NatCandidate) -> bool,
 ) -> Vec<String> {
     let mut seen = HashSet::new();
     let mut candidates = offer
         .candidates
         .iter()
-        .filter(|candidate| candidate.transport.eq_ignore_ascii_case("udp"))
-        .filter(|candidate| include_candidate_type(&candidate.candidate_type))
+        .filter(|candidate| include_candidate(candidate))
         .filter(|candidate| seen.insert(candidate.endpoint.clone()))
         .map(|candidate| (candidate.priority, candidate.endpoint.clone()))
         .collect::<Vec<_>>();
@@ -181,9 +184,18 @@ mod tests {
     }
 
     fn candidate(candidate_type: &str, endpoint: &str, priority: u32) -> NatCandidate {
+        candidate_with_transport(candidate_type, "udp", endpoint, priority)
+    }
+
+    fn candidate_with_transport(
+        candidate_type: &str,
+        transport: &str,
+        endpoint: &str,
+        priority: u32,
+    ) -> NatCandidate {
         NatCandidate {
             candidate_type: candidate_type.to_owned(),
-            transport: "udp".to_owned(),
+            transport: transport.to_owned(),
             endpoint: endpoint.to_owned(),
             priority,
             source: "test".to_owned(),
@@ -220,6 +232,35 @@ mod tests {
         assert_eq!(plan.p2p_candidate_count, 1);
         assert_eq!(plan.relay_candidate_count, 1);
         assert_eq!(plan.selected_relay_endpoints, vec!["203.0.113.10:39090"]);
+    }
+
+    #[test]
+    fn fallback_plan_accepts_http_relay_candidates() {
+        let local = offer(
+            "peer_a",
+            vec![candidate_with_transport(
+                "relay",
+                "http",
+                "http://49.235.146.152",
+                10,
+            )],
+        );
+        let remote = offer(
+            "peer_b",
+            vec![candidate_with_transport(
+                "relay",
+                "http",
+                "http://49.235.146.152",
+                10,
+            )],
+        );
+
+        let plan = create_relay_fallback_plan(&local, &remote, "failed");
+
+        assert_eq!(plan.status, "relay-available");
+        assert_eq!(plan.p2p_candidate_count, 0);
+        assert_eq!(plan.relay_candidate_count, 1);
+        assert_eq!(plan.selected_relay_endpoints, vec!["http://49.235.146.152"]);
     }
 
     #[test]

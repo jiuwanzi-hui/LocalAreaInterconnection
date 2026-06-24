@@ -42,15 +42,20 @@ pub fn detect_wintun_availability() -> WintunDetectReport {
 }
 
 fn detect_wintun_dll() -> Option<String> {
-    let candidates = [
-        "wintun.dll",
-        "C:\\Windows\\System32\\wintun.dll",
-        ".\\wintun.dll",
+    let mut candidates = vec![
+        "wintun.dll".to_owned(),
+        "C:\\Windows\\System32\\wintun.dll".to_owned(),
+        ".\\wintun.dll".to_owned(),
     ];
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(parent) = exe.parent() {
+            candidates.push(parent.join("wintun.dll").to_string_lossy().to_string());
+        }
+    }
 
-    for candidate in &candidates {
-        if Path::new(candidate).exists() {
-            return Some(candidate.to_string());
+    for candidate in candidates {
+        if Path::new(&candidate).exists() {
+            return Some(candidate);
         }
     }
     None

@@ -6,6 +6,12 @@ pub struct RoomRuntimePeer {
     pub peer_id: String,
     pub virtual_ip: Ipv4Addr,
     pub endpoint: String,
+    #[serde(default = "default_runtime_peer_path")]
+    pub connection_path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub direct_endpoint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback_endpoint: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -44,6 +50,10 @@ pub struct RoomRuntimePlan {
     pub udp_forwarders: Vec<RuntimeUdpForwardPlan>,
     pub diagnostic_outputs: Vec<String>,
     pub warnings: Vec<String>,
+}
+
+fn default_runtime_peer_path() -> String {
+    "direct".to_owned()
 }
 
 pub fn create_room_runtime_plan(
@@ -137,6 +147,9 @@ mod tests {
                 peer_id: "peer_b".to_owned(),
                 virtual_ip: "10.77.12.3".parse().unwrap(),
                 endpoint: "203.0.113.10:39090".to_owned(),
+                connection_path: "direct".to_owned(),
+                direct_endpoint: Some("203.0.113.10:39090".to_owned()),
+                fallback_endpoint: None,
             }],
             vec![27015],
             vec![27015, 39078],

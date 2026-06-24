@@ -4,7 +4,10 @@ node_modules/
 dist/
 coverage/
 native/target/
+tmp/
 tools/*.exe
+tools/wintun/
+__pycache__/
 .DS_Store
 *.log
 FUNCTIONAL_DESIGN.md

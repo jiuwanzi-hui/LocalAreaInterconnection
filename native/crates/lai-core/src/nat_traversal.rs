@@ -52,7 +52,7 @@ pub fn create_nat_traversal_offer(
     created_at_ms: u128,
     local_endpoint: SocketAddr,
     observed_endpoint: Option<SocketAddr>,
-    relay_endpoints: Vec<SocketAddr>,
+    relay_endpoints: Vec<String>,
 ) -> NatTraversalOffer {
     let mut candidates = Vec::new();
     candidates.push(candidate("host", local_endpoint, 100, "local-socket"));
@@ -60,7 +60,17 @@ pub fn create_nat_traversal_offer(
         candidates.push(candidate("srflx", endpoint, 90, "observed-endpoint"));
     }
     for endpoint in relay_endpoints {
-        candidates.push(candidate("relay", endpoint, 10, "relay"));
+        candidates.push(NatCandidate {
+            candidate_type: "relay".to_owned(),
+            transport: if endpoint.starts_with("http://") {
+                "http".to_owned()
+            } else {
+                "udp".to_owned()
+            },
+            endpoint,
+            priority: 10,
+            source: "relay".to_owned(),
+        });
     }
     deduplicate_candidates(&mut candidates);
     candidates.sort_by(|left, right| {
@@ -110,6 +120,7 @@ pub fn create_nat_punch_plan(
         .candidates
         .iter()
         .filter(|candidate| candidate.transport.eq_ignore_ascii_case("udp"))
+        .filter(|candidate| !candidate.candidate_type.eq_ignore_ascii_case("relay"))
         .map(|candidate| {
             (
                 punch_candidate_rank(candidate),
@@ -184,8 +195,6 @@ fn punch_candidate_rank(candidate: &NatCandidate) -> u8 {
         }
     } else if candidate.candidate_type.eq_ignore_ascii_case("host") {
         2
-    } else if candidate.candidate_type.eq_ignore_ascii_case("relay") {
-        1
     } else {
         0
     }
@@ -253,7 +262,7 @@ mod tests {
     }
 
     #[test]
-    fn punch_plan_prefers_routable_candidates_before_host_and_relay() {
+    fn punch_plan_prefers_routable_candidates_before_host_and_excludes_relay() {
         let local = create_nat_traversal_offer(
             "room",
             "peer_a",
@@ -310,7 +319,6 @@ mod tests {
                 "198.51.100.20:39090",
                 "198.51.100.20:44000",
                 "192.168.1.20:39090",
-                "203.0.113.10:39091",
             ]
         );
     }

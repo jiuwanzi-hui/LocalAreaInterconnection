@@ -63,10 +63,10 @@ public partial class LocalAreaInterconnectionDesktop
 
         string stamp = DateTime.UtcNow.ToString("yyyyMMddHHmmssfff");
         string safePrefix = SafePeerId(outputPrefix);
-        string scriptPath = Path.Combine(AppDataDirectory(), "elevated-" + safePrefix + "-" + stamp + ".cmd");
-        string stdoutPath = Path.Combine(AppDataDirectory(), "elevated-" + safePrefix + "-" + stamp + ".out.txt");
-        string stderrPath = Path.Combine(AppDataDirectory(), "elevated-" + safePrefix + "-" + stamp + ".err.txt");
-        string exitPath = Path.Combine(AppDataDirectory(), "elevated-" + safePrefix + "-" + stamp + ".exit.txt");
+        string scriptPath = Path.Combine(LogDirectory(), "elevated-" + safePrefix + "-" + stamp + ".cmd");
+        string stdoutPath = Path.Combine(LogDirectory(), "elevated-" + safePrefix + "-" + stamp + ".out.txt");
+        string stderrPath = Path.Combine(LogDirectory(), "elevated-" + safePrefix + "-" + stamp + ".err.txt");
+        string exitPath = Path.Combine(LogDirectory(), "elevated-" + safePrefix + "-" + stamp + ".exit.txt");
 
         StringBuilder script = new StringBuilder();
         script.AppendLine("@echo off");
@@ -77,12 +77,13 @@ public partial class LocalAreaInterconnectionDesktop
             script.Append(QuoteBatch(exe)).Append(" ").Append(argumentLines[i])
                 .Append(" 1>> ").Append(QuoteBatch(stdoutPath))
                 .Append(" 2>> ").Append(QuoteBatch(stderrPath)).AppendLine();
-            script.AppendLine("if errorlevel 1 set LAI_EXIT=%ERRORLEVEL%");
-            script.AppendLine("if errorlevel 1 goto lai_done");
+            script.AppendLine("if errorlevel 1 (");
+            script.AppendLine("  > " + QuoteBatch(exitPath) + " echo 1");
+            script.AppendLine("  exit /b 1");
+            script.AppendLine(")");
         }
-        script.AppendLine(":lai_done");
-        script.AppendLine("echo %LAI_EXIT%> " + QuoteBatch(exitPath));
-        script.AppendLine("exit /b %LAI_EXIT%");
+        script.AppendLine("> " + QuoteBatch(exitPath) + " echo 0");
+        script.AppendLine("exit /b 0");
         File.WriteAllText(scriptPath, script.ToString(), new UTF8Encoding(false));
 
         try

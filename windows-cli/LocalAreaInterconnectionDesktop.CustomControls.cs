@@ -46,7 +46,8 @@ public partial class LocalAreaInterconnectionDesktop
             textBox.DetectUrls = false;
             textBox.Margin = new Padding(0);
             textBox.VScroll += delegate { UpdateScrollBar(); };
-            textBox.MouseWheel += delegate { BeginInvoke((MethodInvoker)UpdateScrollBar); };
+            textBox.MouseEnter += delegate { FocusTextBoxForWheel(); };
+            textBox.MouseWheel += OutputMouseWheel;
             textBox.TextChanged += delegate
             {
                 ScrollToFirstLine(0);
@@ -56,13 +57,16 @@ public partial class LocalAreaInterconnectionDesktop
             scrollBar = new Panel();
             scrollBar.BackColor = FieldDark;
             scrollBar.Paint += PaintScrollBar;
-            scrollBar.MouseWheel += ScrollBarMouseWheel;
+            scrollBar.MouseEnter += delegate { FocusTextBoxForWheel(); };
+            scrollBar.MouseWheel += OutputMouseWheel;
             scrollBar.MouseDown += ScrollBarMouseDown;
 
             scrollThumb = new Panel();
             scrollThumb.BackColor = AccentCyan;
             scrollThumb.Cursor = Cursors.Hand;
             scrollThumb.Resize += delegate { ApplyThumbRegion(); };
+            scrollThumb.MouseEnter += delegate { FocusTextBoxForWheel(); };
+            scrollThumb.MouseWheel += OutputMouseWheel;
             scrollThumb.MouseDown += ThumbMouseDown;
             scrollThumb.MouseMove += ThumbMouseMove;
             scrollThumb.MouseUp += ThumbMouseUp;
@@ -70,6 +74,8 @@ public partial class LocalAreaInterconnectionDesktop
 
             Controls.Add(textBox);
             Controls.Add(scrollBar);
+            MouseEnter += delegate { FocusTextBoxForWheel(); };
+            MouseWheel += OutputMouseWheel;
             LayoutChildren();
         }
 
@@ -77,6 +83,23 @@ public partial class LocalAreaInterconnectionDesktop
         {
             get { return textBox.Text; }
             set { textBox.Text = value ?? ""; }
+        }
+
+        public void FocusTextBoxForWheel()
+        {
+            try
+            {
+                if (textBox != null && textBox.CanFocus) textBox.Focus();
+            }
+            catch
+            {
+            }
+        }
+
+        public void ScrollWheelDelta(int delta)
+        {
+            int direction = delta > 0 ? -1 : 1;
+            ScrollToFirstLine(FirstVisibleLine() + direction * 4);
         }
 
         protected override void OnFontChanged(EventArgs e)
@@ -178,10 +201,9 @@ public partial class LocalAreaInterconnectionDesktop
             }
         }
 
-        void ScrollBarMouseWheel(object sender, MouseEventArgs e)
+        void OutputMouseWheel(object sender, MouseEventArgs e)
         {
-            int direction = e.Delta > 0 ? -1 : 1;
-            ScrollToFirstLine(FirstVisibleLine() + direction * 3);
+            ScrollWheelDelta(e.Delta);
         }
 
         void ScrollBarMouseDown(object sender, MouseEventArgs e)
@@ -307,7 +329,21 @@ public partial class LocalAreaInterconnectionDesktop
         {
             e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
             e.Graphics.PixelOffsetMode = PixelOffsetMode.HighQuality;
-            Rectangle bounds = new Rectangle(0, 0, Width - 1, Height - 1);
+            Color clear = Parent == null ? Color.FromArgb(20, 22, 26) : Parent.BackColor;
+            if (clear == Color.Transparent && Parent != null && Parent.Parent != null)
+            {
+                clear = Parent.Parent.BackColor;
+            }
+            if (clear == Color.Transparent)
+            {
+                clear = Color.FromArgb(20, 22, 26);
+            }
+            using (SolidBrush clearBrush = new SolidBrush(clear))
+            {
+                e.Graphics.FillRectangle(clearBrush, ClientRectangle);
+            }
+
+            Rectangle bounds = new Rectangle(1, 1, Math.Max(1, Width - 3), Math.Max(1, Height - 3));
             Color fill = !Enabled ? Color.FromArgb(28, 32, 38) : pressing ? DownBack : hovering ? HoverBack : NormalBack;
             using (GraphicsPath path = ButtonRoundRect(bounds, Radius))
             using (SolidBrush brush = new SolidBrush(fill))

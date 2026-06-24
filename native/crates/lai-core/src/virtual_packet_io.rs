@@ -36,6 +36,15 @@ pub struct VirtualIpv4PacketSummary {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct VirtualIcmpEchoPacket {
+    pub source_ip: Ipv4Addr,
+    pub destination_ip: Ipv4Addr,
+    pub identifier: u16,
+    pub sequence: u16,
+    pub payload: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct VirtualPacketIoPlan {
     pub adapter_name: String,
     pub backend: String,
@@ -189,6 +198,63 @@ pub fn parse_ipv4_packet_summary(bytes: &[u8]) -> Result<VirtualIpv4PacketSummar
     }
 }
 
+pub fn parse_ipv4_icmp_echo_request(bytes: &[u8]) -> Result<VirtualIcmpEchoPacket, String> {
+    let header = parse_ipv4_header(bytes)?;
+    if header.protocol_number != 1 {
+        return Err("IPv4 packet is not ICMP.".to_owned());
+    }
+    let icmp = &bytes[header.header_len..header.total_len];
+    if icmp.len() < 8 {
+        return Err("ICMP packet is too short.".to_owned());
+    }
+    if icmp[0] != 8 || icmp[1] != 0 {
+        return Err("ICMP packet is not an echo request.".to_owned());
+    }
+    if internet_checksum(icmp) != 0 {
+        return Err("ICMP checksum is invalid.".to_owned());
+    }
+
+    Ok(VirtualIcmpEchoPacket {
+        source_ip: header.source_ip,
+        destination_ip: header.destination_ip,
+        identifier: u16::from_be_bytes([icmp[4], icmp[5]]),
+        sequence: u16::from_be_bytes([icmp[6], icmp[7]]),
+        payload: icmp[8..].to_vec(),
+    })
+}
+
+pub fn build_ipv4_icmp_echo_reply(
+    request: &VirtualIcmpEchoPacket,
+    ttl: u8,
+) -> Result<Vec<u8>, String> {
+    let total_len = 20usize
+        .checked_add(8)
+        .and_then(|len| len.checked_add(request.payload.len()))
+        .ok_or_else(|| "IPv4 ICMP packet length overflowed.".to_owned())?;
+    if total_len > u16::MAX as usize {
+        return Err("IPv4 ICMP packet is too large.".to_owned());
+    }
+
+    let mut bytes = vec![0u8; total_len];
+    write_ipv4_header(
+        &mut bytes,
+        total_len,
+        ttl,
+        1,
+        request.destination_ip,
+        request.source_ip,
+    );
+    bytes[20] = 0;
+    bytes[21] = 0;
+    bytes[22..24].copy_from_slice(&0u16.to_be_bytes());
+    bytes[24..26].copy_from_slice(&request.identifier.to_be_bytes());
+    bytes[26..28].copy_from_slice(&request.sequence.to_be_bytes());
+    bytes[28..].copy_from_slice(&request.payload);
+    let checksum = internet_checksum(&bytes[20..]);
+    bytes[22..24].copy_from_slice(&checksum.to_be_bytes());
+    Ok(bytes)
+}
+
 pub fn build_ipv4_udp_packet(packet: &VirtualUdpPacket, ttl: u8) -> Result<Vec<u8>, String> {
     let total_len = 20usize
         .checked_add(8)
@@ -208,7 +274,7 @@ pub fn build_ipv4_udp_packet(packet: &VirtualUdpPacket, ttl: u8) -> Result<Vec<u
     bytes[9] = 17;
     bytes[12..16].copy_from_slice(&packet.source_ip.octets());
     bytes[16..20].copy_from_slice(&packet.destination_ip.octets());
-    let checksum = ipv4_header_checksum(&bytes[..20]);
+    let checksum = internet_checksum(&bytes[..20]);
     bytes[10..12].copy_from_slice(&checksum.to_be_bytes());
 
     bytes[20..22].copy_from_slice(&packet.source_port.to_be_bytes());
@@ -330,14 +396,17 @@ fn write_ipv4_header(
     bytes[9] = protocol_number;
     bytes[12..16].copy_from_slice(&source_ip.octets());
     bytes[16..20].copy_from_slice(&destination_ip.octets());
-    let checksum = ipv4_header_checksum(&bytes[..20]);
+    let checksum = internet_checksum(&bytes[..20]);
     bytes[10..12].copy_from_slice(&checksum.to_be_bytes());
 }
 
-fn ipv4_header_checksum(header: &[u8]) -> u16 {
+fn internet_checksum(bytes: &[u8]) -> u16 {
     let mut sum = 0u32;
-    for chunk in header.chunks_exact(2) {
+    for chunk in bytes.chunks_exact(2) {
         sum += u16::from_be_bytes([chunk[0], chunk[1]]) as u32;
+    }
+    if let Some(byte) = bytes.chunks_exact(2).remainder().first() {
+        sum += (*byte as u32) << 8;
     }
     while (sum >> 16) != 0 {
         sum = (sum & 0xffff) + (sum >> 16);
@@ -428,6 +497,45 @@ mod tests {
         assert_eq!(summary.source_port, None);
         assert_eq!(summary.destination_port, None);
         assert_eq!(summary.payload_bytes, 8);
+    }
+
+    #[test]
+    fn icmp_echo_request_builds_reply_with_reversed_ips() {
+        let mut request = vec![0u8; 33];
+        write_ipv4_header(
+            &mut request,
+            33,
+            64,
+            1,
+            "10.77.12.2".parse().unwrap(),
+            "10.77.12.3".parse().unwrap(),
+        );
+        request[20] = 8;
+        request[21] = 0;
+        request[24..26].copy_from_slice(&0x1234u16.to_be_bytes());
+        request[26..28].copy_from_slice(&7u16.to_be_bytes());
+        request[28..].copy_from_slice(b"hello");
+        let checksum = internet_checksum(&request[20..]);
+        request[22..24].copy_from_slice(&checksum.to_be_bytes());
+
+        let parsed = parse_ipv4_icmp_echo_request(&request).unwrap();
+        assert_eq!(parsed.source_ip, Ipv4Addr::new(10, 77, 12, 2));
+        assert_eq!(parsed.destination_ip, Ipv4Addr::new(10, 77, 12, 3));
+        assert_eq!(parsed.identifier, 0x1234);
+        assert_eq!(parsed.sequence, 7);
+        assert_eq!(parsed.payload, b"hello");
+
+        let reply = build_ipv4_icmp_echo_reply(&parsed, 64).unwrap();
+        let summary = parse_ipv4_packet_summary(&reply).unwrap();
+        assert_eq!(summary.protocol, "icmp");
+        assert_eq!(summary.source_ip, Ipv4Addr::new(10, 77, 12, 3));
+        assert_eq!(summary.destination_ip, Ipv4Addr::new(10, 77, 12, 2));
+        assert_eq!(reply[20], 0);
+        assert_eq!(reply[21], 0);
+        assert_eq!(&reply[24..26], &0x1234u16.to_be_bytes());
+        assert_eq!(&reply[26..28], &7u16.to_be_bytes());
+        assert_eq!(&reply[28..], b"hello");
+        assert_eq!(internet_checksum(&reply[20..]), 0);
     }
 
     #[test]

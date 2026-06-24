@@ -15,6 +15,8 @@ using System.Windows.Forms;
 
 public partial class LocalAreaInterconnectionDesktop
 {
+    const int CoordinationOfferTtlMs = 300000;
+
     string InvitePayloadJson()
     {
         string value = invite == null ? "" : invite.Text.Trim();
@@ -110,12 +112,12 @@ public partial class LocalAreaInterconnectionDesktop
 
     string RuntimeFilePath(string name, string extension)
     {
-        return Path.Combine(AppDataDirectory(), name + "-" + RuntimeFilePrefix() + "." + extension);
+        return Path.Combine(LogDirectory(), name + "-" + RuntimeFilePrefix() + "." + extension);
     }
 
     string RuntimeRoomFilePath(string name, string extension)
     {
-        return Path.Combine(AppDataDirectory(), name + "-" + RuntimeRoomId() + "." + extension);
+        return Path.Combine(LogDirectory(), name + "-" + RuntimeRoomId() + "." + extension);
     }
 
     string NetshExportArgs()
@@ -170,7 +172,7 @@ public partial class LocalAreaInterconnectionDesktop
     string RuntimeCoordinationArgs()
     {
         string args = "";
-        string server = coordinationServer.Text.Trim();
+        string server = NormalizeCoordinationServer(coordinationServer.Text.Trim());
         string peer = remotePeer.Text.Trim();
         string bootstrap = RuntimeDirectBootstrapArgs(peer);
         if (bootstrap.Length > 0)
@@ -179,10 +181,36 @@ public partial class LocalAreaInterconnectionDesktop
         }
         else if (server.Length > 0 && peer.Length > 0)
         {
+            string peerId;
+            string virtualIp;
+            string offerValue;
+            if (TryParseRemotePeerOfferSpec(peer, out peerId, out virtualIp, out offerValue))
+            {
+                peer = SafePeerId(peerId) + "," + virtualIp;
+            }
+            else if (TryParseCoordinationPeerSpec(peer, out peerId, out virtualIp))
+            {
+                peer = SafePeerId(peerId) + "," + virtualIp;
+            }
             args += " --coordination-server " + Quote(server);
             args += " --coordination-peer " + Quote(peer);
         }
         return args;
+    }
+
+    string DefaultCoordinationServer()
+    {
+        return "http://49.235.146.152";
+    }
+
+    string DefaultRelayServer()
+    {
+        return "49.235.146.152:39091";
+    }
+
+    string DefaultStunServer()
+    {
+        return "49.235.146.152:39091,stun.l.google.com:19302,stun.cloudflare.com:3478";
     }
 
     string RuntimeDirectBootstrapArgs(string peerSpec)
@@ -201,8 +229,8 @@ public partial class LocalAreaInterconnectionDesktop
         }
         string spec = SafePeerId(peerId) + "," + virtualIp + "," + preparedOffer;
         return " --nat-bootstrap-remote-peer " + Quote(spec)
-            + " --nat-bootstrap-attempts 8"
-            + " --nat-bootstrap-interval-ms 50"
+            + " --nat-bootstrap-attempts 24"
+            + " --nat-bootstrap-interval-ms 100"
             + " --nat-bootstrap-timeout-ms 5000";
     }
 
@@ -211,7 +239,15 @@ public partial class LocalAreaInterconnectionDesktop
         peerId = "";
         virtualIp = "";
         offerValue = "";
-        if (value.Trim().Length == 0) return false;
+        value = value.Trim();
+        if (value.Length == 0) return false;
+        if (value.StartsWith("{", StringComparison.Ordinal))
+        {
+            peerId = JsonStringValue(value, "peer_id");
+            virtualIp = JsonStringValue(value, "virtual_ip");
+            offerValue = value;
+            return peerId.Length > 0 && LooksLikeIpv4(virtualIp) && offerValue.Length > 0;
+        }
         int first = value.IndexOf(',');
         if (first < 0) return false;
         int second = value.IndexOf(',', first + 1);
@@ -220,6 +256,35 @@ public partial class LocalAreaInterconnectionDesktop
         virtualIp = value.Substring(first + 1, second - first - 1).Trim();
         offerValue = value.Substring(second + 1).Trim();
         return peerId.Length > 0 && LooksLikeIpv4(virtualIp) && offerValue.Length > 0;
+    }
+
+    bool TryParseCoordinationPeerSpec(string value, out string peerId, out string virtualIp)
+    {
+        peerId = "";
+        virtualIp = "";
+        string offerValue;
+        if (TryParseRemotePeerOfferSpec(value, out peerId, out virtualIp, out offerValue))
+        {
+            return true;
+        }
+        value = value.Trim();
+        if (value.Length == 0) return false;
+        if (value.StartsWith("{", StringComparison.Ordinal))
+        {
+            peerId = JsonStringValue(value, "peer_id");
+            virtualIp = JsonStringValue(value, "virtual_ip");
+            return peerId.Length > 0 && LooksLikeIpv4(virtualIp);
+        }
+        int comma = value.IndexOf(',');
+        if (comma < 0) return false;
+        peerId = value.Substring(0, comma).Trim();
+        virtualIp = value.Substring(comma + 1).Trim();
+        int nextComma = virtualIp.IndexOf(',');
+        if (nextComma >= 0)
+        {
+            virtualIp = virtualIp.Substring(0, nextComma).Trim();
+        }
+        return peerId.Length > 0 && LooksLikeIpv4(virtualIp);
     }
 
     string RuntimeCoordinationMonitorArgs()
@@ -305,7 +370,7 @@ public partial class LocalAreaInterconnectionDesktop
         }
         if (value.StartsWith("{", StringComparison.Ordinal))
         {
-            string path = Path.Combine(AppDataDirectory(), fileName);
+            string path = Path.Combine(LogDirectory(), fileName);
             File.WriteAllText(path, value + Environment.NewLine, Encoding.UTF8);
             return path;
         }
@@ -335,11 +400,11 @@ public partial class LocalAreaInterconnectionDesktop
 
     void RefreshCoordinationPresence()
     {
-        if (runtimeProcess == null || runtimeProcess.HasExited)
+        if (coordinationServer.Text.Trim().Length == 0)
         {
             return;
         }
-        if (coordinationServer.Text.Trim().Length == 0)
+        if (invite.Text.Trim().Length == 0 && roomName.Text.Trim().Length == 0)
         {
             return;
         }
@@ -413,8 +478,13 @@ public partial class LocalAreaInterconnectionDesktop
         string arguments = "coordination-http-offer-publish"
             + " --server " + Quote(server)
             + " --offer " + Quote(latestNativeOfferFile)
-            + " --ttl-ms 30000";
-        return showOutput ? RunNativeCli(arguments) : RunNativeCliCapture(arguments);
+            + " --ttl-ms " + CoordinationOfferTtlMs.ToString(CultureInfo.InvariantCulture);
+        return showOutput ? RunNativeCli(arguments) : RunNativeCliCapture(arguments, 12000);
+    }
+
+    bool CoordinationPublishLooksSuccessful(string text)
+    {
+        return JsonStringValue(text, "status") == "ok";
     }
 
     string LeaveCoordinationRoomIfConfigured()
@@ -489,7 +559,7 @@ public partial class LocalAreaInterconnectionDesktop
             RuntimeRoomId(),
             peer,
             ip.Text.Trim(),
-            NativeRuntimeBind(),
+            AllocateNativeRuntimeBind(),
             stunServer.Text.Trim(),
             showOutput);
     }
@@ -502,14 +572,16 @@ public partial class LocalAreaInterconnectionDesktop
             + " --peer-id " + Quote(peer)
             + " --virtual-ip " + Quote(virtualIp)
             + " --bind " + Quote(bind)
+            + RelayCandidateArgs()
             + StunArgs(stunServerValue)
             + UpnpPortMapArgs()
             + " --nonce " + Quote(peer + "-desktop-offer");
-        string text = showOutput ? RunNativeCli(arguments) : RunNativeCliCapture(arguments);
+        string text = showOutput ? RunNativeCli(arguments) : RunNativeCliCapture(arguments, 30000);
         string offer = JsonObjectValue(text, "offer");
         if (offer.Length > 0)
         {
             File.WriteAllText(latestNativeOfferFile, offer + Environment.NewLine, Encoding.UTF8);
+            latestNativeOfferBind = bind;
             if (showOutput)
             {
                 output.Text = text + Environment.NewLine + T("nativeOfferPath") + latestNativeOfferFile;
@@ -528,17 +600,49 @@ public partial class LocalAreaInterconnectionDesktop
         return StunArgs(stunServer.Text.Trim());
     }
 
+    string RelayCandidateArgs()
+    {
+        if (relayServer == null) return "";
+        string value = NormalizeRelayServer(relayServer.Text.Trim());
+        if (value.Length == 0) return "";
+        return " --relay " + Quote(value);
+    }
+
+    string NormalizeCoordinationServer(string value)
+    {
+        value = value.Trim();
+        if (value.Length == 0) return "";
+        if (value.IndexOf("://", StringComparison.Ordinal) >= 0) return value;
+        return "http://" + value;
+    }
+
+    string NormalizeRelayServer(string value)
+    {
+        value = value.Trim();
+        if (value.Length == 0) return "";
+        if (IsLegacyDefaultRelayServer(value)) return DefaultRelayServer();
+        if (value.IndexOf("://", StringComparison.Ordinal) >= 0) return value;
+        if (value.IndexOf(':') >= 0) return value;
+        return value + ":39091";
+    }
+
+    bool IsLegacyDefaultRelayServer(string value)
+    {
+        return value.Equals("http://49.235.146.152", StringComparison.OrdinalIgnoreCase)
+            || value.Equals("https://49.235.146.152", StringComparison.OrdinalIgnoreCase);
+    }
+
     string StunArgs(string server)
     {
         if (server.Length == 0) return "";
-        return " --stun-server " + Quote(server) + " --stun-timeout-ms 1000";
+        return " --stun-server " + Quote(server) + " --stun-timeout-ms 2500";
     }
 
     string RuntimeNatBootstrapStunArgs(string server)
     {
         if (server.Length == 0) return "";
         return " --nat-bootstrap-stun-server " + Quote(server)
-            + " --nat-bootstrap-stun-timeout-ms 1000";
+            + " --nat-bootstrap-stun-timeout-ms 2500";
     }
 
     string UpnpPortMapArgs()
@@ -555,6 +659,13 @@ public partial class LocalAreaInterconnectionDesktop
             : "";
     }
 
+    string RuntimeCoordinationPublishArgs(string server)
+    {
+        server = NormalizeCoordinationServer(server);
+        if (server.Length == 0) return "";
+        return " --coordination-publish-ttl-ms " + CoordinationOfferTtlMs.ToString(CultureInfo.InvariantCulture);
+    }
+
     bool UpnpPortMapEnabled()
     {
         if (upnpPortMap == null) return false;
@@ -568,6 +679,56 @@ public partial class LocalAreaInterconnectionDesktop
     string NativeRuntimeBind()
     {
         return "0.0.0.0:" + NativeRuntimePort().ToString(CultureInfo.InvariantCulture);
+    }
+
+    string AllocateNativeRuntimeBind()
+    {
+        int preferred = NativeRuntimePort();
+        int port = FirstAvailableUdpPort(preferred, 200);
+        return "0.0.0.0:" + port.ToString(CultureInfo.InvariantCulture);
+    }
+
+    int FirstAvailableUdpPort(int preferred, int attempts)
+    {
+        for (int offset = 0; offset <= attempts; offset++)
+        {
+            int port = preferred + offset;
+            if (port > 65535) break;
+            if (CanBindUdpPort(port)) return port;
+        }
+        for (int port = 39000; port <= 39250; port++)
+        {
+            if (CanBindUdpPort(port)) return port;
+        }
+        return preferred;
+    }
+
+    bool CanBindUdpPort(int port)
+    {
+        try
+        {
+            using (Socket socket = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp))
+            {
+                socket.ExclusiveAddressUse = true;
+                socket.Bind(new IPEndPoint(IPAddress.Any, port));
+                return true;
+            }
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    int RuntimePortFromBind(string bind)
+    {
+        int colon = bind.LastIndexOf(':');
+        int port;
+        if (colon >= 0 && Int32.TryParse(bind.Substring(colon + 1), out port))
+        {
+            return port;
+        }
+        return NativeRuntimePort();
     }
 
     int NativeRuntimePort()
@@ -747,16 +908,6 @@ public partial class LocalAreaInterconnectionDesktop
         return "127.0.0.1";
     }
 
-    string EnsureCoordinationFirewallRule()
-    {
-        return EnsureFirewallRule("LocalAreaInterconnection Coordination", "TCP", CoordinationPort());
-    }
-
-    string EnsureRuntimeFirewallRule()
-    {
-        return EnsureFirewallRule("LocalAreaInterconnection Runtime " + RuntimePeerId(), "UDP", NativeRuntimePort().ToString(CultureInfo.InvariantCulture));
-    }
-
     void StartRuntimePostStartWork(
         bool showDetails,
         string roomId,
@@ -769,29 +920,6 @@ public partial class LocalAreaInterconnectionDesktop
     {
         Task.Factory.StartNew(delegate
         {
-            string publishOutput = "";
-            try
-            {
-                if (coordinationServerValue.Length > 0)
-                {
-                    string offerOutput = CreateNativeOfferSnapshot(
-                        roomId,
-                        peer,
-                        virtualIp,
-                        bind,
-                        stunServerValue,
-                        false);
-                    if (offerOutput.Length > 0)
-                    {
-                        publishOutput = PublishNativeOfferFileIfConfigured(coordinationServerValue, false);
-                    }
-                }
-            }
-            catch (Exception ex)
-            {
-                publishOutput = ex.Message;
-            }
-
             if (IsDisposed || !IsHandleCreated)
             {
                 return;
@@ -800,17 +928,6 @@ public partial class LocalAreaInterconnectionDesktop
             {
                 BeginInvoke((MethodInvoker)delegate
                 {
-                    if (output != null)
-                    {
-                        bool publishNeedsAttention = publishOutput.IndexOf("error", StringComparison.OrdinalIgnoreCase) >= 0
-                            || publishOutput.IndexOf("10060", StringComparison.OrdinalIgnoreCase) >= 0
-                            || publishOutput.IndexOf("超时", StringComparison.OrdinalIgnoreCase) >= 0
-                            || publishOutput.IndexOf("timed", StringComparison.OrdinalIgnoreCase) >= 0;
-                        if ((showDetails || publishNeedsAttention) && publishOutput.Length > 0)
-                        {
-                            output.Text += Environment.NewLine + Environment.NewLine + publishOutput;
-                        }
-                    }
                     RefreshCoordinationRoomView(false);
                 });
             }
@@ -820,30 +937,13 @@ public partial class LocalAreaInterconnectionDesktop
         });
     }
 
-    string EnsureFirewallRule(string name, string protocol, string port)
-    {
-        try
-        {
-            string args = "advfirewall firewall add rule name=" + Quote(name)
-                + " dir=in action=allow protocol=" + protocol
-                + " localport=" + port
-                + " profile=any enable=yes";
-            string result = RunExecutableCapture("netsh", args, 3000).Trim();
-            if (result.Length == 0) return "";
-            return T("firewallRuleTried") + " " + protocol + "/" + port + Environment.NewLine + result;
-        }
-        catch (Exception ex)
-        {
-            return T("firewallRuleFailed") + " " + protocol + "/" + port + ": " + ex.Message;
-        }
-    }
-
     void AutoConfigureRemotePeerFromCoordinationView(string json)
     {
         if (restartingRuntimeForRemotePeer || json.Trim().Length == 0) return;
-        if (remotePeer.Text.Trim().Length > 0) return;
         string spec = RemotePeerSpecFromCoordinationView(json);
         if (spec.Length == 0) return;
+        string current = remotePeer.Text.Trim();
+        if (RemotePeerTargetsSamePeer(current, spec)) return;
 
         remotePeer.Text = spec;
         if (runtimeProcess == null || runtimeProcess.HasExited) return;
@@ -860,9 +960,22 @@ public partial class LocalAreaInterconnectionDesktop
         }
     }
 
+    bool RemotePeerTargetsSamePeer(string current, string next)
+    {
+        string currentPeer;
+        string currentIp;
+        string nextPeer;
+        string nextIp;
+        if (!TryParseCoordinationPeerSpec(current, out currentPeer, out currentIp)) return false;
+        if (!TryParseCoordinationPeerSpec(next, out nextPeer, out nextIp)) return false;
+        return SafePeerId(currentPeer) == SafePeerId(nextPeer)
+            && currentIp == nextIp;
+    }
+
     string RemotePeerSpecFromCoordinationView(string json)
     {
         string members = JsonArrayValue(json, "members");
+        if (members.Length == 0) members = JsonArrayValue(json, "peers");
         if (members.Length == 0) return "";
         string localPeer = RuntimePeerId();
         int search = 0;
@@ -874,7 +987,9 @@ public partial class LocalAreaInterconnectionDesktop
             if (end < 0) break;
             string member = members.Substring(start, end - start + 1);
             string peer = JsonStringValue(member, "peer_id");
+            if (peer.Length == 0) peer = JsonStringValue(member, "peerId");
             string virtualIp = JsonStringValue(member, "virtual_ip");
+            if (virtualIp.Length == 0) virtualIp = JsonStringValue(member, "virtualIp");
             string status = JsonStringValue(member, "status");
             if (peer.Length > 0
                 && peer != localPeer
@@ -949,17 +1064,112 @@ public partial class LocalAreaInterconnectionDesktop
 
     string RunNativeCliCapture(string arguments)
     {
+        return RunNativeCliCapture(arguments, 5000);
+    }
+
+    string RunNativeCliCapture(string arguments, int timeoutMs)
+    {
         string exe = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "LocalAreaInterconnection.Native.Cli.exe");
         if (!File.Exists(exe))
         {
             return T("missingNativeCli") + exe;
         }
-        return RunExecutableCapture(exe, arguments);
+        return RunExecutableCapture(exe, arguments, timeoutMs);
     }
 
     Process StartNativeRuntimeProcess(string arguments)
     {
+        if (arguments.IndexOf("--wintun-runtime true", StringComparison.OrdinalIgnoreCase) >= 0
+            || arguments.IndexOf("--packet-io-backend wintun", StringComparison.OrdinalIgnoreCase) >= 0)
+        {
+            return StartNativeRuntimeProcessElevated(arguments);
+        }
         return StartNativeBackgroundProcess(arguments, runtimeOutput, T("runtimeExited"));
+    }
+
+    Process StartNativeRuntimeProcessElevated(string arguments)
+    {
+        string exe = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "LocalAreaInterconnection.Native.Cli.exe");
+        if (!File.Exists(exe))
+        {
+            output.Text = T("missingNativeCli") + exe;
+            return null;
+        }
+
+        string stamp = DateTime.UtcNow.ToString("yyyyMMddHHmmssfff");
+        string prefix = SafePeerId("runtime-" + RuntimeFilePrefix());
+        string scriptPath = Path.Combine(LogDirectory(), "elevated-" + prefix + "-" + stamp + ".cmd");
+        string stdoutPath = Path.Combine(LogDirectory(), "elevated-" + prefix + "-" + stamp + ".out.txt");
+        string stderrPath = Path.Combine(LogDirectory(), "elevated-" + prefix + "-" + stamp + ".err.txt");
+        string exitPath = Path.Combine(LogDirectory(), "elevated-" + prefix + "-" + stamp + ".exit.txt");
+
+        StringBuilder script = new StringBuilder();
+        script.AppendLine("@echo off");
+        script.AppendLine("chcp 65001 > nul");
+        script.AppendLine("cd /d " + QuoteBatch(AppDomain.CurrentDomain.BaseDirectory));
+        script.Append(QuoteBatch(exe)).Append(" ").Append(arguments)
+            .Append(" 1> ").Append(QuoteBatch(stdoutPath))
+            .Append(" 2> ").Append(QuoteBatch(stderrPath)).AppendLine();
+        script.AppendLine("> " + QuoteBatch(exitPath) + " echo %ERRORLEVEL%");
+        script.AppendLine("exit /b %ERRORLEVEL%");
+        File.WriteAllText(scriptPath, script.ToString(), new UTF8Encoding(false));
+
+        ProcessStartInfo start = new ProcessStartInfo();
+        start.FileName = scriptPath;
+        start.UseShellExecute = true;
+        start.Verb = "runas";
+        start.WindowStyle = ProcessWindowStyle.Hidden;
+        start.WorkingDirectory = AppDomain.CurrentDomain.BaseDirectory;
+
+        try
+        {
+            Process process = new Process();
+            process.StartInfo = start;
+            process.EnableRaisingEvents = true;
+            process.Exited += delegate
+            {
+                if (IsDisposed || !IsHandleCreated) return;
+                try
+                {
+                    BeginInvoke((MethodInvoker)delegate
+                    {
+                        if (output != null && !IsDisposed)
+                        {
+                            string stdout = ReadOptionalText(stdoutPath).Trim();
+                            string stderr = ReadOptionalText(stderrPath).Trim();
+                            string exitCode = ReadOptionalText(exitPath).Trim();
+                            output.Text = T("runtimeExited")
+                                + Environment.NewLine
+                                + T("adminActionFinished") + " " + (exitCode.Length == 0 ? T("stateUnknown") : exitCode)
+                                + Environment.NewLine
+                                + T("runtimeSnapshotReady") + latestRuntimeSnapshot;
+                            if (stdout.Length > 0)
+                            {
+                                output.Text += Environment.NewLine + Environment.NewLine + T("adminActionStdout") + Environment.NewLine + stdout;
+                            }
+                            if (stderr.Length > 0)
+                            {
+                                output.Text += Environment.NewLine + Environment.NewLine + T("adminActionStderr") + Environment.NewLine + stderr;
+                            }
+                        }
+                    });
+                }
+                catch
+                {
+                }
+            };
+            process.Start();
+            runtimeOutput.AppendLine(T("runtimeStartedElevated"));
+            runtimeOutput.AppendLine(T("runtimeStdoutPath") + stdoutPath);
+            runtimeOutput.AppendLine(T("runtimeStderrPath") + stderrPath);
+            RegisterBackgroundProcess(process);
+            return process;
+        }
+        catch (Exception ex)
+        {
+            output.Text = T("adminActionCancelled") + Environment.NewLine + ex.Message;
+            return null;
+        }
     }
 
     Process StartNativeBackgroundProcess(string arguments, StringBuilder log, string exitedPrefix)

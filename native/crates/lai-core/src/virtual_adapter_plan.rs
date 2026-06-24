@@ -45,6 +45,7 @@ pub fn create_windows_virtual_adapter_plan(
         set_static_address_command(&adapter_name, assigned_ip, subnet_mask),
         set_mtu_command(&adapter_name, mtu),
         set_metric_command(&adapter_name, interface_metric),
+        ensure_subnet_route_command(&adapter_name, virtual_subnet, interface_metric),
         show_config_command(&adapter_name),
     ];
 
@@ -111,6 +112,27 @@ fn set_metric_command(adapter_name: &str, interface_metric: u16) -> NetworkComma
         assignment("metric", &interface_metric.to_string()),
     ];
     command(args, "Set the virtual adapter interface metric.")
+}
+
+fn ensure_subnet_route_command(
+    adapter_name: &str,
+    virtual_subnet: Ipv4Subnet,
+    interface_metric: u16,
+) -> NetworkCommand {
+    let args = vec![
+        "interface".to_owned(),
+        "ipv4".to_owned(),
+        "add".to_owned(),
+        "route".to_owned(),
+        assignment("prefix", &virtual_subnet.to_string()),
+        assignment("interface", adapter_name),
+        assignment("metric", &interface_metric.to_string()),
+        "store=active".to_owned(),
+    ];
+    command(
+        args,
+        "Ensure the room subnet routes through the virtual adapter.",
+    )
 }
 
 fn show_config_command(adapter_name: &str) -> NetworkCommand {
@@ -217,12 +239,19 @@ mod tests {
             plan.subnet_mask,
             "255.255.255.0".parse::<Ipv4Addr>().unwrap()
         );
-        assert_eq!(plan.commands.len(), 4);
+        assert_eq!(plan.commands.len(), 5);
         assert!(plan.commands[0]
             .command
             .contains("set address name=LocalAreaInterconnection static 10.77.12.2 255.255.255.0"));
         assert!(plan.commands[1].command.contains("mtu=1420"));
         assert!(plan.commands[2].command.contains("metric=5"));
+        assert!(plan.commands[3]
+            .command
+            .contains("add route prefix=10.77.12.0/24"));
+        assert!(plan.commands[3]
+            .command
+            .contains("interface=LocalAreaInterconnection"));
+        assert!(plan.commands[3].command.contains("store=active"));
         assert!(plan.warnings.is_empty());
     }
 

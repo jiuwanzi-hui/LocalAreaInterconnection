@@ -239,6 +239,7 @@ fn connection_path_report_from_bootstrap_result(
 pub fn connection_path_status_from_bootstrap_status(status: &str) -> &'static str {
     match status {
         "ok" | "connected" | "success" | "succeeded" => "ok",
+        "relay-ready" | "relay-selected" => "failed",
         "handshake-timeout" | "timeout" | "timed-out" | "no-response" => "timeout",
         "failed" | "blocked" | "unreachable" | "disconnected" => "failed",
         _ => "unknown",

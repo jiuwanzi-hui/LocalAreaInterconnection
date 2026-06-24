@@ -69,7 +69,23 @@ public partial class LocalAreaInterconnectionDesktop
     {
         if (!IsHandleCreated || WindowState == FormWindowState.Minimized) return;
         MoveParticles();
+        UpdateHeartbeatPulseAnimation();
         Invalidate();
+    }
+
+    void UpdateHeartbeatPulseAnimation()
+    {
+        if (heartbeatPulseLabel == null) return;
+        if (!heartbeatPulseActive)
+        {
+            heartbeatPulseLabel.ForeColor = TextMuted;
+            heartbeatPulseLabel.Text = "•";
+            return;
+        }
+        heartbeatPulsePhase = (heartbeatPulsePhase + 1) % 10;
+        bool beat = heartbeatPulsePhase < 3;
+        heartbeatPulseLabel.ForeColor = beat ? AccentCyanHover : AccentCyan;
+        heartbeatPulseLabel.Text = beat ? "●" : "•";
     }
 
     Particle NewParticle()

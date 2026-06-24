@@ -202,7 +202,7 @@ public partial class LocalAreaInterconnectionDesktop
         {
             return T("joinNeedsInvite");
         }
-        if (key == "startLanSession" || key == "startRuntime" || key == "nativeOffer")
+        if (key == "startLanSession" || key == "startRuntime" || key == "nativeOffer" || key == "copyDirectCode")
         {
             return T("startNeedsRoom");
         }
@@ -238,6 +238,23 @@ public partial class LocalAreaInterconnectionDesktop
         }
         actionScrollOffset = 0;
         AdjustActionLayout();
+    }
+
+    void UpdateHomeActionButtons()
+    {
+        SetHomeButtonVisible("quickHostRoom", roomUiMode == "none" || roomUiMode == "host");
+        SetHomeButtonVisible("quickJoinRoom", roomUiMode == "none");
+        SetHomeButtonVisible("copyInvite", roomUiMode == "host");
+        SetHomeButtonVisible("copyDirectCode", roomUiMode == "host" || roomUiMode == "joined" || roomUiMode == "running");
+        SetHomeButtonVisible("startLanSession", roomUiMode == "host" || roomUiMode == "joined" || roomUiMode == "running");
+        SetHomeButtonVisible("checkConnection", roomUiMode == "host" || roomUiMode == "joined" || roomUiMode == "running");
+        SetHomeButtonVisible("moreTools", true);
+    }
+
+    void SetHomeButtonVisible(string key, bool visible)
+    {
+        if (!homeButtonControls.ContainsKey(key)) return;
+        homeButtonControls[key].Visible = visible;
     }
 
     void AdjustActionLayout()
@@ -346,6 +363,96 @@ public partial class LocalAreaInterconnectionDesktop
         }
     }
 
+    void AdjustHomeFieldLayout()
+    {
+        if (homeFieldViewport == null || homeFieldTable == null) return;
+        int width = Math.Max(220, homeFieldViewport.ClientSize.Width);
+        int contentHeight = Math.Max(1, 14 + 34 * Math.Max(1, homeFieldTable.RowCount) + 14);
+        homeFieldTable.SetBounds(0, -homeFieldScrollOffset, width, contentHeight);
+        ClampHomeFieldScroll();
+        UpdateHomeFieldScrollBar();
+    }
+
+    void ScrollHomeFieldsWheel(object sender, MouseEventArgs e)
+    {
+        int step = e.Delta > 0 ? -34 : 34;
+        SetHomeFieldScrollOffset(homeFieldScrollOffset + step);
+    }
+
+    void BeginHomeFieldScrollThumbDrag(object sender, MouseEventArgs e)
+    {
+        if (e.Button != MouseButtons.Left) return;
+        draggingHomeFieldScrollThumb = true;
+        homeFieldScrollDragStartY = homeFieldScrollBar.PointToClient(homeFieldScrollThumb.PointToScreen(e.Location)).Y;
+        homeFieldScrollStartOffset = homeFieldScrollOffset;
+    }
+
+    void DragHomeFieldScrollThumb(object sender, MouseEventArgs e)
+    {
+        if (!draggingHomeFieldScrollThumb) return;
+        int currentY = homeFieldScrollBar.PointToClient(homeFieldScrollThumb.PointToScreen(e.Location)).Y;
+        int track = Math.Max(1, homeFieldScrollBar.ClientSize.Height - homeFieldScrollThumb.Height - 4);
+        int maxOffset = MaxHomeFieldScrollOffset();
+        int deltaOffset = (currentY - homeFieldScrollDragStartY) * maxOffset / track;
+        SetHomeFieldScrollOffset(homeFieldScrollStartOffset + deltaOffset);
+    }
+
+    void EndHomeFieldScrollThumbDrag(object sender, MouseEventArgs e)
+    {
+        draggingHomeFieldScrollThumb = false;
+    }
+
+    void SetHomeFieldScrollOffset(int value)
+    {
+        homeFieldScrollOffset = Math.Max(0, Math.Min(MaxHomeFieldScrollOffset(), value));
+        if (homeFieldTable != null)
+        {
+            homeFieldTable.Top = -homeFieldScrollOffset;
+        }
+        UpdateHomeFieldScrollBar();
+    }
+
+    void ClampHomeFieldScroll()
+    {
+        homeFieldScrollOffset = Math.Max(0, Math.Min(MaxHomeFieldScrollOffset(), homeFieldScrollOffset));
+        if (homeFieldTable != null)
+        {
+            homeFieldTable.Top = -homeFieldScrollOffset;
+        }
+    }
+
+    int MaxHomeFieldScrollOffset()
+    {
+        if (homeFieldTable == null || homeFieldViewport == null) return 0;
+        return Math.Max(0, homeFieldTable.Height - homeFieldViewport.ClientSize.Height);
+    }
+
+    void UpdateHomeFieldScrollBar()
+    {
+        if (homeFieldScrollBar == null || homeFieldScrollThumb == null || homeFieldTable == null || homeFieldViewport == null) return;
+        int maxOffset = MaxHomeFieldScrollOffset();
+        bool visible = maxOffset > 0;
+        homeFieldScrollBar.Visible = visible;
+        if (!visible) return;
+
+        int trackHeight = Math.Max(1, homeFieldScrollBar.ClientSize.Height - 4);
+        int thumbHeight = Math.Max(28, homeFieldViewport.ClientSize.Height * trackHeight / Math.Max(homeFieldTable.Height, 1));
+        int travel = Math.Max(1, trackHeight - thumbHeight);
+        int thumbTop = 2 + (homeFieldScrollOffset * travel / maxOffset);
+        homeFieldScrollThumb.SetBounds(2, thumbTop, Math.Max(4, homeFieldScrollBar.Width - 4), thumbHeight);
+        ApplyRoundedRegion(homeFieldScrollThumb, 4);
+        homeFieldScrollBar.Invalidate();
+    }
+
+    void PaintHomeFieldScrollBar(object sender, PaintEventArgs e)
+    {
+        e.Graphics.Clear(homeFieldScrollBar.BackColor);
+        using (Pen pen = new Pen(Color.FromArgb(76, 76, 76)))
+        {
+            e.Graphics.DrawLine(pen, homeFieldScrollBar.Width / 2, 4, homeFieldScrollBar.Width / 2, homeFieldScrollBar.Height - 4);
+        }
+    }
+
     void StyleTextBox(TextBox box)
     {
         box.BackColor = FieldDark;
@@ -361,7 +468,7 @@ public partial class LocalAreaInterconnectionDesktop
 
     Panel Framed(Control control)
     {
-        return Framed(control, CardBorder);
+        return Framed(control, FieldBorder);
     }
 
     Panel Framed(Control control, Color border)
@@ -369,9 +476,10 @@ public partial class LocalAreaInterconnectionDesktop
         Panel panel = new Panel();
         panel.Dock = DockStyle.Fill;
         panel.BackColor = border;
-        panel.Padding = new Padding(1);
+        panel.Padding = new Padding(3);
         panel.Margin = new Padding(0, 3, 10, 3);
         panel.Resize += delegate { ApplyRoundedRegion(panel, 10); };
+        panel.Paint += PaintInsetFrame;
         TextBox textBox = control as TextBox;
         if (textBox != null && !textBox.Multiline)
         {
@@ -402,14 +510,55 @@ public partial class LocalAreaInterconnectionDesktop
         box.SetBounds(left, top, width, box.Height);
     }
 
+    void PaintRaisedCardFrame(object sender, PaintEventArgs e)
+    {
+        Control control = (Control)sender;
+        if (control.Width <= 2 || control.Height <= 2) return;
+
+        UseCrispGraphics(e.Graphics);
+        Rectangle bounds = new Rectangle(0, 0, control.Width - 1, control.Height - 1);
+        using (GraphicsPath path = RoundedRectPath(bounds, 12))
+        using (Pen shadow = new Pen(Color.FromArgb(0, 0, 0), 2f))
+        using (Pen border = new Pen(CardBorder, 1.6f))
+        using (Pen highlight = new Pen(CardHighlight, 1.2f))
+        using (Pen lowlight = new Pen(Color.FromArgb(14, 20, 26), 1.2f))
+        {
+            e.Graphics.DrawPath(shadow, path);
+            e.Graphics.DrawPath(border, path);
+            e.Graphics.DrawLine(highlight, 11, 1, Math.Max(11, control.Width - 13), 1);
+            e.Graphics.DrawLine(highlight, 1, 11, 1, Math.Max(11, control.Height - 13));
+            e.Graphics.DrawLine(lowlight, 12, control.Height - 2, Math.Max(12, control.Width - 14), control.Height - 2);
+            e.Graphics.DrawLine(lowlight, control.Width - 2, 12, control.Width - 2, Math.Max(12, control.Height - 14));
+        }
+    }
+
+    void PaintInsetFrame(object sender, PaintEventArgs e)
+    {
+        Control control = (Control)sender;
+        if (control.Width <= 2 || control.Height <= 2) return;
+
+        UseCrispGraphics(e.Graphics);
+        Rectangle bounds = new Rectangle(0, 0, control.Width - 1, control.Height - 1);
+        using (GraphicsPath path = RoundedRectPath(bounds, 10))
+        using (Pen border = new Pen(FieldBorder, 1.5f))
+        using (Pen top = new Pen(Color.FromArgb(122, 142, 152), 1f))
+        using (Pen bottom = new Pen(Color.FromArgb(4, 8, 12), 1.2f))
+        {
+            e.Graphics.DrawPath(border, path);
+            e.Graphics.DrawLine(top, 9, 1, Math.Max(9, control.Width - 11), 1);
+            e.Graphics.DrawLine(bottom, 9, control.Height - 2, Math.Max(9, control.Width - 11), control.Height - 2);
+        }
+    }
+
     Panel RoomDetailsPanel()
     {
         Panel outer = new Panel();
         outer.Dock = DockStyle.Fill;
-        outer.BackColor = CardBorder;
-        outer.Padding = new Padding(1);
+        outer.BackColor = CardShadow;
+        outer.Padding = new Padding(3, 3, 5, 5);
         outer.Margin = new Padding(14, 0, 0, 10);
         outer.Resize += delegate { ApplyRoundedRegion(outer, 12); };
+        outer.Paint += PaintRaisedCardFrame;
 
         TableLayoutPanel details = new TableLayoutPanel();
         details.Dock = DockStyle.Fill;
@@ -425,16 +574,38 @@ public partial class LocalAreaInterconnectionDesktop
         details.RowStyles.Add(new RowStyle(SizeType.Percent, 34));
         details.RowStyles.Add(new RowStyle(SizeType.Percent, 18));
 
+        FlowLayoutPanel headerLine = new FlowLayoutPanel();
+        headerLine.Dock = DockStyle.Fill;
+        headerLine.BackColor = Color.Transparent;
+        headerLine.FlowDirection = FlowDirection.LeftToRight;
+        headerLine.WrapContents = false;
+        headerLine.Margin = new Padding(0);
+        headerLine.Padding = new Padding(0);
+
+        heartbeatPulseLabel = new Label();
+        heartbeatPulseLabel.Text = "●";
+        heartbeatPulseLabel.Width = 18;
+        heartbeatPulseLabel.Height = 28;
+        heartbeatPulseLabel.TextAlign = ContentAlignment.MiddleLeft;
+        heartbeatPulseLabel.Font = new Font(Font.FontFamily, 13, FontStyle.Bold);
+        heartbeatPulseLabel.ForeColor = TextMuted;
+        heartbeatPulseLabel.BackColor = Color.Transparent;
+        heartbeatPulseLabel.Margin = new Padding(0, 0, 4, 0);
+        headerLine.Controls.Add(heartbeatPulseLabel);
+
         Label header = new Label();
         header.Name = "roomDetailsHeader";
         header.Text = T("roomDetails");
-        header.Dock = DockStyle.Fill;
+        header.Width = 240;
+        header.Height = 28;
         header.TextAlign = ContentAlignment.MiddleLeft;
         header.Font = new Font(Font.FontFamily, 10, FontStyle.Bold);
         header.ForeColor = TextBright;
         header.BackColor = Color.Transparent;
+        header.Margin = new Padding(0);
         labelControls["roomDetails"] = header;
-        details.Controls.Add(header, 0, 0);
+        headerLine.Controls.Add(header);
+        details.Controls.Add(headerLine, 0, 0);
 
         roomSummary = DetailLabel();
         connectionSummary = DetailLabel();

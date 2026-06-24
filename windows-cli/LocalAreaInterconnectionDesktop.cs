@@ -17,9 +17,12 @@ public partial class LocalAreaInterconnectionDesktop : Form, IMessageFilter
     static readonly Color SidebarDark = Color.FromArgb(15, 69, 78);
     static readonly Color SidebarMid = Color.FromArgb(30, 76, 86);
     static readonly Color SidebarDeep = Color.FromArgb(40, 65, 86);
-    static readonly Color CardDark = Color.FromArgb(30, 34, 40);
-    static readonly Color CardBorder = Color.FromArgb(42, 48, 56);
-    static readonly Color FieldDark = Color.FromArgb(26, 30, 36);
+    static readonly Color CardDark = Color.FromArgb(34, 39, 47);
+    static readonly Color CardBorder = Color.FromArgb(92, 110, 122);
+    static readonly Color CardHighlight = Color.FromArgb(142, 162, 172);
+    static readonly Color CardShadow = Color.FromArgb(8, 12, 16);
+    static readonly Color FieldDark = Color.FromArgb(22, 27, 34);
+    static readonly Color FieldBorder = Color.FromArgb(78, 94, 104);
     static readonly Color TextBright = Color.FromArgb(240, 244, 246);
     static readonly Color TextMuted = Color.FromArgb(138, 148, 156);
     static readonly Color AccentCyan = Color.FromArgb(0, 212, 216);
@@ -49,6 +52,7 @@ public partial class LocalAreaInterconnectionDesktop : Form, IMessageFilter
     TextBox pingTarget;
     TextBox packetObservations;
     TextBox coordinationServer;
+    TextBox relayServer;
     TextBox stunServer;
     TextBox upnpPortMap;
     TextBox remotePeer;
@@ -72,6 +76,7 @@ public partial class LocalAreaInterconnectionDesktop : Form, IMessageFilter
     string activePage = "home";
     Label titleLabel;
     Label roomSummary;
+    Label heartbeatPulseLabel;
     Label connectionSummary;
     Label broadcastSummary;
     Label memberSummary;
@@ -83,12 +88,20 @@ public partial class LocalAreaInterconnectionDesktop : Form, IMessageFilter
     Panel actionScrollBar;
     Panel actionScrollThumb;
     FlowLayoutPanel actionsPanel;
+    Panel homeFieldViewport;
+    TableLayoutPanel homeFieldTable;
+    Panel homeFieldScrollBar;
+    Panel homeFieldScrollThumb;
     Button moreToolsButton;
     bool advancedActionsVisible = false;
     int actionScrollOffset = 0;
     bool draggingActionScrollThumb = false;
     int actionScrollDragStartY = 0;
     int actionScrollStartOffset = 0;
+    int homeFieldScrollOffset = 0;
+    bool draggingHomeFieldScrollThumb = false;
+    int homeFieldScrollDragStartY = 0;
+    int homeFieldScrollStartOffset = 0;
     Control resizeCursorControl;
     Cursor resizeCursorOriginal;
     Cursor activeResizeCursor;
@@ -96,6 +109,9 @@ public partial class LocalAreaInterconnectionDesktop : Form, IMessageFilter
     List<Button> advancedActionButtons = new List<Button>();
     Dictionary<string, Label> labelControls = new Dictionary<string, Label>();
     Dictionary<string, Button> buttonControls = new Dictionary<string, Button>();
+    Dictionary<string, Button> homeButtonControls = new Dictionary<string, Button>();
+    Dictionary<string, List<TextBox>> fieldTextBoxes = new Dictionary<string, List<TextBox>>();
+    bool syncingFieldTextBoxes = false;
     Process runtimeProcess;
     Process coordinationProcess;
     readonly object backgroundProcessLock = new object();
@@ -106,6 +122,7 @@ public partial class LocalAreaInterconnectionDesktop : Form, IMessageFilter
     string latestRuntimeSnapshot = "";
     string latestRuntimeObservationFile = "";
     string latestNativeOfferFile = "";
+    string latestNativeOfferBind = "";
     string coordinationStoreFile = "";
     string localRuntimePeerId = "";
     string hostRuntimePeerId = "";
@@ -113,7 +130,13 @@ public partial class LocalAreaInterconnectionDesktop : Form, IMessageFilter
     bool coordinationPresenceRefreshRunning = false;
     bool coordinationRoomRefreshRunning = false;
     string lastRuntimeSnapshotText = "";
+    string latestCoordinationViewText = "";
+    int latestCoordinationOnlineCount = 0;
+    int latestCoordinationMemberCount = 0;
+    bool heartbeatPulseActive = false;
+    int heartbeatPulsePhase = 0;
     int lastRuntimeLogLength = 0;
+    string roomUiMode = "none";
     DateTime lastCoordinationRefreshUtc = DateTime.MinValue;
     const int ResizeGripSize = 8;
     const int WmMouseMove = 0x0200;
@@ -131,6 +154,7 @@ public partial class LocalAreaInterconnectionDesktop : Form, IMessageFilter
     const int HtBottomLeft = 16;
     const int HtBottomRight = 17;
 
+    [STAThread]
     public static void Main()
     {
         EnableProcessDpiAwareness();

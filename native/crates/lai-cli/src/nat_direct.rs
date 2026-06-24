@@ -384,7 +384,7 @@ pub fn run_nat_hole_punch(
         current_epoch_ms(),
         socket.local_addr()?,
         observed_endpoint,
-        relay_endpoints,
+        relay_endpoints.iter().map(SocketAddr::to_string).collect(),
     );
     enrich_offer_with_local_host_candidates(&mut local_offer, &socket)?;
     let stun_mapping = apply_stun_mapping_candidates_to_offer(
@@ -482,6 +482,46 @@ pub fn run_nat_p2p_bootstrap(
     handshake_timeout_ms: u64,
 ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
     let socket = UdpSocket::bind(bind)?;
+    run_nat_p2p_bootstrap_on_socket(
+        &socket,
+        room_id,
+        peer_id,
+        virtual_ip,
+        key,
+        remote_offer,
+        observed_endpoint,
+        stun_server,
+        stun_timeout_ms,
+        upnp_port_map,
+        upnp_timeout_ms,
+        upnp_lease_seconds,
+        upnp_gateway_location,
+        relay_endpoints,
+        punch_attempts,
+        punch_interval_ms,
+        handshake_timeout_ms,
+    )
+}
+
+pub fn run_nat_p2p_bootstrap_on_socket(
+    socket: &UdpSocket,
+    room_id: &str,
+    peer_id: &str,
+    virtual_ip: Ipv4Addr,
+    key: &str,
+    remote_offer: &lai_core::NatTraversalOffer,
+    observed_endpoint: Option<SocketAddr>,
+    stun_server: Option<&str>,
+    stun_timeout_ms: u64,
+    upnp_port_map: bool,
+    upnp_timeout_ms: u64,
+    upnp_lease_seconds: u32,
+    upnp_gateway_location: Option<&str>,
+    relay_endpoints: Vec<SocketAddr>,
+    punch_attempts: u16,
+    punch_interval_ms: u64,
+    handshake_timeout_ms: u64,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
     socket.set_read_timeout(Some(Duration::from_millis(25)))?;
     let local_endpoint = socket.local_addr()?;
     let mut local_offer = lai_core::create_nat_traversal_offer(
@@ -491,7 +531,7 @@ pub fn run_nat_p2p_bootstrap(
         current_epoch_ms(),
         local_endpoint,
         observed_endpoint,
-        relay_endpoints,
+        relay_endpoints.iter().map(SocketAddr::to_string).collect(),
     );
     enrich_offer_with_local_host_candidates(&mut local_offer, &socket)?;
     let stun_mapping = apply_stun_mapping_candidates_to_offer(
@@ -524,29 +564,6 @@ pub fn run_nat_p2p_bootstrap(
     let mut buffer = vec![0u8; 65_535];
 
     if plan.status == "ready" {
-        for attempt in 0..plan.attempt_count {
-            let payload = serde_json::json!({
-                "schemaVersion": 1,
-                "type": "nat-punch",
-                "roomId": room_id,
-                "peerId": peer_id,
-                "attempt": attempt,
-                "sentAtMs": current_epoch_ms(),
-            })
-            .to_string();
-            for target in &plan.target_endpoints {
-                let sent = socket.send_to(payload.as_bytes(), target)?;
-                punch_packets.push(serde_json::json!({
-                    "target": target,
-                    "attempt": attempt,
-                    "bytes": sent,
-                }));
-            }
-            if punch_interval_ms > 0 && attempt + 1 < plan.attempt_count {
-                std::thread::sleep(Duration::from_millis(punch_interval_ms));
-            }
-        }
-
         let started_at_ms = current_epoch_ms();
         let hello = create_p2p_handshake_hello(
             room_id,
@@ -560,19 +577,35 @@ pub fn run_nat_p2p_bootstrap(
         let envelope =
             seal_tunnel_payload(key, "p2p-handshake-hello", 1, started_at_ms, &hello_bytes)?;
         let envelope_bytes = serde_json::to_vec(&envelope)?;
-        for target in &plan.target_endpoints {
-            let sent = socket.send_to(&envelope_bytes, target)?;
-            handshake_packets.push(serde_json::json!({
-                "target": target,
-                "packetKind": "p2p-handshake-hello",
-                "bytes": sent,
-            }));
-        }
-
         let deadline = Instant::now() + Duration::from_millis(handshake_timeout_ms);
-        let handshake_resend_interval = Duration::from_millis(250);
-        let mut next_handshake_resend_at = Instant::now() + handshake_resend_interval;
+        let punch_interval = Duration::from_millis(punch_interval_ms.max(25));
+        let handshake_resend_interval = Duration::from_millis(100);
+        let mut punch_attempt = 0u16;
+        let mut next_punch_at = Instant::now();
+        let mut next_handshake_resend_at = Instant::now();
         while handshake_timeout_ms > 0 && Instant::now() < deadline {
+            let now = Instant::now();
+            if punch_attempt < plan.attempt_count && now >= next_punch_at {
+                let payload = serde_json::json!({
+                    "schemaVersion": 1,
+                    "type": "nat-punch",
+                    "roomId": room_id,
+                    "peerId": peer_id,
+                    "attempt": punch_attempt,
+                    "sentAtMs": current_epoch_ms(),
+                })
+                .to_string();
+                for target in &plan.target_endpoints {
+                    let sent = socket.send_to(payload.as_bytes(), target)?;
+                    punch_packets.push(serde_json::json!({
+                        "target": target,
+                        "attempt": punch_attempt,
+                        "bytes": sent,
+                    }));
+                }
+                punch_attempt = punch_attempt.saturating_add(1);
+                next_punch_at = now + punch_interval;
+            }
             if Instant::now() >= next_handshake_resend_at {
                 for target in &plan.target_endpoints {
                     let sent = socket.send_to(&envelope_bytes, target)?;
@@ -1346,8 +1379,7 @@ fn push_default_route_candidate(endpoints: &mut Vec<SocketAddr>, probe: &str, po
     let Ok(local) = socket.local_addr() else {
         return;
     };
-    if local.ip().is_unspecified()
-        || local.ip().is_loopback()
+    if !is_usable_host_candidate_ip(local.ip())
         || endpoints
             .iter()
             .any(|endpoint| endpoint.ip() == local.ip() && endpoint.port() == port)
@@ -1355,6 +1387,27 @@ fn push_default_route_candidate(endpoints: &mut Vec<SocketAddr>, probe: &str, po
         return;
     }
     endpoints.push(SocketAddr::new(local.ip(), port));
+}
+
+fn is_usable_host_candidate_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(value) => {
+            let octets = value.octets();
+            !value.is_unspecified()
+                && !value.is_loopback()
+                && !value.is_multicast()
+                && octets[0] != 0
+                && octets[0] != 127
+                && !(octets[0] == 169 && octets[1] == 254)
+                && !(octets[0] == 198 && (octets[1] == 18 || octets[1] == 19))
+        }
+        IpAddr::V6(value) => {
+            !value.is_unspecified()
+                && !value.is_loopback()
+                && !value.is_multicast()
+                && !value.is_unicast_link_local()
+        }
+    }
 }
 
 fn deduplicate_and_sort_nat_candidates(candidates: &mut Vec<lai_core::NatCandidate>) {

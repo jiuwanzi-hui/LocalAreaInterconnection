@@ -192,11 +192,13 @@ pub(crate) enum Command {
         coordination_server: Option<String>,
         #[arg(long = "coordination-peer")]
         coordination_peers: Vec<String>,
+        #[arg(long, default_value_t = 0)]
+        coordination_publish_ttl_ms: u64,
         #[arg(long, default_value = "")]
         game_ports: String,
         #[arg(long, default_value = "")]
         broadcast_ports: String,
-        #[arg(long, default_value_t = 30)]
+        #[arg(long, default_value_t = 8)]
         max_broadcast_packets_per_second: u16,
         #[arg(long)]
         key: String,
@@ -232,6 +234,8 @@ pub(crate) enum Command {
         nat_bootstrap_timeout_ms: u64,
         #[arg(long)]
         nat_bootstrap_stun_server: Option<String>,
+        #[arg(long = "relay")]
+        relay_endpoints: Vec<String>,
         #[arg(long, default_value_t = 1000)]
         nat_bootstrap_stun_timeout_ms: u64,
         #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]

@@ -15,6 +15,7 @@ public partial class LocalAreaInterconnectionDesktop
     void UpdateRoomDetails(string mode)
     {
         if (roomSummary == null) return;
+        heartbeatPulseActive = false;
         roomSummary.Text = T("detailRoom") + " " + SafeText(roomName.Text) + " | " + T("detailSubnet") + " " + SafeText(subnet.Text);
         connectionSummary.Text = T("detailConnection") + " " + ConnectionText(mode);
         broadcastSummary.Text = T("detailBroadcast") + " " + T("stateUnknown");
@@ -54,6 +55,7 @@ public partial class LocalAreaInterconnectionDesktop
         RefreshCoordinationPresence();
         if (latestRuntimeSnapshot.Length == 0 || !File.Exists(latestRuntimeSnapshot))
         {
+            RefreshCoordinationRoomView(false);
             return;
         }
         string text;
@@ -86,12 +88,16 @@ public partial class LocalAreaInterconnectionDesktop
         string connectedPeers = JsonNumberValue(json, "connected_peer_count");
         string heartbeatPackets = JsonNumberValue(json, "heartbeatPacketsSent");
         string snapshotWrites = JsonNumberValue(json, "snapshotWriteCount");
-        string runtimePeers = RuntimePeersText(json);
-        string runtimeConnectionPaths = RuntimeConnectionPathText(json);
-        string relayFallback = RuntimeRelayFallbackText(json);
+        string runtimePeers = RuntimeCompactPeersText(json);
+        string linkState = RuntimeLinkStateText(json);
+        string primaryPath = RuntimePrimaryPathText(json);
+        string runtimeMetrics = RuntimeMetricsText(json);
+        string packetCounters = RuntimePacketCountersText(json);
+        heartbeatPulseActive = RuntimeHasConnectedPeer(json);
         if (adapter.Length == 0) adapter = T("stateUnknown");
         if (tunnel.Length == 0) tunnel = T("stateUnknown");
         if (p2p.Length == 0) p2p = T("stateUnknown");
+        if (primaryPath.Length > 0) path = primaryPath;
         if (path.Length == 0 || path == "skipped") path = T("stateUnknown");
         if (broadcast.Length == 0) broadcast = T("stateUnknown");
         if (gameTraffic.Length == 0) gameTraffic = T("stateUnknown");
@@ -100,31 +106,21 @@ public partial class LocalAreaInterconnectionDesktop
         if (snapshotWrites.Length == 0) snapshotWrites = "0";
 
         roomSummary.Text = T("detailRoom") + " " + SafeText(roomName.Text) + " | " + T("detailSubnet") + " " + SafeText(subnet.Text);
-        connectionSummary.Text = T("detailConnection") + " " + RuntimeStatusText()
-            + ", " + T("detailTunnel") + "=" + tunnel
-            + ", P2P=" + p2p
-            + ", " + T("detailPath") + "=" + path;
-        broadcastSummary.Text = T("detailBroadcast") + " " + broadcast + " | " + T("detailGameTraffic") + " " + gameTraffic;
+        connectionSummary.Text = T("detailConnection") + " " + linkState
+            + (path.Length > 0 && path != T("stateUnknown") ? " | " + path : "");
+        broadcastSummary.Text = runtimeMetrics.Length > 0
+            ? runtimeMetrics + (packetCounters.Length > 0 ? " | " + packetCounters : "")
+            : T("runtimeMetricEmpty");
         memberSummary.Text = T("detailMembers") + Environment.NewLine
-            + (runtimePeers.Length > 0 ? runtimePeers : SafeText(hostName.Text) + " @ " + SafeText(ip.Text))
-            + Environment.NewLine
-            + T("runtimePeers") + "=" + connectedPeers
-            + ", " + T("runtimeHeartbeats") + "=" + heartbeatPackets
-            + ", " + T("runtimeSnapshots") + "=" + snapshotWrites;
-        if (runtimeConnectionPaths.Length > 0)
-        {
-            memberSummary.Text += Environment.NewLine + T("runtimeConnectionPaths") + Environment.NewLine + runtimeConnectionPaths;
-        }
-        if (relayFallback.Length > 0)
-        {
-            memberSummary.Text += Environment.NewLine + T("detailRelay") + Environment.NewLine + relayFallback;
-        }
-        nextActionSummary.Text = T("detailNext") + " " + DiagnosticNextAction(adapter, tunnel, p2p, broadcast, gameTraffic);
+            + (runtimePeers.Length > 0 ? runtimePeers : SafeText(hostName.Text) + " @ " + SafeText(ip.Text));
+        nextActionSummary.Text = T("detailNext") + " "
+            + RuntimeNextActionText(json, linkState, adapter, tunnel, p2p, broadcast, gameTraffic);
     }
 
     void UpdateRoomDetailsFromRuntimeCleanupPlan(string json)
     {
         if (roomSummary == null || json.Trim().Length == 0) return;
+        heartbeatPulseActive = false;
         string backend = JsonStringValue(json, "packet_io_backend");
         bool restoreAdapter = JsonBoolValue(json, "restore_adapter");
         bool requiresElevation = JsonBoolValue(json, "requires_elevation");
@@ -235,18 +231,46 @@ public partial class LocalAreaInterconnectionDesktop
     void UpdateRoomDetailsFromCoordinationView(string json)
     {
         if (roomSummary == null || json.Trim().Length == 0) return;
+        if (runtimeProcess == null || runtimeProcess.HasExited)
+        {
+            heartbeatPulseActive = false;
+        }
         string status = JsonStringValue(json, "status");
         string memberCount = JsonNumberValue(json, "member_count");
+        if (memberCount.Length == 0) memberCount = JsonNumberValue(json, "memberCount");
         string onlineCount = JsonNumberValue(json, "online_count");
+        if (onlineCount.Length == 0) onlineCount = JsonNumberValue(json, "onlineCount");
         string expiredCount = JsonNumberValue(json, "expired_count");
+        if (expiredCount.Length == 0) expiredCount = JsonNumberValue(json, "expiredCount");
         string nextAction = JsonStringValue(json, "next_action");
+        if (nextAction.Length == 0) nextAction = JsonStringValue(json, "nextAction");
         string members = CoordinationMembersText(json);
+        latestCoordinationViewText = json;
         if (status.Length == 0) status = T("stateUnknown");
+        if (memberCount.Length == 0 && JsonArrayValue(json, "peers").Length > 0)
+        {
+            memberCount = JsonObjectArrayCount(json, "peers").ToString(CultureInfo.InvariantCulture);
+        }
+        if (onlineCount.Length == 0 && JsonArrayValue(json, "peers").Length > 0)
+        {
+            onlineCount = JsonObjectArrayStatusCount(json, "peers", "online").ToString(CultureInfo.InvariantCulture);
+        }
+        if (expiredCount.Length == 0 && JsonArrayValue(json, "peers").Length > 0)
+        {
+            expiredCount = JsonObjectArrayStatusCount(json, "peers", "expired").ToString(CultureInfo.InvariantCulture);
+        }
         if (memberCount.Length == 0) memberCount = "0";
         if (onlineCount.Length == 0) onlineCount = "0";
         if (expiredCount.Length == 0) expiredCount = "0";
+        Int32.TryParse(memberCount, NumberStyles.Integer, CultureInfo.InvariantCulture, out latestCoordinationMemberCount);
+        Int32.TryParse(onlineCount, NumberStyles.Integer, CultureInfo.InvariantCulture, out latestCoordinationOnlineCount);
         if (nextAction.Length == 0) nextAction = NextActionText("joined");
         if (members.Length == 0) members = MemberText("joined");
+
+        if (runtimeProcess != null && !runtimeProcess.HasExited && latestRuntimeSnapshot.Length > 0 && File.Exists(latestRuntimeSnapshot))
+        {
+            return;
+        }
 
         roomSummary.Text = T("detailRoom") + " " + RuntimeRoomId() + " | " + T("detailSubnet") + " " + SafeText(subnet.Text);
         connectionSummary.Text = T("detailConnection") + " " + T("coordinationRoomStatus") + "=" + status
@@ -577,6 +601,8 @@ public partial class LocalAreaInterconnectionDesktop
         if (selectedPath.Length == 0) selectedPath = JsonStringValue(readiness, "selectedPath");
         string selectedEndpoint = JsonFirstStringInArray(JsonArrayValue(readiness, "selected_endpoints"));
         string pathBootstrap = JsonStringValue(readiness, "bootstrapStatus");
+        string runtimePeers = RuntimePeersText(network);
+        string runtimePaths = RuntimeConnectionPathText(network);
         if (pathStatus.Length == 0) pathStatus = JsonStringValue(readiness, "status");
         if (adapter.Length == 0) adapter = T("stateUnknown");
         if (tunnel.Length == 0) tunnel = T("stateUnknown");
@@ -604,6 +630,12 @@ public partial class LocalAreaInterconnectionDesktop
                     + FriendlyStatus(pathStatus)
                     + (selectedPath.Length > 0 ? " [" + selectedPath + "]" : "")
                     + (selectedEndpoint.Length > 0 ? " -> " + selectedEndpoint : "")
+                : "")
+            + (runtimePeers.Length > 0
+                ? Environment.NewLine + T("summaryRuntimePeers") + Environment.NewLine + runtimePeers
+                : "")
+            + (runtimePaths.Length > 0
+                ? Environment.NewLine + T("summaryRuntimePaths") + Environment.NewLine + runtimePaths
                 : "")
             + Environment.NewLine
             + Environment.NewLine + T("detailNext") + " " + next;

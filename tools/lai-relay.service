@@ -1,0 +1,18 @@
+[Unit]
+Description=LocalAreaInterconnection relay server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/home/ubuntu
+Environment=LAI_HTTP_PORT=80
+Environment=LAI_UDP_PORT=39091
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/bin/python3 /home/ubuntu/lai-relay-server.py
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

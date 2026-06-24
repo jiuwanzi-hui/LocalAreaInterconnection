@@ -45,8 +45,9 @@ pub fn evaluate_connection_path(
     let local_relay_candidate_count = candidate_type_count(local_offer, "relay");
     let remote_host_candidate_count = candidate_type_count(remote_offer, "host");
     let remote_srflx_candidate_count = candidate_type_count(remote_offer, "srflx");
-    let remote_p2p_candidates = candidate_endpoints(remote_offer, |candidate_type| {
-        !candidate_type.eq_ignore_ascii_case("relay")
+    let remote_p2p_candidates = candidate_endpoints(remote_offer, |candidate| {
+        candidate.transport.eq_ignore_ascii_case("udp")
+            && !candidate.candidate_type.eq_ignore_ascii_case("relay")
     });
     let remote_relay_candidates = relay_fallback.selected_relay_endpoints.clone();
     let selected_path = match relay_fallback.status.as_str() {
@@ -135,20 +136,18 @@ fn candidate_type_count(offer: &NatTraversalOffer, expected_type: &str) -> usize
     offer
         .candidates
         .iter()
-        .filter(|candidate| candidate.transport.eq_ignore_ascii_case("udp"))
         .filter(|candidate| candidate.candidate_type.eq_ignore_ascii_case(expected_type))
         .count()
 }
 
 fn candidate_endpoints(
     offer: &NatTraversalOffer,
-    include_candidate_type: impl Fn(&str) -> bool,
+    include_candidate: impl Fn(&crate::NatCandidate) -> bool,
 ) -> Vec<String> {
     let mut endpoints = offer
         .candidates
         .iter()
-        .filter(|candidate| candidate.transport.eq_ignore_ascii_case("udp"))
-        .filter(|candidate| include_candidate_type(&candidate.candidate_type))
+        .filter(|candidate| include_candidate(candidate))
         .map(|candidate| {
             (
                 p2p_candidate_rank(&candidate.candidate_type, &candidate.source),
@@ -188,21 +187,14 @@ fn p2p_candidate_rank(candidate_type: &str, source: &str) -> u8 {
 }
 
 fn nat_assessment(offer: &NatTraversalOffer) -> String {
-    let has_udp = offer
-        .candidates
-        .iter()
-        .any(|candidate| candidate.transport.eq_ignore_ascii_case("udp"));
-    if !has_udp {
-        return "no-udp-candidates".to_owned();
-    }
     let has_srflx = offer.candidates.iter().any(|candidate| {
         candidate.transport.eq_ignore_ascii_case("udp")
             && candidate.candidate_type.eq_ignore_ascii_case("srflx")
     });
-    let has_relay = offer.candidates.iter().any(|candidate| {
-        candidate.transport.eq_ignore_ascii_case("udp")
-            && candidate.candidate_type.eq_ignore_ascii_case("relay")
-    });
+    let has_relay = offer
+        .candidates
+        .iter()
+        .any(|candidate| candidate.candidate_type.eq_ignore_ascii_case("relay"));
     let has_host = offer.candidates.iter().any(|candidate| {
         candidate.transport.eq_ignore_ascii_case("udp")
             && candidate.candidate_type.eq_ignore_ascii_case("host")
@@ -245,7 +237,7 @@ mod tests {
     }
 
     fn candidate(candidate_type: &str, endpoint: &str, priority: u32) -> NatCandidate {
-        candidate_from_source(candidate_type, endpoint, priority, "test")
+        candidate_from_source_and_transport(candidate_type, "udp", endpoint, priority, "test")
     }
 
     fn candidate_from_source(
@@ -254,9 +246,19 @@ mod tests {
         priority: u32,
         source: &str,
     ) -> NatCandidate {
+        candidate_from_source_and_transport(candidate_type, "udp", endpoint, priority, source)
+    }
+
+    fn candidate_from_source_and_transport(
+        candidate_type: &str,
+        transport: &str,
+        endpoint: &str,
+        priority: u32,
+        source: &str,
+    ) -> NatCandidate {
         NatCandidate {
             candidate_type: candidate_type.to_owned(),
-            transport: "udp".to_owned(),
+            transport: transport.to_owned(),
             endpoint: endpoint.to_owned(),
             priority,
             source: source.to_owned(),
@@ -322,5 +324,40 @@ mod tests {
         assert_eq!(report.selected_path, "relay");
         assert_eq!(report.remote_relay_candidate_count, 1);
         assert_eq!(report.selected_endpoints, vec!["203.0.113.10:39090"]);
+    }
+
+    #[test]
+    fn connection_path_accepts_http_relay_only_candidates() {
+        let local = offer(
+            "peer_a",
+            vec![candidate_from_source_and_transport(
+                "relay",
+                "http",
+                "http://49.235.146.152",
+                10,
+                "relay",
+            )],
+        );
+        let remote = offer(
+            "peer_b",
+            vec![candidate_from_source_and_transport(
+                "relay",
+                "http",
+                "http://49.235.146.152",
+                10,
+                "relay",
+            )],
+        );
+
+        let report = evaluate_connection_path(&local, &remote, "failed");
+
+        assert_eq!(report.status, "relay-ready");
+        assert_eq!(report.selected_path, "relay");
+        assert_eq!(report.local_udp_candidate_count, 0);
+        assert_eq!(report.local_relay_candidate_count, 1);
+        assert_eq!(report.remote_relay_candidate_count, 1);
+        assert_eq!(report.local_nat_assessment, "relay-only");
+        assert_eq!(report.remote_nat_assessment, "relay-only");
+        assert_eq!(report.selected_endpoints, vec!["http://49.235.146.152"]);
     }
 }

@@ -39,18 +39,28 @@ use lai_core::{
 use nat_direct::{
     apply_stun_mapping_candidates_to_offer, apply_upnp_port_mapping_to_offer,
     enrich_offer_with_local_host_candidates, query_stun_like_server, run_nat_hole_punch,
-    run_nat_hole_punch_loopback_test, run_nat_p2p_bootstrap, run_stun_like_server,
-    UpnpPortMappingReport,
+    run_nat_hole_punch_loopback_test, run_nat_p2p_bootstrap, run_nat_p2p_bootstrap_on_socket,
+    run_stun_like_server, UpnpPortMappingReport,
 };
 use rand::RngCore;
 use serde::Serialize;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io::{ErrorKind, Read, Write};
-use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
+use std::net::{
+    IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs, UdpSocket,
+};
 use std::path::Path;
 use std::process::Command as ProcessCommand;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+const RUNTIME_PEER_CONNECTED_WINDOW_MS: u64 = 5_000;
+const RUNTIME_HTTP_RELAY_PACKET_MAX_AGE_MS: u128 = 5_000;
+const RUNTIME_RELAY_REGISTRATION_INTERVAL_MS: u64 = 2_000;
+const DEFAULT_UDP_RELAY_PORT: u16 = 39091;
+const UDP_RELAY_BINARY_MAGIC: &[u8] = b"LAIR1";
+const UDP_RELAY_BINARY_REGISTER: u8 = 1;
+const UDP_RELAY_BINARY_FORWARD: u8 = 2;
 
 struct RuntimePacketIoProbeOptions {
     wintun_adapter_name: String,
@@ -78,6 +88,42 @@ struct RuntimeCoordinationMonitorReport {
     room_present: bool,
     checked_at_ms: u128,
     detail: String,
+}
+
+#[derive(Clone, Debug)]
+struct RuntimeSendTarget {
+    peer_id: String,
+    endpoint: String,
+    socket_endpoint: Option<SocketAddr>,
+    relay_url: Option<String>,
+    tcp_relay_url: Option<String>,
+    connection_path: String,
+}
+
+impl RuntimeSendTarget {
+    fn is_relay(&self) -> bool {
+        self.connection_path.eq_ignore_ascii_case("relay")
+            || self.connection_path.eq_ignore_ascii_case("relayed")
+    }
+}
+
+struct RuntimeOpenedPacket {
+    payload: lai_core::TunnelPayload,
+    relay: Option<RuntimeRelayPacketInfo>,
+}
+
+struct RuntimeRelayPacketInfo {
+    relay_endpoint: String,
+    relay_socket_endpoint: Option<SocketAddr>,
+    relay_url: Option<String>,
+    tcp_relay_url: Option<String>,
+    from_peer_id: String,
+}
+
+struct RuntimeTcpRelayClient {
+    server_url: String,
+    stream: TcpStream,
+    read_buffer: Vec<u8>,
 }
 
 fn main() {
@@ -548,6 +594,7 @@ fn run_main() -> Result<(), Box<dyn std::error::Error>> {
             coordination_store,
             coordination_server,
             coordination_peers,
+            coordination_publish_ttl_ms,
             game_ports,
             broadcast_ports,
             max_broadcast_packets_per_second,
@@ -568,6 +615,7 @@ fn run_main() -> Result<(), Box<dyn std::error::Error>> {
             nat_bootstrap_interval_ms,
             nat_bootstrap_timeout_ms,
             nat_bootstrap_stun_server,
+            relay_endpoints,
             nat_bootstrap_stun_timeout_ms,
             nat_bootstrap_upnp_port_map,
             nat_bootstrap_upnp_timeout_ms,
@@ -588,6 +636,26 @@ fn run_main() -> Result<(), Box<dyn std::error::Error>> {
             let game_ports = parse_ports(&game_ports)?;
             let broadcast_ports = parse_ports(&broadcast_ports)?;
             let local_virtual_ip = virtual_ip.parse::<Ipv4Addr>()?;
+            let relay_endpoints = relay_endpoints.clone();
+            let tunnel_socket = bind_runtime_tunnel_socket(&bind)?;
+            let runtime_published_offer = publish_runtime_coordination_offer(
+                coordination_server.as_deref(),
+                coordination_publish_ttl_ms,
+                &room_id,
+                &peer_id,
+                local_virtual_ip,
+                &tunnel_socket,
+                nat_bootstrap_stun_server.as_deref(),
+                nat_bootstrap_stun_timeout_ms,
+                nat_bootstrap_upnp_port_map,
+                nat_bootstrap_upnp_timeout_ms,
+                nat_bootstrap_upnp_lease_seconds,
+                nat_bootstrap_upnp_gateway_location.as_deref(),
+                &relay_endpoints,
+            )?;
+            let nat_bootstrap_socket_reused = !nat_bootstrap_remote_peers.is_empty()
+                || (!coordination_peers.is_empty()
+                    && (coordination_store.is_some() || coordination_server.is_some()));
             let mut runtime_peers =
                 parse_runtime_peers_with_bootstrap(&peers, &nat_bootstrap_peers)?;
             let (mut bootstrapped_peers, nat_bootstrap_results) = run_runtime_nat_bootstraps(
@@ -596,7 +664,7 @@ fn run_main() -> Result<(), Box<dyn std::error::Error>> {
                 &peer_id,
                 local_virtual_ip,
                 &key,
-                &bind,
+                &tunnel_socket,
                 nat_bootstrap_attempts,
                 nat_bootstrap_interval_ms,
                 nat_bootstrap_timeout_ms,
@@ -606,6 +674,7 @@ fn run_main() -> Result<(), Box<dyn std::error::Error>> {
                 nat_bootstrap_upnp_timeout_ms,
                 nat_bootstrap_upnp_lease_seconds,
                 nat_bootstrap_upnp_gateway_location.as_deref(),
+                relay_endpoints.clone(),
             )?;
             runtime_peers.append(&mut bootstrapped_peers);
             let (mut coordination_bootstrapped_peers, mut coordination_bootstrap_results) =
@@ -619,7 +688,7 @@ fn run_main() -> Result<(), Box<dyn std::error::Error>> {
                         &peer_id,
                         local_virtual_ip,
                         &key,
-                        &bind,
+                        &tunnel_socket,
                         nat_bootstrap_attempts,
                         nat_bootstrap_interval_ms,
                         nat_bootstrap_timeout_ms,
@@ -629,6 +698,7 @@ fn run_main() -> Result<(), Box<dyn std::error::Error>> {
                         nat_bootstrap_upnp_timeout_ms,
                         nat_bootstrap_upnp_lease_seconds,
                         nat_bootstrap_upnp_gateway_location.as_deref(),
+                        relay_endpoints.clone(),
                     )?
                 };
             runtime_peers.append(&mut coordination_bootstrapped_peers);
@@ -643,7 +713,7 @@ fn run_main() -> Result<(), Box<dyn std::error::Error>> {
                         &peer_id,
                         local_virtual_ip,
                         &key,
-                        &bind,
+                        &tunnel_socket,
                         nat_bootstrap_attempts,
                         nat_bootstrap_interval_ms,
                         nat_bootstrap_timeout_ms,
@@ -653,6 +723,7 @@ fn run_main() -> Result<(), Box<dyn std::error::Error>> {
                         nat_bootstrap_upnp_timeout_ms,
                         nat_bootstrap_upnp_lease_seconds,
                         nat_bootstrap_upnp_gateway_location.as_deref(),
+                        relay_endpoints.clone(),
                     )?
                 };
             runtime_peers.append(&mut coordination_server_peers);
@@ -704,7 +775,11 @@ fn run_main() -> Result<(), Box<dyn std::error::Error>> {
                 broadcast_ports.clone(),
                 game_ports.clone(),
                 max_broadcast_packets_per_second,
+                Some(tunnel_socket),
             )?;
+            result["natBootstrapSocketReused"] =
+                serde_json::Value::Bool(nat_bootstrap_socket_reused);
+            result["runtimePublishedOffer"] = runtime_published_offer;
             result["natBootstrapResults"] = serde_json::Value::Array(nat_bootstrap_results);
             coordination_bootstrap_results.append(&mut coordination_server_results);
             result["coordinationBootstrapResults"] =
@@ -919,6 +994,7 @@ fn run_main() -> Result<(), Box<dyn std::error::Error>> {
             } else {
                 "planned".to_owned()
             };
+            let status_is_failure = matches!(status.as_str(), "failed" | "needs-elevation");
             println!(
                 "{}",
                 serde_json::to_string_pretty(&serde_json::json!({
@@ -938,6 +1014,11 @@ fn run_main() -> Result<(), Box<dyn std::error::Error>> {
                     },
                 }))?
             );
+            if status_is_failure {
+                return Err(
+                    invalid_input(format!("firewall apply did not complete: {status}")).into(),
+                );
+            }
         }
         Command::FirewallDiagnose {
             game_name,
@@ -1379,10 +1460,7 @@ fn run_main() -> Result<(), Box<dyn std::error::Error>> {
                 .as_deref()
                 .map(str::parse::<SocketAddr>)
                 .transpose()?;
-            let relay_endpoints = relay_endpoints
-                .iter()
-                .map(|endpoint| endpoint.parse::<SocketAddr>())
-                .collect::<Result<Vec<_>, _>>()?;
+            let relay_endpoints = relay_endpoints.clone();
             let mut offer = lai_core::create_nat_traversal_offer(
                 &room_id,
                 &peer_id,
@@ -2238,18 +2316,29 @@ fn run_main() -> Result<(), Box<dyn std::error::Error>> {
                 );
                 return Ok(());
             }
-            let create_report =
-                lai_core::create_wintun_adapter(lai_core::WintunAdapterCreateRequest {
-                    adapter_name: adapter_name.clone(),
-                    tunnel_type: tunnel_type.clone(),
-                });
-            let open_report = lai_core::open_wintun_adapter(lai_core::WintunAdapterOpenRequest {
-                adapter_name: adapter_name.clone(),
+            let initial_open_report = open_wintun_adapter_with_retry(&adapter_name, 1, 0);
+            let already_available = initial_open_report.opened;
+            let create_report = if already_available {
+                None
+            } else {
+                Some(lai_core::create_wintun_adapter(
+                    lai_core::WintunAdapterCreateRequest {
+                        adapter_name: adapter_name.clone(),
+                        tunnel_type: tunnel_type.clone(),
+                    },
+                ))
+            };
+            let open_report = if already_available {
+                initial_open_report.clone()
+            } else {
+                open_wintun_adapter_with_retry(&adapter_name, 10, 500)
+            };
+            let create_ok = create_report.as_ref().is_some_and(|report| {
+                matches!(
+                    report.status.as_str(),
+                    "created" | "adapter-exists" | "already-exists"
+                )
             });
-            let create_ok = matches!(
-                create_report.status.as_str(),
-                "created" | "adapter-exists" | "already-exists"
-            );
             let open_ok = open_report.opened;
             let status = if open_ok {
                 "ready"
@@ -2266,6 +2355,8 @@ fn run_main() -> Result<(), Box<dyn std::error::Error>> {
                     "tunnelType": tunnel_type,
                     "requiresElevation": true,
                     "confirmed": true,
+                    "alreadyAvailable": already_available,
+                    "initialOpenReport": initial_open_report,
                     "createReport": create_report,
                     "openReport": open_report,
                     "nextAction": if open_ok {
@@ -2275,6 +2366,9 @@ fn run_main() -> Result<(), Box<dyn std::error::Error>> {
                     },
                 }))?
             );
+            if !open_ok {
+                return Err(invalid_input(format!("wintun adapter is not ready: {status}")).into());
+            }
         }
         Command::WintunAdapterDelete {
             adapter_name,
@@ -2464,6 +2558,17 @@ fn parse_runtime_peers(
                     invalid_input(format!("invalid peer virtual IP `{}`: {err}", parts[1]))
                 })?,
                 endpoint: parts[2].to_owned(),
+                connection_path: if is_http_relay_endpoint(parts[2]) {
+                    "relay".to_owned()
+                } else {
+                    "direct".to_owned()
+                },
+                direct_endpoint: if is_http_relay_endpoint(parts[2]) {
+                    None
+                } else {
+                    Some(parts[2].to_owned())
+                },
+                fallback_endpoint: None,
             })
         })
         .collect()
@@ -2505,16 +2610,56 @@ fn runtime_peer_from_bootstrap_result(
     virtual_ip: Ipv4Addr,
     result: &serde_json::Value,
 ) -> Result<RoomRuntimePeer, Box<dyn std::error::Error>> {
-    let endpoint = match runtime_direct_endpoint_from_bootstrap_result(peer_id, result)? {
-        Some(endpoint) => endpoint,
-        None => runtime_fallback_endpoint_from_bootstrap_result(result)?,
-    };
+    let direct_endpoint =
+        runtime_direct_endpoint_from_bootstrap_result(peer_id, result)?.or_else(|| {
+            runtime_best_direct_endpoint_from_bootstrap_result(result)
+                .ok()
+                .flatten()
+        });
+    let (endpoint, connection_path) =
+        match runtime_direct_endpoint_from_bootstrap_result(peer_id, result)? {
+            Some(endpoint) => (endpoint, "direct".to_owned()),
+            None => runtime_fallback_endpoint_from_bootstrap_result(result)?,
+        };
+    let fallback_endpoint = runtime_relay_fallback_endpoint_from_bootstrap_result(result)?;
 
     Ok(RoomRuntimePeer {
         peer_id: peer_id.to_owned(),
         virtual_ip,
         endpoint,
+        connection_path,
+        direct_endpoint,
+        fallback_endpoint,
     })
+}
+
+fn runtime_best_direct_endpoint_from_bootstrap_result(
+    result: &serde_json::Value,
+) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    let Some(remote_offer_value) = result.get("remoteOffer").cloned() else {
+        return Ok(None);
+    };
+    let remote_offer: lai_core::NatTraversalOffer = serde_json::from_value(remote_offer_value)?;
+    Ok(best_direct_candidate_endpoint(&remote_offer))
+}
+
+fn runtime_relay_fallback_endpoint_from_bootstrap_result(
+    result: &serde_json::Value,
+) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    let Some(local_offer_value) = result.get("localOffer").cloned() else {
+        return Ok(None);
+    };
+    let Some(remote_offer_value) = result.get("remoteOffer").cloned() else {
+        return Ok(None);
+    };
+    let local_offer: lai_core::NatTraversalOffer = serde_json::from_value(local_offer_value)?;
+    let remote_offer: lai_core::NatTraversalOffer = serde_json::from_value(remote_offer_value)?;
+    let report = lai_core::evaluate_connection_path(&local_offer, &remote_offer, "failed");
+    Ok(report
+        .relay_fallback
+        .selected_relay_endpoints
+        .first()
+        .cloned())
 }
 
 fn runtime_direct_endpoint_from_bootstrap_result(
@@ -2524,6 +2669,9 @@ fn runtime_direct_endpoint_from_bootstrap_result(
     let Some(selected) = result.get("selectedPeer") else {
         return Ok(None);
     };
+    if selected.is_null() {
+        return Ok(None);
+    }
     let responder_peer_id = selected
         .get("responderPeerId")
         .and_then(serde_json::Value::as_str)
@@ -2560,7 +2708,7 @@ fn runtime_direct_endpoint_from_bootstrap_result(
 
 fn runtime_fallback_endpoint_from_bootstrap_result(
     result: &serde_json::Value,
-) -> Result<String, Box<dyn std::error::Error>> {
+) -> Result<(String, String), Box<dyn std::error::Error>> {
     let local_offer: lai_core::NatTraversalOffer =
         serde_json::from_value(result.get("localOffer").cloned().ok_or_else(|| {
             invalid_input("NAT bootstrap result is missing localOffer".to_owned())
@@ -2578,16 +2726,160 @@ fn runtime_fallback_endpoint_from_bootstrap_result(
         &remote_offer,
         connection_path_status_from_bootstrap_status(status),
     );
+    preferred_runtime_fallback_endpoint(status, &report, &remote_offer)
+        .ok_or_else(|| {
+            invalid_input(
+                format!(
+                    "NAT bootstrap did not produce a direct peer and no relay/P2P fallback endpoint was available. {}",
+                    bootstrap_failure_summary(status, &report)
+                ),
+            )
+        })
+}
+
+fn preferred_runtime_fallback_endpoint(
+    _status: &str,
+    report: &lai_core::ConnectionPathReport,
+    remote_offer: &lai_core::NatTraversalOffer,
+) -> Option<(String, String)> {
+    if report.status == "config-error" {
+        return None;
+    }
+    let relay_endpoint = report
+        .relay_fallback
+        .selected_relay_endpoints
+        .first()
+        .cloned();
+    if report.selected_path == "relay" || relay_endpoint.is_some() {
+        return relay_endpoint
+            .or_else(|| report.selected_endpoints.first().cloned())
+            .map(|endpoint| (endpoint, "relay".to_owned()));
+    }
+    if report.selected_path == "p2p" {
+        return best_direct_candidate_endpoint(remote_offer).map(|endpoint| {
+            let path = if report.selected_path == "p2p" {
+                "direct"
+            } else {
+                report.selected_path.as_str()
+            };
+            (endpoint, path.to_owned())
+        });
+    }
     report
         .selected_endpoints
         .first()
         .cloned()
-        .ok_or_else(|| {
-            invalid_input(
-                "NAT bootstrap did not produce a direct peer and no relay/P2P fallback endpoint was available."
-                    .to_owned(),
+        .or_else(|| best_direct_candidate_endpoint(remote_offer))
+        .map(|endpoint| (endpoint, report.selected_path.clone()))
+}
+
+fn udp_relay_endpoints(values: &[String]) -> Vec<SocketAddr> {
+    values
+        .iter()
+        .filter_map(|endpoint| endpoint.parse::<SocketAddr>().ok())
+        .collect()
+}
+
+fn add_string_relay_candidates(
+    offer: &mut lai_core::NatTraversalOffer,
+    relay_endpoints: &[String],
+) {
+    for endpoint in relay_endpoints {
+        if offer.candidates.iter().any(|candidate| {
+            candidate.candidate_type.eq_ignore_ascii_case("relay")
+                && candidate.endpoint == *endpoint
+        }) {
+            continue;
+        }
+        offer.candidates.push(lai_core::NatCandidate {
+            candidate_type: "relay".to_owned(),
+            transport: if endpoint.starts_with("http://") {
+                "http".to_owned()
+            } else {
+                "udp".to_owned()
+            },
+            endpoint: endpoint.clone(),
+            priority: 10,
+            source: "relay".to_owned(),
+        });
+    }
+}
+
+fn add_relay_candidates_to_bootstrap_result(
+    result: &mut serde_json::Value,
+    relay_endpoints: &[String],
+) -> Result<(), Box<dyn std::error::Error>> {
+    if relay_endpoints.is_empty() {
+        return Ok(());
+    }
+    if let Some(local_offer_value) = result.get("localOffer").cloned() {
+        let mut local_offer: lai_core::NatTraversalOffer =
+            serde_json::from_value(local_offer_value)?;
+        add_string_relay_candidates(&mut local_offer, relay_endpoints);
+        result["localOffer"] = serde_json::to_value(local_offer)?;
+    }
+    if let Some(remote_offer_value) = result.get("remoteOffer").cloned() {
+        let mut remote_offer: lai_core::NatTraversalOffer =
+            serde_json::from_value(remote_offer_value)?;
+        add_string_relay_candidates(&mut remote_offer, relay_endpoints);
+        result["remoteOffer"] = serde_json::to_value(remote_offer)?;
+    }
+    Ok(())
+}
+
+fn best_direct_candidate_endpoint(offer: &lai_core::NatTraversalOffer) -> Option<String> {
+    let mut candidates = offer
+        .candidates
+        .iter()
+        .filter(|candidate| candidate.transport.eq_ignore_ascii_case("udp"))
+        .filter(|candidate| !candidate.candidate_type.eq_ignore_ascii_case("relay"))
+        .map(|candidate| {
+            (
+                runtime_candidate_rank(&candidate.candidate_type),
+                candidate.priority,
+                candidate.endpoint.clone(),
             )
         })
+        .collect::<Vec<_>>();
+    candidates.sort_by(|left, right| {
+        right
+            .0
+            .cmp(&left.0)
+            .then_with(|| right.1.cmp(&left.1))
+            .then_with(|| left.2.cmp(&right.2))
+    });
+    candidates
+        .into_iter()
+        .map(|(_, _, endpoint)| endpoint)
+        .next()
+}
+
+fn runtime_candidate_rank(candidate_type: &str) -> u8 {
+    if candidate_type.eq_ignore_ascii_case("srflx") {
+        3
+    } else if candidate_type.eq_ignore_ascii_case("host") {
+        2
+    } else {
+        1
+    }
+}
+
+fn bootstrap_failure_summary(status: &str, report: &lai_core::ConnectionPathReport) -> String {
+    format!(
+        "status={status}, path={}, local host/srflx/relay={}/{}/{}, remote host/srflx/relay={}/{}/{}, action={}",
+        report.selected_path,
+        report.local_host_candidate_count,
+        report.local_srflx_candidate_count,
+        report.local_relay_candidate_count,
+        report.remote_host_candidate_count,
+        report.remote_srflx_candidate_count,
+        report.remote_relay_candidate_count,
+        report
+            .recommended_actions
+            .first()
+            .map(String::as_str)
+            .unwrap_or("Refresh NAT candidates and retry."),
+    )
 }
 
 fn run_runtime_nat_bootstraps(
@@ -2596,7 +2888,7 @@ fn run_runtime_nat_bootstraps(
     local_peer_id: &str,
     local_virtual_ip: Ipv4Addr,
     key: &str,
-    bind: &str,
+    socket: &UdpSocket,
     attempts: u16,
     interval_ms: u64,
     timeout_ms: u64,
@@ -2606,6 +2898,7 @@ fn run_runtime_nat_bootstraps(
     upnp_timeout_ms: u64,
     upnp_lease_seconds: u32,
     upnp_gateway_location: Option<&str>,
+    relay_endpoints: Vec<String>,
 ) -> Result<(Vec<RoomRuntimePeer>, Vec<serde_json::Value>), Box<dyn std::error::Error>> {
     let mut peers = Vec::new();
     let mut results = Vec::new();
@@ -2624,12 +2917,12 @@ fn run_runtime_nat_bootstraps(
             ))
         })?;
         let remote_offer = load_nat_offer_argument(parts[2])?;
-        let result = run_nat_p2p_bootstrap(
+        let mut result = run_nat_p2p_bootstrap_on_socket(
+            socket,
             room_id,
             local_peer_id,
             local_virtual_ip,
             key,
-            bind,
             &remote_offer,
             None,
             stun_server,
@@ -2638,11 +2931,12 @@ fn run_runtime_nat_bootstraps(
             upnp_timeout_ms,
             upnp_lease_seconds,
             upnp_gateway_location,
-            Vec::new(),
+            udp_relay_endpoints(&relay_endpoints),
             attempts,
             interval_ms,
             timeout_ms,
         )?;
+        add_relay_candidates_to_bootstrap_result(&mut result, &relay_endpoints)?;
         peers.push(runtime_peer_from_bootstrap_result(
             &remote_peer_id,
             remote_virtual_ip,
@@ -2660,7 +2954,7 @@ fn run_runtime_coordination_bootstraps(
     local_peer_id: &str,
     local_virtual_ip: Ipv4Addr,
     key: &str,
-    bind: &str,
+    socket: &UdpSocket,
     attempts: u16,
     interval_ms: u64,
     timeout_ms: u64,
@@ -2670,6 +2964,7 @@ fn run_runtime_coordination_bootstraps(
     upnp_timeout_ms: u64,
     upnp_lease_seconds: u32,
     upnp_gateway_location: Option<&str>,
+    relay_endpoints: Vec<String>,
 ) -> Result<(Vec<RoomRuntimePeer>, Vec<serde_json::Value>), Box<dyn std::error::Error>> {
     let Some(store_path) = store_path else {
         return Ok((Vec::new(), Vec::new()));
@@ -2694,20 +2989,16 @@ fn run_runtime_coordination_bootstraps(
     let mut missing_peers = Vec::new();
 
     for (remote_peer_id, remote_virtual_ip) in peer_specs {
-        let Some(offer) = fetch
-            .offers
-            .iter()
-            .find(|offer| offer.peer_id == remote_peer_id)
-        else {
+        let Some(offer) = runtime_coordination_offer_for_peer(&fetch, &remote_peer_id) else {
             missing_peers.push(remote_peer_id);
             continue;
         };
-        let result = run_nat_p2p_bootstrap(
+        let mut result = run_nat_p2p_bootstrap_on_socket(
+            socket,
             room_id,
             local_peer_id,
             local_virtual_ip,
             key,
-            bind,
             offer,
             None,
             stun_server,
@@ -2716,11 +3007,12 @@ fn run_runtime_coordination_bootstraps(
             upnp_timeout_ms,
             upnp_lease_seconds,
             upnp_gateway_location,
-            Vec::new(),
+            udp_relay_endpoints(&relay_endpoints),
             attempts,
             interval_ms,
             timeout_ms,
         )?;
+        add_relay_candidates_to_bootstrap_result(&mut result, &relay_endpoints)?;
         peers.push(runtime_peer_from_bootstrap_result(
             &remote_peer_id,
             remote_virtual_ip,
@@ -2769,7 +3061,7 @@ fn run_runtime_coordination_server_bootstraps(
     local_peer_id: &str,
     local_virtual_ip: Ipv4Addr,
     key: &str,
-    bind: &str,
+    socket: &UdpSocket,
     attempts: u16,
     interval_ms: u64,
     timeout_ms: u64,
@@ -2779,6 +3071,7 @@ fn run_runtime_coordination_server_bootstraps(
     upnp_timeout_ms: u64,
     upnp_lease_seconds: u32,
     upnp_gateway_location: Option<&str>,
+    relay_endpoints: Vec<String>,
 ) -> Result<(Vec<RoomRuntimePeer>, Vec<serde_json::Value>), Box<dyn std::error::Error>> {
     let Some(server) = server else {
         return Ok((Vec::new(), Vec::new()));
@@ -2790,8 +3083,16 @@ fn run_runtime_coordination_server_bootstraps(
                 .to_owned(),
         ));
     }
-    let fetch_value = coordination_http_fetch_offers(server, room_id, local_peer_id)?;
-    let fetch: lai_core::CoordinationFetchResult = serde_json::from_value(fetch_value.clone())?;
+    let waited_fetch = wait_for_coordination_http_offers(
+        server,
+        room_id,
+        local_peer_id,
+        &peer_specs,
+        timeout_ms,
+        interval_ms,
+    )?;
+    let fetch_value = waited_fetch.fetch_value.clone();
+    let fetch = waited_fetch.fetch.clone();
     let mut peers = Vec::new();
     let mut bootstrap_results = Vec::new();
     let mut missing_peers = Vec::new();
@@ -2805,12 +3106,12 @@ fn run_runtime_coordination_server_bootstraps(
             missing_peers.push(remote_peer_id);
             continue;
         };
-        let result = run_nat_p2p_bootstrap(
+        let mut result = run_nat_p2p_bootstrap_on_socket(
+            socket,
             room_id,
             local_peer_id,
             local_virtual_ip,
             key,
-            bind,
             offer,
             None,
             stun_server,
@@ -2819,11 +3120,12 @@ fn run_runtime_coordination_server_bootstraps(
             upnp_timeout_ms,
             upnp_lease_seconds,
             upnp_gateway_location,
-            Vec::new(),
+            udp_relay_endpoints(&relay_endpoints),
             attempts,
             interval_ms,
             timeout_ms,
         )?;
+        add_relay_candidates_to_bootstrap_result(&mut result, &relay_endpoints)?;
         peers.push(runtime_peer_from_bootstrap_result(
             &remote_peer_id,
             remote_virtual_ip,
@@ -2848,6 +3150,8 @@ fn run_runtime_coordination_server_bootstraps(
             "source": "coordination-http",
             "server": server,
             "fetch": fetch_value,
+            "fetchAttempts": waited_fetch.attempts,
+            "fetchWaitedMs": waited_fetch.waited_ms,
             "status": "empty",
         }));
     } else {
@@ -2857,12 +3161,123 @@ fn run_runtime_coordination_server_bootstraps(
                 "source": "coordination-http",
                 "server": server,
                 "fetch": fetch_value,
+                "fetchAttempts": waited_fetch.attempts,
+                "fetchWaitedMs": waited_fetch.waited_ms,
                 "status": "ok",
             }),
         );
     }
 
     Ok((peers, bootstrap_results))
+}
+
+struct RuntimeCoordinationHttpFetch {
+    fetch_value: serde_json::Value,
+    fetch: lai_core::CoordinationFetchResult,
+    attempts: u32,
+    waited_ms: u128,
+}
+
+fn wait_for_coordination_http_offers(
+    server: &str,
+    room_id: &str,
+    local_peer_id: &str,
+    peer_specs: &[(String, Ipv4Addr)],
+    timeout_ms: u64,
+    interval_ms: u64,
+) -> Result<RuntimeCoordinationHttpFetch, Box<dyn std::error::Error>> {
+    let started = Instant::now();
+    let deadline = started + Duration::from_millis(timeout_ms.max(1));
+    let interval = Duration::from_millis(interval_ms.max(100));
+    let mut attempts = 0u32;
+    let mut fallback_fetch_value = None;
+    let mut fallback_fetch = None;
+    let mut fallback_attempts = 0u32;
+    let mut fallback_waited_ms = 0u128;
+    loop {
+        attempts = attempts.saturating_add(1);
+        let fetch_value = coordination_http_fetch_offers(server, room_id, local_peer_id)?;
+        let fetch: lai_core::CoordinationFetchResult = serde_json::from_value(fetch_value.clone())?;
+        let runtime_present = peer_specs.iter().all(|(remote_peer_id, _)| {
+            fetch.offers.iter().any(|offer| {
+                offer.peer_id == *remote_peer_id && runtime_coordination_offer_ready(offer)
+            })
+        });
+        let any_present = peer_specs.iter().all(|(remote_peer_id, _)| {
+            fetch
+                .offers
+                .iter()
+                .any(|offer| offer.peer_id == *remote_peer_id)
+        });
+        if any_present && fallback_fetch.is_none() {
+            fallback_fetch_value = Some(fetch_value.clone());
+            fallback_fetch = Some(fetch.clone());
+            fallback_attempts = attempts;
+            fallback_waited_ms = started.elapsed().as_millis();
+        }
+        if runtime_present {
+            return Ok(RuntimeCoordinationHttpFetch {
+                fetch_value,
+                fetch,
+                attempts,
+                waited_ms: started.elapsed().as_millis(),
+            });
+        }
+        if Instant::now() >= deadline {
+            if let (Some(fetch_value), Some(fetch)) = (fallback_fetch_value, fallback_fetch) {
+                return Ok(RuntimeCoordinationHttpFetch {
+                    fetch_value,
+                    fetch,
+                    attempts: fallback_attempts,
+                    waited_ms: fallback_waited_ms,
+                });
+            }
+            return Ok(RuntimeCoordinationHttpFetch {
+                fetch_value,
+                fetch,
+                attempts,
+                waited_ms: started.elapsed().as_millis(),
+            });
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            if let (Some(fetch_value), Some(fetch)) = (fallback_fetch_value, fallback_fetch) {
+                return Ok(RuntimeCoordinationHttpFetch {
+                    fetch_value,
+                    fetch,
+                    attempts: fallback_attempts,
+                    waited_ms: fallback_waited_ms,
+                });
+            }
+            return Ok(RuntimeCoordinationHttpFetch {
+                fetch_value,
+                fetch,
+                attempts,
+                waited_ms: started.elapsed().as_millis(),
+            });
+        }
+        std::thread::sleep(interval.min(remaining));
+    }
+}
+
+fn runtime_coordination_offer_ready(offer: &lai_core::NatTraversalOffer) -> bool {
+    offer.nonce.ends_with("-runtime-offer")
+}
+
+fn runtime_coordination_offer_for_peer<'a>(
+    fetch: &'a lai_core::CoordinationFetchResult,
+    remote_peer_id: &str,
+) -> Option<&'a lai_core::NatTraversalOffer> {
+    fetch
+        .offers
+        .iter()
+        .find(|offer| offer.peer_id == remote_peer_id && runtime_coordination_offer_ready(offer))
+        .or_else(|| {
+            fetch
+                .offers
+                .iter()
+                .find(|offer| offer.peer_id == remote_peer_id)
+        })
 }
 
 fn parse_coordination_peer_specs(
@@ -3327,6 +3742,29 @@ fn current_epoch_ms() -> u128 {
         .unwrap_or_default()
 }
 
+fn open_wintun_adapter_with_retry(
+    adapter_name: &str,
+    attempts: u16,
+    delay_ms: u64,
+) -> lai_core::WintunAdapterOpenReport {
+    let attempts = attempts.max(1);
+    let mut report = lai_core::open_wintun_adapter(lai_core::WintunAdapterOpenRequest {
+        adapter_name: adapter_name.to_owned(),
+    });
+    for _ in 1..attempts {
+        if report.opened {
+            return report;
+        }
+        if delay_ms > 0 {
+            std::thread::sleep(Duration::from_millis(delay_ms));
+        }
+        report = lai_core::open_wintun_adapter(lai_core::WintunAdapterOpenRequest {
+            adapter_name: adapter_name.to_owned(),
+        });
+    }
+    report
+}
+
 fn write_json_file<T: serde::Serialize>(
     path: &str,
     value: &T,
@@ -3611,20 +4049,26 @@ fn execute_network_command(command: &NetworkCommand) -> CommandExecutionRecord {
         .output()
     {
         Ok(output) => {
+            let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+            let benign = is_existing_route_result(command, &stdout, &stderr);
+            let succeeded = output.status.success() || benign;
             CommandExecutionRecord {
                 command: command.command.clone(),
                 purpose: command.purpose.clone(),
-                status: if output.status.success() {
+                status: if succeeded {
                     CommandExecutionStatus::Succeeded
                 } else {
                     CommandExecutionStatus::Failed
                 },
                 exit_code: output.status.code(),
-                stdout: String::from_utf8_lossy(&output.stdout).to_string(),
-                stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+                stdout,
+                stderr,
                 error: None,
                 next_action: if output.status.success() {
                     None
+                } else if benign {
+                    Some("The room subnet route already exists; continuing with the existing active route.".to_owned())
                 } else {
                     Some("Check that the adapter name exists and rerun from an Administrator terminal.".to_owned())
                 },
@@ -3644,6 +4088,25 @@ fn execute_network_command(command: &NetworkCommand) -> CommandExecutionRecord {
             ),
         },
     }
+}
+
+fn is_existing_route_result(command: &NetworkCommand, stdout: &str, stderr: &str) -> bool {
+    let is_route_add = command.tool.eq_ignore_ascii_case("netsh")
+        && command
+            .args
+            .iter()
+            .map(|arg| arg.to_ascii_lowercase())
+            .collect::<Vec<_>>()
+            .windows(3)
+            .any(|items| items == ["ipv4", "add", "route"]);
+    if !is_route_add {
+        return false;
+    }
+    let text = format!("{stdout}\n{stderr}").to_ascii_lowercase();
+    text.contains("already exists")
+        || text.contains("object already exists")
+        || text.contains("对象已存在")
+        || text.contains("已存在")
 }
 
 fn run_tunnel_loopback_test(
@@ -3905,9 +4368,60 @@ fn relay_packet_event(
     source: SocketAddr,
     observed_at_ms: u128,
 ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
-    let envelope: TunnelEnvelope = serde_json::from_slice(wire)?;
-    let payload = open_tunnel_payload(key, &envelope)?;
-    let request: serde_json::Value = serde_json::from_slice(&payload.plaintext)?;
+    let (request, packet_kind, sequence) = if let Some(packet) = parse_binary_udp_relay_packet(wire)
+    {
+        (
+            serde_json::json!({
+                "room_id": packet.room_id,
+                "from_peer_id": packet.from_peer_id,
+                "to_peer_id": packet.to_peer_id,
+            }),
+            if packet.kind == UDP_RELAY_BINARY_REGISTER {
+                "relay-register".to_owned()
+            } else {
+                "relay-udp-forward".to_owned()
+            },
+            0,
+        )
+    } else if let Ok(request) = serde_json::from_slice::<serde_json::Value>(wire) {
+        let kind = request
+            .get("kind")
+            .or_else(|| request.get("packetKind"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        if kind.starts_with("relay-") {
+            let packet_kind = request
+                .get("packet_kind")
+                .or_else(|| request.get("packetKind"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or(kind.as_str())
+                .to_owned();
+            let sequence = request
+                .get("sequence")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or_default();
+            (request, packet_kind, sequence)
+        } else {
+            let envelope: TunnelEnvelope = serde_json::from_slice(wire)?;
+            let payload = open_tunnel_payload(key, &envelope)?;
+            let request: serde_json::Value = serde_json::from_slice(&payload.plaintext)?;
+            (
+                request,
+                payload.metadata.packet_kind,
+                payload.metadata.sequence,
+            )
+        }
+    } else {
+        let envelope: TunnelEnvelope = serde_json::from_slice(wire)?;
+        let payload = open_tunnel_payload(key, &envelope)?;
+        let request: serde_json::Value = serde_json::from_slice(&payload.plaintext)?;
+        (
+            request,
+            payload.metadata.packet_kind,
+            payload.metadata.sequence,
+        )
+    };
     let request_room_id = request
         .get("room_id")
         .or_else(|| request.get("roomId"))
@@ -3936,8 +4450,8 @@ fn relay_packet_event(
             "expectedRoomId": room_id,
             "bytesReceived": received,
             "observedAtMs": observed_at_ms,
-            "packetKind": payload.metadata.packet_kind,
-            "sequence": payload.metadata.sequence,
+            "packetKind": packet_kind,
+            "sequence": sequence,
         }));
     }
     if from_peer_id.is_empty() {
@@ -3947,8 +4461,8 @@ fn relay_packet_event(
             "source": source.to_string(),
             "bytesReceived": received,
             "observedAtMs": observed_at_ms,
-            "packetKind": payload.metadata.packet_kind,
-            "sequence": payload.metadata.sequence,
+            "packetKind": packet_kind,
+            "sequence": sequence,
         }));
     }
     if !allowed_peers.is_empty() && !allowed_peers.contains(from_peer_id) {
@@ -3959,8 +4473,8 @@ fn relay_packet_event(
             "fromPeerId": from_peer_id,
             "bytesReceived": received,
             "observedAtMs": observed_at_ms,
-            "packetKind": payload.metadata.packet_kind,
-            "sequence": payload.metadata.sequence,
+            "packetKind": packet_kind,
+            "sequence": sequence,
         }));
     }
 
@@ -3973,8 +4487,8 @@ fn relay_packet_event(
             "knownPeerCount": peer_endpoints.len(),
             "bytesReceived": received,
             "observedAtMs": observed_at_ms,
-            "packetKind": payload.metadata.packet_kind,
-            "sequence": payload.metadata.sequence,
+            "packetKind": packet_kind,
+            "sequence": sequence,
         }));
     };
     if !allowed_peers.is_empty() && !allowed_peers.contains(to_peer_id) {
@@ -3987,8 +4501,8 @@ fn relay_packet_event(
             "knownPeerCount": peer_endpoints.len(),
             "bytesReceived": received,
             "observedAtMs": observed_at_ms,
-            "packetKind": payload.metadata.packet_kind,
-            "sequence": payload.metadata.sequence,
+            "packetKind": packet_kind,
+            "sequence": sequence,
         }));
     }
     let Some(target) = peer_endpoints.get(to_peer_id).copied() else {
@@ -4001,8 +4515,8 @@ fn relay_packet_event(
             "knownPeerCount": peer_endpoints.len(),
             "bytesReceived": received,
             "observedAtMs": observed_at_ms,
-            "packetKind": payload.metadata.packet_kind,
-            "sequence": payload.metadata.sequence,
+            "packetKind": packet_kind,
+            "sequence": sequence,
         }));
     };
     let sent = socket.send_to(wire, target)?;
@@ -4016,8 +4530,8 @@ fn relay_packet_event(
         "bytesReceived": received,
         "bytesSent": sent,
         "observedAtMs": observed_at_ms,
-        "packetKind": payload.metadata.packet_kind,
-        "sequence": payload.metadata.sequence,
+        "packetKind": packet_kind,
+        "sequence": sequence,
     }))
 }
 
@@ -4150,6 +4664,539 @@ fn relay_packet(
         serde_json::to_string(&body)?.as_bytes(),
     )?;
     serde_json::to_vec(&envelope).map_err(Into::into)
+}
+
+fn runtime_relay_register_packet(
+    room_id: &str,
+    local_peer_id: &str,
+) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    build_binary_udp_relay_packet(UDP_RELAY_BINARY_REGISTER, room_id, local_peer_id, None, &[])
+}
+
+fn runtime_http_relay_register(
+    server: &str,
+    room_id: &str,
+    local_peer_id: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    runtime_http_post_json(
+        &format!("{}/v1/relay/register", trim_trailing_slash_local(server)),
+        &serde_json::json!({
+            "room_id": room_id,
+            "peer_id": local_peer_id,
+        }),
+    )?;
+    Ok(())
+}
+
+fn runtime_http_relay_poll(
+    server: &str,
+    room_id: &str,
+    local_peer_id: &str,
+    timeout_ms: u64,
+) -> Result<Vec<(Vec<u8>, SocketAddr)>, Box<dyn std::error::Error>> {
+    let value = runtime_http_get_json(&format!(
+        "{}/v1/relay/poll?room_id={}&peer_id={}&timeout_ms={}",
+        trim_trailing_slash_local(server),
+        percent_encode_runtime(room_id),
+        percent_encode_runtime(local_peer_id),
+        timeout_ms
+    ))?;
+    let pseudo_peer = http_relay_pseudo_endpoint(server)?;
+    let now_ms = current_epoch_ms();
+    let packets = value
+        .get("packets")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|packet| runtime_http_relay_packet_is_fresh(packet, now_ms))
+        .map(|mut packet| {
+            if let Some(object) = packet.as_object_mut() {
+                object.insert("_relay_url".to_owned(), serde_json::json!(server));
+            }
+            serde_json::to_vec(&packet).map(|wire| (wire, pseudo_peer))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(packets)
+}
+
+fn runtime_http_relay_packet_is_fresh(packet: &serde_json::Value, now_ms: u128) -> bool {
+    let Some(received_at_ms) = packet
+        .get("receivedAtMs")
+        .and_then(serde_json::Value::as_u64)
+        .map(u128::from)
+    else {
+        return true;
+    };
+    now_ms.saturating_sub(received_at_ms) <= RUNTIME_HTTP_RELAY_PACKET_MAX_AGE_MS
+}
+
+impl RuntimeTcpRelayClient {
+    fn connect(
+        server_url: &str,
+        room_id: &str,
+        local_peer_id: &str,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let endpoint = tcp_relay_endpoint_from_http_url(server_url)?;
+        let mut stream = TcpStream::connect(endpoint)?;
+        stream.set_nodelay(true)?;
+        stream.write_all(b"LAI-TCP-RELAY/1\n")?;
+        write_tcp_relay_json_line(
+            &mut stream,
+            &serde_json::json!({
+                "kind": "tcp-register",
+                "room_id": room_id,
+                "peer_id": local_peer_id,
+                "sentAtMs": current_epoch_ms(),
+            }),
+        )?;
+        stream.set_nonblocking(true)?;
+        Ok(Self {
+            server_url: server_url.to_owned(),
+            stream,
+            read_buffer: Vec::new(),
+        })
+    }
+
+    fn send(
+        &mut self,
+        room_id: &str,
+        local_peer_id: &str,
+        target_peer_id: &str,
+        wire: &[u8],
+        packet_kind: &str,
+        sequence: u64,
+    ) -> Result<usize, Box<dyn std::error::Error>> {
+        write_tcp_relay_json_line(
+            &mut self.stream,
+            &serde_json::json!({
+                "kind": "tcp-forward",
+                "room_id": room_id,
+                "from_peer_id": local_peer_id,
+                "to_peer_id": target_peer_id,
+                "packet_kind": packet_kind,
+                "sequence": sequence,
+                "bytes": STANDARD_NO_PAD.encode(wire),
+                "sentAtMs": current_epoch_ms(),
+            }),
+        )?;
+        Ok(wire.len())
+    }
+
+    fn poll(&mut self) -> Result<Vec<Vec<u8>>, Box<dyn std::error::Error>> {
+        let mut temp = [0u8; 16_384];
+        loop {
+            match self.stream.read(&mut temp) {
+                Ok(0) => {
+                    return Err(invalid_input(format!(
+                        "TCP relay {} closed the connection",
+                        self.server_url
+                    ))
+                    .into())
+                }
+                Ok(read) => self.read_buffer.extend_from_slice(&temp[..read]),
+                Err(err) if err.kind() == ErrorKind::WouldBlock => break,
+                Err(err) if err.kind() == ErrorKind::Interrupted => continue,
+                Err(err) => return Err(err.into()),
+            }
+        }
+        let mut packets = Vec::new();
+        while let Some(position) = self.read_buffer.iter().position(|byte| *byte == b'\n') {
+            let line = self.read_buffer.drain(..=position).collect::<Vec<_>>();
+            let line = &line[..line.len().saturating_sub(1)];
+            if line.is_empty() {
+                continue;
+            }
+            let mut packet: serde_json::Value = match serde_json::from_slice(line) {
+                Ok(value) => value,
+                Err(_) => continue,
+            };
+            let kind = packet
+                .get("kind")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            if kind == "tcp-registered" {
+                continue;
+            }
+            if let Some(object) = packet.as_object_mut() {
+                object.insert(
+                    "_relay_tcp_url".to_owned(),
+                    serde_json::json!(self.server_url),
+                );
+            }
+            packets.push(serde_json::to_vec(&packet)?);
+        }
+        Ok(packets)
+    }
+}
+
+fn write_tcp_relay_json_line(
+    stream: &mut TcpStream,
+    value: &serde_json::Value,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut encoded = serde_json::to_vec(value)?;
+    encoded.push(b'\n');
+    stream.set_nonblocking(false)?;
+    let result = stream.write_all(&encoded);
+    stream.set_nonblocking(true)?;
+    result.map_err(Into::into)
+}
+
+fn register_runtime_relay_targets(
+    targets: &[RuntimeSendTarget],
+    tunnel_socket: &UdpSocket,
+    room_id: &str,
+    local_peer_id: &str,
+    tcp_relay_clients: &mut HashMap<String, RuntimeTcpRelayClient>,
+    last_error: &mut Option<String>,
+) {
+    for target in targets {
+        if let Some(server) = target.tcp_relay_url.as_deref() {
+            match RuntimeTcpRelayClient::connect(server, room_id, local_peer_id) {
+                Ok(client) => {
+                    tcp_relay_clients.insert(server.to_owned(), client);
+                }
+                Err(err) => {
+                    *last_error = Some(format!("Failed to connect TCP relay {}: {err}", server));
+                }
+            }
+        } else if let Some(server) = target.relay_url.as_deref() {
+            if let Err(err) = runtime_http_relay_register(server, room_id, local_peer_id) {
+                *last_error = Some(format!(
+                    "Failed to register HTTP relay {}: {err}",
+                    target.endpoint
+                ));
+            }
+        } else if target.is_relay() {
+            match runtime_relay_register_packet(room_id, local_peer_id) {
+                Ok(wire) => {
+                    if let Some(endpoint) = target.socket_endpoint {
+                        let _ = tunnel_socket.send_to(&wire, endpoint);
+                    }
+                }
+                Err(err) => {
+                    *last_error = Some(format!(
+                        "Failed to build relay registration for {}: {err}",
+                        target.endpoint
+                    ));
+                }
+            }
+        }
+    }
+}
+
+fn runtime_send_wire_to_target(
+    socket: &UdpSocket,
+    _key: &str,
+    room_id: &str,
+    local_peer_id: &str,
+    target: &RuntimeSendTarget,
+    wire: &[u8],
+    packet_kind: &str,
+    sequence: u64,
+    tcp_relay_clients: &mut HashMap<String, RuntimeTcpRelayClient>,
+) -> Result<usize, Box<dyn std::error::Error>> {
+    if let Some(server) = target.tcp_relay_url.as_deref() {
+        if !tcp_relay_clients.contains_key(server) {
+            let client = RuntimeTcpRelayClient::connect(server, room_id, local_peer_id)?;
+            tcp_relay_clients.insert(server.to_owned(), client);
+        }
+        tcp_relay_clients
+            .get_mut(server)
+            .ok_or_else(|| invalid_input(format!("TCP relay `{server}` is not connected")))?
+            .send(
+                room_id,
+                local_peer_id,
+                &target.peer_id,
+                wire,
+                packet_kind,
+                sequence,
+            )
+            .or_else(|_| {
+                tcp_relay_clients.remove(server);
+                let mut client = RuntimeTcpRelayClient::connect(server, room_id, local_peer_id)?;
+                let sent = client.send(
+                    room_id,
+                    local_peer_id,
+                    &target.peer_id,
+                    wire,
+                    packet_kind,
+                    sequence,
+                )?;
+                tcp_relay_clients.insert(server.to_owned(), client);
+                Ok(sent)
+            })
+    } else if let Some(server) = target.relay_url.as_deref() {
+        runtime_http_post_json(
+            &format!("{}/v1/relay/send", trim_trailing_slash_local(server)),
+            &serde_json::json!({
+                "room_id": room_id,
+                "from_peer_id": local_peer_id,
+                "to_peer_id": target.peer_id,
+                "bytes": STANDARD_NO_PAD.encode(wire),
+            }),
+        )?;
+        Ok(wire.len())
+    } else if target.is_relay() {
+        let relay_wire = build_binary_udp_relay_packet(
+            UDP_RELAY_BINARY_FORWARD,
+            room_id,
+            local_peer_id,
+            Some(&target.peer_id),
+            wire,
+        )?;
+        let endpoint = target.socket_endpoint.ok_or_else(|| {
+            invalid_input(format!(
+                "relay target `{}` is missing UDP endpoint",
+                target.endpoint
+            ))
+        })?;
+        socket.send_to(&relay_wire, endpoint).map_err(Into::into)
+    } else {
+        let endpoint = target.socket_endpoint.ok_or_else(|| {
+            invalid_input(format!(
+                "target `{}` is missing UDP endpoint",
+                target.endpoint
+            ))
+        })?;
+        socket.send_to(wire, endpoint).map_err(Into::into)
+    }
+}
+
+fn runtime_open_received_packet(
+    key: &str,
+    wire: &[u8],
+    peer: SocketAddr,
+) -> Option<RuntimeOpenedPacket> {
+    if let Some(packet) = parse_binary_udp_relay_packet(wire) {
+        if packet.kind == UDP_RELAY_BINARY_FORWARD {
+            let inner_envelope = serde_json::from_slice::<TunnelEnvelope>(&packet.payload).ok()?;
+            let inner_payload = open_tunnel_payload(key, &inner_envelope).ok()?;
+            return Some(RuntimeOpenedPacket {
+                payload: inner_payload,
+                relay: Some(RuntimeRelayPacketInfo {
+                    relay_endpoint: peer.to_string(),
+                    relay_socket_endpoint: Some(peer),
+                    relay_url: None,
+                    tcp_relay_url: None,
+                    from_peer_id: packet.from_peer_id,
+                }),
+            });
+        }
+    }
+    if let Ok(request) = serde_json::from_slice::<serde_json::Value>(wire) {
+        let kind = request
+            .get("kind")
+            .or_else(|| request.get("packetKind"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        if kind.starts_with("relay-") {
+            let bytes = request
+                .get("bytes")
+                .and_then(serde_json::Value::as_str)
+                .and_then(|encoded| STANDARD_NO_PAD.decode(encoded.as_bytes()).ok())?;
+            let inner_envelope = serde_json::from_slice::<TunnelEnvelope>(&bytes).ok()?;
+            let inner_payload = open_tunnel_payload(key, &inner_envelope).ok()?;
+            let from_peer_id = request
+                .get("from_peer_id")
+                .or_else(|| request.get("fromPeerId"))
+                .or_else(|| request.get("peer_id"))
+                .or_else(|| request.get("peerId"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown")
+                .to_owned();
+            let relay_url = request
+                .get("_relay_url")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned);
+            let tcp_relay_url = request
+                .get("_relay_tcp_url")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned);
+            return Some(RuntimeOpenedPacket {
+                payload: inner_payload,
+                relay: Some(RuntimeRelayPacketInfo {
+                    relay_endpoint: tcp_relay_url
+                        .clone()
+                        .or_else(|| relay_url.clone())
+                        .unwrap_or_else(|| peer.to_string()),
+                    relay_socket_endpoint: (relay_url.is_none() && tcp_relay_url.is_none())
+                        .then_some(peer),
+                    relay_url,
+                    tcp_relay_url,
+                    from_peer_id,
+                }),
+            });
+        }
+    }
+
+    let envelope = serde_json::from_slice::<TunnelEnvelope>(wire).ok()?;
+    let payload = open_tunnel_payload(key, &envelope).ok()?;
+    if payload.metadata.packet_kind.starts_with("relay-") {
+        let request: serde_json::Value = serde_json::from_slice(&payload.plaintext).ok()?;
+        let bytes = request
+            .get("bytes")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|encoded| STANDARD_NO_PAD.decode(encoded.as_bytes()).ok())?;
+        let inner_envelope = serde_json::from_slice::<TunnelEnvelope>(&bytes).ok()?;
+        let inner_payload = open_tunnel_payload(key, &inner_envelope).ok()?;
+        let from_peer_id = request
+            .get("from_peer_id")
+            .or_else(|| request.get("fromPeerId"))
+            .or_else(|| request.get("peer_id"))
+            .or_else(|| request.get("peerId"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown")
+            .to_owned();
+        return Some(RuntimeOpenedPacket {
+            payload: inner_payload,
+            relay: Some(RuntimeRelayPacketInfo {
+                relay_endpoint: peer.to_string(),
+                relay_socket_endpoint: Some(peer),
+                relay_url: None,
+                tcp_relay_url: None,
+                from_peer_id,
+            }),
+        });
+    }
+    Some(RuntimeOpenedPacket {
+        payload,
+        relay: None,
+    })
+}
+
+struct BinaryUdpRelayPacket {
+    kind: u8,
+    room_id: String,
+    from_peer_id: String,
+    to_peer_id: Option<String>,
+    payload: Vec<u8>,
+}
+
+fn build_binary_udp_relay_packet(
+    kind: u8,
+    room_id: &str,
+    from_peer_id: &str,
+    to_peer_id: Option<&str>,
+    payload: &[u8],
+) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let to_peer_id = to_peer_id.unwrap_or_default();
+    let room = room_id.as_bytes();
+    let from = from_peer_id.as_bytes();
+    let to = to_peer_id.as_bytes();
+    let room_len = u16::try_from(room.len())
+        .map_err(|_| invalid_input("room id is too long for UDP relay packet".to_owned()))?;
+    let from_len = u16::try_from(from.len())
+        .map_err(|_| invalid_input("peer id is too long for UDP relay packet".to_owned()))?;
+    let to_len = u16::try_from(to.len())
+        .map_err(|_| invalid_input("target peer id is too long for UDP relay packet".to_owned()))?;
+    let payload_len = u32::try_from(payload.len())
+        .map_err(|_| invalid_input("payload is too large for UDP relay packet".to_owned()))?;
+    let mut packet = Vec::with_capacity(
+        UDP_RELAY_BINARY_MAGIC.len()
+            + 1
+            + 2
+            + 2
+            + 2
+            + 4
+            + room.len()
+            + from.len()
+            + to.len()
+            + payload.len(),
+    );
+    packet.extend_from_slice(UDP_RELAY_BINARY_MAGIC);
+    packet.push(kind);
+    packet.extend_from_slice(&room_len.to_be_bytes());
+    packet.extend_from_slice(&from_len.to_be_bytes());
+    packet.extend_from_slice(&to_len.to_be_bytes());
+    packet.extend_from_slice(&payload_len.to_be_bytes());
+    packet.extend_from_slice(room);
+    packet.extend_from_slice(from);
+    packet.extend_from_slice(to);
+    packet.extend_from_slice(payload);
+    Ok(packet)
+}
+
+fn parse_binary_udp_relay_packet(wire: &[u8]) -> Option<BinaryUdpRelayPacket> {
+    let header_len = UDP_RELAY_BINARY_MAGIC.len() + 1 + 2 + 2 + 2 + 4;
+    if wire.len() < header_len || !wire.starts_with(UDP_RELAY_BINARY_MAGIC) {
+        return None;
+    }
+    let mut offset = UDP_RELAY_BINARY_MAGIC.len();
+    let kind = wire[offset];
+    offset += 1;
+    let room_len = u16::from_be_bytes([wire[offset], wire[offset + 1]]) as usize;
+    offset += 2;
+    let from_len = u16::from_be_bytes([wire[offset], wire[offset + 1]]) as usize;
+    offset += 2;
+    let to_len = u16::from_be_bytes([wire[offset], wire[offset + 1]]) as usize;
+    offset += 2;
+    let payload_len = u32::from_be_bytes([
+        wire[offset],
+        wire[offset + 1],
+        wire[offset + 2],
+        wire[offset + 3],
+    ]) as usize;
+    offset += 4;
+    let total_len = offset
+        .checked_add(room_len)?
+        .checked_add(from_len)?
+        .checked_add(to_len)?
+        .checked_add(payload_len)?;
+    if total_len != wire.len() {
+        return None;
+    }
+    let room_id = String::from_utf8(wire[offset..offset + room_len].to_vec()).ok()?;
+    offset += room_len;
+    let from_peer_id = String::from_utf8(wire[offset..offset + from_len].to_vec()).ok()?;
+    offset += from_len;
+    let to_peer_id = if to_len == 0 {
+        None
+    } else {
+        Some(String::from_utf8(wire[offset..offset + to_len].to_vec()).ok()?)
+    };
+    offset += to_len;
+    let payload = wire[offset..offset + payload_len].to_vec();
+    Some(BinaryUdpRelayPacket {
+        kind,
+        room_id,
+        from_peer_id,
+        to_peer_id,
+        payload,
+    })
+}
+
+fn runtime_reply_target(
+    plan: &RoomRuntimePlan,
+    observed_peer: SocketAddr,
+    relay: Option<&RuntimeRelayPacketInfo>,
+) -> RuntimeSendTarget {
+    if let Some(relay) = relay {
+        let peer_id = relay.from_peer_id.clone();
+        let connection_path = "relay".to_owned();
+        return RuntimeSendTarget {
+            peer_id,
+            endpoint: relay.relay_endpoint.clone(),
+            socket_endpoint: relay.relay_socket_endpoint,
+            relay_url: relay.relay_url.clone(),
+            tcp_relay_url: relay.tcp_relay_url.clone(),
+            connection_path,
+        };
+    }
+    let endpoint = observed_peer.to_string();
+    let peer = plan.peers.iter().find(|peer| peer.endpoint == endpoint);
+    RuntimeSendTarget {
+        peer_id: peer
+            .map(|peer| peer.peer_id.clone())
+            .unwrap_or_else(|| endpoint.clone()),
+        endpoint,
+        socket_endpoint: Some(observed_peer),
+        relay_url: None,
+        tcp_relay_url: None,
+        connection_path: peer
+            .map(|peer| peer.connection_path.clone())
+            .unwrap_or_else(|| "direct".to_owned()),
+    }
 }
 
 fn run_p2p_handshake_loopback_test(
@@ -4484,6 +5531,7 @@ fn run_room_runtime(
     expected_broadcast_ports: Vec<u16>,
     expected_game_ports: Vec<u16>,
     max_broadcast_packets_per_second: u16,
+    tunnel_socket_override: Option<UdpSocket>,
 ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
     let started_at_ms = current_epoch_ms();
     let started_at = Instant::now();
@@ -4498,9 +5546,14 @@ fn run_room_runtime(
         "enabled": wintun_runtime,
         "status": if wintun_runtime { "not-opened" } else { "disabled" },
     });
+    let mut wintun_adapter_config = serde_json::json!({
+        "enabled": packet_io_backend == "wintun" && wintun_runtime,
+        "status": if packet_io_backend == "wintun" && wintun_runtime { "not-run" } else { "disabled" },
+    });
     if packet_io_backend == "wintun" && wintun_runtime {
         match lai_core::open_wintun_packet_io_session(lai_core::WintunPacketIoConfig {
             adapter_name: packet_io_probe_options.wintun_adapter_name.clone(),
+            tunnel_type: "LocalAreaInterconnection".to_owned(),
             ring_capacity: packet_io_probe_options.wintun_ring_capacity,
         }) {
             Ok(session) => {
@@ -4509,6 +5562,30 @@ fn run_room_runtime(
                     "status": "session-opened",
                     "adapterName": packet_io_probe_options.wintun_adapter_name.clone(),
                     "ringCapacity": packet_io_probe_options.wintun_ring_capacity,
+                });
+                let adapter_plan = create_windows_virtual_adapter_plan(
+                    packet_io_probe_options.wintun_adapter_name.clone(),
+                    runtime_subnet_from_local_ip(plan.local_virtual_ip),
+                    plan.local_virtual_ip,
+                    1420,
+                    5,
+                );
+                let command_results = execute_network_commands(&adapter_plan.commands);
+                let config_ok = command_results
+                    .iter()
+                    .all(|record| record.status == CommandExecutionStatus::Succeeded);
+                wintun_adapter_config = serde_json::json!({
+                    "enabled": true,
+                    "status": if config_ok { "applied" } else { "failed" },
+                    "adapterName": adapter_plan.adapter_name,
+                    "assignedIp": adapter_plan.assigned_ip,
+                    "subnet": adapter_plan.virtual_subnet,
+                    "commands": command_results,
+                    "nextAction": if config_ok {
+                        "Continue with Wintun packet runtime."
+                    } else {
+                        "Run the desktop app as Administrator or inspect the netsh command error."
+                    },
                 });
                 wintun_packet_io = Some(session);
             }
@@ -4521,7 +5598,10 @@ fn run_room_runtime(
             }
         }
     }
-    let tunnel_socket = UdpSocket::bind(&plan.tunnel.bind_endpoint)?;
+    let tunnel_socket = match tunnel_socket_override {
+        Some(socket) => socket,
+        None => bind_runtime_tunnel_socket(&plan.tunnel.bind_endpoint)?,
+    };
     tunnel_socket.set_read_timeout(Some(Duration::from_millis(25)))?;
     let tunnel_endpoint = tunnel_socket.local_addr()?;
     let mut bytes_sent = 0u64;
@@ -4530,11 +5610,33 @@ fn run_room_runtime(
     let mut last_error = None;
 
     let mut capture_sockets = Vec::new();
+    let mut capture_bind_errors = Vec::new();
     for binding in &plan.capture_ports {
         if binding.protocol != "udp" {
             continue;
         }
-        let socket = UdpSocket::bind(format!("0.0.0.0:{}", binding.port))?;
+        let bind_endpoint = format!("0.0.0.0:{}", binding.port);
+        let socket = match UdpSocket::bind(&bind_endpoint) {
+            Ok(socket) => socket,
+            Err(err) => {
+                let message = format!(
+                    "Packet capture port bind failed for {} port {} ({}): {err}",
+                    binding.protocol, binding.port, binding.purpose
+                );
+                capture_bind_errors.push(serde_json::json!({
+                    "protocol": binding.protocol,
+                    "port": binding.port,
+                    "purpose": binding.purpose,
+                    "bind": bind_endpoint,
+                    "error": err.to_string(),
+                    "nextAction": "Close the app or game already using this UDP port, or change the game/broadcast port setting. The tunnel remains running."
+                }));
+                if last_error.is_none() {
+                    last_error = Some(message);
+                }
+                continue;
+            }
+        };
         socket.set_broadcast(true)?;
         socket.set_read_timeout(Some(Duration::from_millis(10)))?;
         let actual_port = socket.local_addr()?.port();
@@ -4564,6 +5666,11 @@ fn run_room_runtime(
         false,
         false,
     );
+    let runtime_route_evidence = runtime_route_evidence(
+        &packet_io_probe_options.wintun_adapter_name,
+        plan.local_virtual_ip,
+        packet_io_backend == "wintun" && wintun_runtime,
+    );
     let mut broadcast_gate = lai_core::BroadcastForwardGate::new(
         lai_core::BroadcastPolicy::with_limit(
             runtime_subnet_from_local_ip(plan.local_virtual_ip),
@@ -4573,11 +5680,12 @@ fn run_room_runtime(
         started_at_ms,
     );
     let mut broadcast_forward_events = Vec::new();
-    let forward_targets_by_port = runtime_forward_targets(
+    let mut forward_targets_by_port = runtime_forward_targets(
         plan,
         &actual_broadcast_ports,
         forward_self_probe,
         tunnel_endpoint,
+        false,
     )?;
     let inject_receiver = if inject_self_probe {
         let socket = UdpSocket::bind("127.0.0.1:0")?;
@@ -4596,12 +5704,36 @@ fn run_room_runtime(
             .map(UdpSocket::local_addr)
             .transpose()?
     };
-    let heartbeat_targets = runtime_heartbeat_targets(plan, self_probe, tunnel_endpoint)?;
+    let mut using_relay_fallback_targets = false;
+    let mut relay_fallback_events = Vec::new();
+    let mut heartbeat_targets =
+        runtime_heartbeat_targets(plan, self_probe, tunnel_endpoint, false)?;
+    let relay_registration_targets = runtime_heartbeat_targets(plan, false, tunnel_endpoint, true)?
+        .into_iter()
+        .filter(RuntimeSendTarget::is_relay)
+        .collect::<Vec<_>>();
+    let direct_probe_heartbeat_targets = runtime_direct_probe_heartbeat_targets(plan)?
+        .into_iter()
+        .filter(|target| !target.is_relay())
+        .collect::<Vec<_>>();
+    let heartbeat_targets_include_relay =
+        |targets: &[RuntimeSendTarget]| targets.iter().any(RuntimeSendTarget::is_relay);
+    let mut tcp_relay_clients = HashMap::<String, RuntimeTcpRelayClient>::new();
+    register_runtime_relay_targets(
+        &relay_registration_targets,
+        &tunnel_socket,
+        &plan.room_id,
+        &plan.local_peer_id,
+        &mut tcp_relay_clients,
+        &mut last_error,
+    );
     let heartbeat_interval =
         (heartbeat_interval_ms > 0).then(|| Duration::from_millis(heartbeat_interval_ms));
     let peer_timeout = (peer_timeout_ms > 0).then(|| Duration::from_millis(peer_timeout_ms));
     let deadline = (duration_ms > 0).then(|| started_at + Duration::from_millis(duration_ms));
     let mut next_heartbeat_at = started_at;
+    let mut next_relay_registration_at =
+        started_at + Duration::from_millis(RUNTIME_RELAY_REGISTRATION_INTERVAL_MS);
     let mut next_snapshot_at =
         snapshot_interval_ms.map(|interval_ms| started_at + Duration::from_millis(interval_ms));
     let coordination_monitor_interval = coordination_monitor
@@ -4635,10 +5767,20 @@ fn run_room_runtime(
     let mut injected_packets = Vec::new();
     let mut injected_received_packets = Vec::new();
     let mut raw_virtual_packets = Vec::new();
+    let mut icmp_echo_replies = Vec::new();
+    let mut icmp_echo_requests = Vec::new();
     let mut wintun_runtime_received_packets = Vec::new();
     let mut wintun_runtime_sent_packets = Vec::new();
     let mut wintun_runtime_errors = Vec::new();
     let mut buffer = vec![0u8; 65_535];
+    let mut http_relay_packets = VecDeque::<(Vec<u8>, SocketAddr)>::new();
+    let http_relay_servers = heartbeat_targets
+        .iter()
+        .filter(|target| target.tcp_relay_url.is_none())
+        .filter_map(|target| target.relay_url.clone())
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
 
     loop {
         let now = Instant::now();
@@ -4655,8 +5797,50 @@ fn run_room_runtime(
             }
         }
 
+        for server in &http_relay_servers {
+            match runtime_http_relay_poll(server, &plan.room_id, &plan.local_peer_id, 50) {
+                Ok(packets) => {
+                    for packet in packets {
+                        http_relay_packets.push_back(packet);
+                    }
+                }
+                Err(err) => {
+                    last_error = Some(format!("HTTP relay poll failed for {server}: {err}"));
+                }
+            }
+        }
+        let mut disconnected_tcp_relays = Vec::new();
+        for (server, client) in tcp_relay_clients.iter_mut() {
+            match client.poll() {
+                Ok(packets) => {
+                    let pseudo_peer = http_relay_pseudo_endpoint(server)?;
+                    for packet in packets {
+                        http_relay_packets.push_back((packet, pseudo_peer));
+                    }
+                }
+                Err(err) => {
+                    last_error = Some(format!("TCP relay poll failed for {server}: {err}"));
+                    disconnected_tcp_relays.push(server.clone());
+                }
+            }
+        }
+        for server in disconnected_tcp_relays {
+            tcp_relay_clients.remove(&server);
+        }
+
         if heartbeat_interval.is_some() && now >= next_heartbeat_at {
-            for target in &heartbeat_targets {
+            let heartbeat_targets_for_tick = if using_relay_fallback_targets
+                || heartbeat_targets_include_relay(&heartbeat_targets)
+            {
+                heartbeat_targets
+                    .iter()
+                    .chain(direct_probe_heartbeat_targets.iter())
+                    .cloned()
+                    .collect::<Vec<_>>()
+            } else {
+                heartbeat_targets.clone()
+            };
+            for target in &heartbeat_targets_for_tick {
                 let sequence = heartbeat_packets.len() as u64 + 1;
                 let sent_at_ms = current_epoch_ms();
                 let heartbeat = serde_json::json!({
@@ -4675,11 +5859,23 @@ fn run_room_runtime(
                     serde_json::to_string(&heartbeat)?.as_bytes(),
                 )?;
                 let wire = serde_json::to_vec(&envelope)?;
-                match tunnel_socket.send_to(&wire, target) {
+                match runtime_send_wire_to_target(
+                    &tunnel_socket,
+                    key,
+                    &plan.room_id,
+                    &plan.local_peer_id,
+                    target,
+                    &wire,
+                    "runtime-heartbeat",
+                    sequence,
+                    &mut tcp_relay_clients,
+                ) {
                     Ok(sent) => {
                         bytes_sent += sent as u64;
                         heartbeat_packets.push(serde_json::json!({
-                            "target": target.to_string(),
+                            "target": target.endpoint,
+                            "targetPeerId": target.peer_id,
+                            "connectionPath": target.connection_path,
                             "bytesSent": sent,
                             "sequence": sequence,
                             "sentAtMs": sent_at_ms,
@@ -4687,7 +5883,8 @@ fn run_room_runtime(
                     }
                     Err(err) => {
                         last_error = Some(format!(
-                            "Failed to send runtime heartbeat to {target}: {err}"
+                            "Failed to send runtime heartbeat to {}: {err}",
+                            target.endpoint
                         ));
                     }
                 }
@@ -4695,6 +5892,19 @@ fn run_room_runtime(
             if let Some(interval) = heartbeat_interval {
                 next_heartbeat_at = now + interval;
             }
+        }
+
+        if now >= next_relay_registration_at {
+            register_runtime_relay_targets(
+                &relay_registration_targets,
+                &tunnel_socket,
+                &plan.room_id,
+                &plan.local_peer_id,
+                &mut tcp_relay_clients,
+                &mut last_error,
+            );
+            next_relay_registration_at =
+                now + Duration::from_millis(RUNTIME_RELAY_REGISTRATION_INTERVAL_MS);
         }
 
         if let (Some(path), Some(interval_ms), Some(next_snapshot)) =
@@ -4707,6 +5917,7 @@ fn run_room_runtime(
                     "startedAtMs": started_at_ms,
                     "updatedAtMs": current_epoch_ms(),
                     "actualTunnelEndpoint": tunnel_endpoint_text.clone(),
+                    "captureBindErrors": capture_bind_errors.clone(),
                     "bytesSent": bytes_sent,
                     "bytesReceived": bytes_received,
                     "heartbeatPacketsSent": heartbeat_packets.len(),
@@ -4720,6 +5931,16 @@ fn run_room_runtime(
                     "injectedPacketCount": injected_packets.len(),
                     "wintunRuntimeReceivedPacketCount": wintun_runtime_received_packets.len(),
                     "wintunRuntimeSentPacketCount": wintun_runtime_sent_packets.len(),
+                    "packetPathCounters": runtime_packet_path_counters(
+                        &tunnel_packets,
+                        &forwarded_packets,
+                        &raw_virtual_packets,
+                        &icmp_echo_replies,
+                        &icmp_echo_requests,
+                        &wintun_runtime_received_packets,
+                        &wintun_runtime_sent_packets,
+                        &injected_packets,
+                    ),
                     "packetIoProbe": packet_io_probe.clone(),
                     "adapterWriteStatus": packet_io_probe["adapterWriteStatus"].clone(),
                     "adapterReadStatus": packet_io_probe["adapterReadStatus"].clone(),
@@ -4736,6 +5957,16 @@ fn run_room_runtime(
                         Some(tunnel_endpoint_text.as_str()),
                     ),
                     "coordinationMonitorReports": coordination_monitor_reports.clone(),
+                    "relayFallbackActive": using_relay_fallback_targets,
+                    "relayFallbackEvents": relay_fallback_events.clone(),
+                    "relayRegistrationTargets": relay_registration_targets.iter().map(|target| {
+                        serde_json::json!({
+                            "peerId": target.peer_id,
+                            "endpoint": target.endpoint,
+                            "connectionPath": target.connection_path,
+                        })
+                    }).collect::<Vec<_>>(),
+                    "runtimeRouteEvidence": runtime_route_evidence.clone(),
                     "lastError": last_error.clone(),
                 });
                 write_json_file(path, &tick)?;
@@ -4804,22 +6035,146 @@ fn run_room_runtime(
                     last_error = Some(format!(
                         "No runtime tunnel packets were received from configured peers within {peer_timeout_ms}ms."
                     ));
+                    if !using_relay_fallback_targets
+                        && plan.peers.iter().any(|peer| {
+                            peer.fallback_endpoint
+                                .as_deref()
+                                .map(str::trim)
+                                .is_some_and(|endpoint| !endpoint.is_empty())
+                        })
+                    {
+                        using_relay_fallback_targets = true;
+                        heartbeat_targets =
+                            runtime_heartbeat_targets(plan, self_probe, tunnel_endpoint, true)?;
+                        forward_targets_by_port = runtime_forward_targets(
+                            plan,
+                            &actual_broadcast_ports,
+                            forward_self_probe,
+                            tunnel_endpoint,
+                            true,
+                        )?;
+                        register_runtime_relay_targets(
+                            &heartbeat_targets,
+                            &tunnel_socket,
+                            &plan.room_id,
+                            &plan.local_peer_id,
+                            &mut tcp_relay_clients,
+                            &mut last_error,
+                        );
+                        relay_fallback_events.push(serde_json::json!({
+                            "status": "activated",
+                            "reason": "peer-timeout",
+                            "activatedAtMs": current_epoch_ms(),
+                            "peerTimeoutMs": peer_timeout_ms,
+                            "targets": heartbeat_targets.iter().map(|target| {
+                                serde_json::json!({
+                                    "peerId": target.peer_id,
+                                    "endpoint": target.endpoint,
+                                    "connectionPath": target.connection_path,
+                                })
+                            }).collect::<Vec<_>>(),
+                        }));
+                    }
                 }
             }
         }
 
-        match tunnel_socket.recv_from(&mut buffer) {
-            Ok((received, peer)) => {
+        let received_packet = if let Some((wire, peer)) = http_relay_packets.pop_front() {
+            Ok((wire.len(), peer, wire))
+        } else {
+            match tunnel_socket.recv_from(&mut buffer) {
+                Ok((received, peer)) => Ok((received, peer, buffer[..received].to_vec())),
+                Err(err) => Err(err),
+            }
+        };
+        match received_packet {
+            Ok((received, peer, wire)) => {
                 bytes_received += received as u64;
-                match serde_json::from_slice::<TunnelEnvelope>(&buffer[..received])
-                    .ok()
-                    .and_then(|envelope| open_tunnel_payload(key, &envelope).ok())
-                {
-                    Some(payload) => {
+                match runtime_open_received_packet(key, &wire, peer) {
+                    Some(opened) => {
+                        let payload = opened.payload;
+                        let observed_peer = opened
+                            .relay
+                            .as_ref()
+                            .and_then(|relay| relay.relay_socket_endpoint)
+                            .unwrap_or(peer);
+                        let observed_peer_text = opened
+                            .relay
+                            .as_ref()
+                            .map(|relay| relay.relay_endpoint.clone())
+                            .unwrap_or_else(|| peer.to_string());
+                        let observed_peer_id = opened
+                            .relay
+                            .as_ref()
+                            .map(|relay| relay.from_peer_id.clone());
+                        let observed_runtime_peer = runtime_observed_configured_peer(
+                            plan,
+                            observed_peer,
+                            observed_peer_id.as_deref(),
+                            opened.relay.is_some(),
+                        );
+                        let self_probe_endpoint =
+                            loopback_endpoint_for_bound_socket(tunnel_endpoint);
+                        let observed_remote_peer = observed_runtime_peer.is_some()
+                            && observed_peer != self_probe_endpoint
+                            && observed_peer_id.as_deref().is_none_or(|peer_id| {
+                                peer_id != "self-probe" && peer_id != plan.local_peer_id
+                            });
                         let received_at_ms = current_epoch_ms();
-                        last_peer_packet_at = Some(Instant::now());
-                        peer_timed_out = false;
-                        connected_peer_count = connected_peer_count.max(1);
+                        if opened.relay.is_none()
+                            && using_relay_fallback_targets
+                            && observed_remote_peer
+                        {
+                            using_relay_fallback_targets = false;
+                            heartbeat_targets = runtime_direct_heartbeat_targets(
+                                plan,
+                                self_probe,
+                                tunnel_endpoint,
+                            )?;
+                            forward_targets_by_port = runtime_direct_forward_targets(
+                                plan,
+                                &actual_broadcast_ports,
+                                forward_self_probe,
+                                tunnel_endpoint,
+                            )?;
+                            relay_fallback_events.push(serde_json::json!({
+                                "status": "restored-direct",
+                                "reason": "direct-packet-received",
+                                "restoredAtMs": received_at_ms,
+                                "endpoint": peer.to_string(),
+                            }));
+                        }
+                        let was_peer_timed_out = peer_timed_out;
+                        if observed_remote_peer {
+                            last_peer_packet_at = Some(Instant::now());
+                            peer_timed_out = false;
+                            if using_relay_fallback_targets {
+                                if last_error.as_deref().is_some_and(|error| {
+                                    error.starts_with("No runtime tunnel packets were received")
+                                        || error == "Runtime tunnel peer timed out before the runtime stopped."
+                                }) {
+                                    last_error = None;
+                                }
+                            } else if last_error.as_deref().is_some_and(|error| {
+                                error.starts_with("No runtime tunnel packets were received")
+                                    || error
+                                        == "Runtime tunnel peer timed out before the runtime stopped."
+                            }) {
+                                last_error = None;
+                            }
+                            if was_peer_timed_out {
+                                if using_relay_fallback_targets {
+                                    relay_fallback_events.push(serde_json::json!({
+                                        "status": "recovered",
+                                        "reason": "packet-received",
+                                        "recoveredAtMs": received_at_ms,
+                                        "peerId": observed_peer_id.clone(),
+                                        "endpoint": observed_peer_text,
+                                    }));
+                                }
+                            }
+                            connected_peer_count = connected_peer_count.max(1);
+                        }
                         if payload.metadata.packet_kind == "runtime-heartbeat" {
                             match runtime_heartbeat_ack_payload(
                                 plan,
@@ -4836,12 +6191,29 @@ fn run_room_runtime(
                                         serde_json::to_string(&ack_payload)?.as_bytes(),
                                     )?;
                                     let wire = serde_json::to_vec(&envelope)?;
-                                    match tunnel_socket.send_to(&wire, peer) {
+                                    let ack_target = runtime_reply_target(
+                                        plan,
+                                        observed_peer,
+                                        opened.relay.as_ref(),
+                                    );
+                                    match runtime_send_wire_to_target(
+                                        &tunnel_socket,
+                                        key,
+                                        &plan.room_id,
+                                        &plan.local_peer_id,
+                                        &ack_target,
+                                        &wire,
+                                        "runtime-heartbeat-ack",
+                                        acked_sequence,
+                                        &mut tcp_relay_clients,
+                                    ) {
                                         Ok(sent) => {
                                             bytes_sent += sent as u64;
                                             heartbeat_ack_packets.push(serde_json::json!({
                                                 "direction": "sent",
-                                                "target": peer.to_string(),
+                                                "target": ack_target.endpoint,
+                                                "targetPeerId": ack_target.peer_id,
+                                                "connectionPath": ack_target.connection_path,
                                                 "bytesSent": sent,
                                                 "ackedSequence": acked_sequence,
                                                 "heartbeatSentAtMs": heartbeat_sent_at_ms,
@@ -4851,7 +6223,8 @@ fn run_room_runtime(
                                         }
                                         Err(err) => {
                                             last_error = Some(format!(
-                                                "Failed to send runtime heartbeat ack to {peer}: {err}"
+                                                "Failed to send runtime heartbeat ack to {}: {err}",
+                                                ack_target.endpoint
                                             ));
                                         }
                                     }
@@ -4863,12 +6236,23 @@ fn run_room_runtime(
                             }
                         } else if payload.metadata.packet_kind == "runtime-heartbeat-ack" {
                             match runtime_heartbeat_ack_observation(
-                                peer,
+                                observed_peer,
                                 received,
                                 &payload.plaintext,
                                 received_at_ms,
                             ) {
-                                Ok(ack) => heartbeat_ack_packets.push(ack),
+                                Ok(mut ack) => {
+                                    if let Some(peer_id) = observed_peer_id.as_deref() {
+                                        ack["peerId"] = serde_json::json!(peer_id);
+                                    }
+                                    ack["connectionPath"] =
+                                        serde_json::json!(if opened.relay.is_some() {
+                                            "relay"
+                                        } else {
+                                            "direct"
+                                        });
+                                    heartbeat_ack_packets.push(ack);
+                                }
                                 Err(err) => {
                                     last_error = Some(format!(
                                         "Failed to decode runtime heartbeat ack: {err}"
@@ -4963,14 +6347,65 @@ fn run_room_runtime(
                                             "broadcast": summary.broadcast,
                                         }));
                                     }
-                                    if let (Some(session), Some(raw_bytes), Some(summary)) = (
-                                        wintun_packet_io.as_mut(),
-                                        forward_data.raw_ipv4_packet_bytes.as_ref(),
-                                        forward_data.raw_ipv4_summary.as_ref(),
-                                    ) {
-                                        match session.send_ipv4_packet(raw_bytes) {
-                                            Ok(bytes_sent_to_adapter) => {
-                                                wintun_runtime_sent_packets.push(
+                                    let mut handled_icmp_echo_request = false;
+                                    if let Some(raw_bytes) =
+                                        forward_data.raw_ipv4_packet_bytes.as_ref()
+                                    {
+                                        if let Ok(request) =
+                                            lai_core::parse_ipv4_icmp_echo_request(raw_bytes)
+                                        {
+                                            icmp_echo_requests.push(serde_json::json!({
+                                                "direction": "tunnel-to-runtime",
+                                                "peer": observed_peer_text,
+                                                "peerId": observed_peer_id,
+                                                "connectionPath": if opened.relay.is_some() { "relay" } else { "direct" },
+                                                "sourceIp": request.source_ip,
+                                                "destinationIp": request.destination_ip,
+                                                "identifier": request.identifier,
+                                                "sequence": request.sequence,
+                                                "payloadBytes": request.payload.len(),
+                                                "receivedAtMs": received_at_ms,
+                                            }));
+                                        }
+                                        let reply_target = runtime_reply_target(
+                                            plan,
+                                            observed_peer,
+                                            opened.relay.as_ref(),
+                                        );
+                                        let sequence = forwarded_packets.len() as u64 + 1;
+                                        match runtime_send_icmp_echo_reply(
+                                            &tunnel_socket,
+                                            key,
+                                            plan,
+                                            &reply_target,
+                                            raw_bytes,
+                                            sequence,
+                                            &mut tcp_relay_clients,
+                                        ) {
+                                            Ok(Some((sent, reply_event, forwarded_event))) => {
+                                                handled_icmp_echo_request = true;
+                                                bytes_sent += sent as u64;
+                                                icmp_echo_replies.push(reply_event);
+                                                forwarded_packets.push(forwarded_event);
+                                            }
+                                            Ok(None) => {}
+                                            Err(err) => {
+                                                last_error = Some(format!(
+                                                    "Failed to send ICMP echo reply to {}: {err}",
+                                                    reply_target.endpoint
+                                                ));
+                                            }
+                                        }
+                                    }
+                                    if !handled_icmp_echo_request {
+                                        if let (Some(session), Some(raw_bytes), Some(summary)) = (
+                                            wintun_packet_io.as_mut(),
+                                            forward_data.raw_ipv4_packet_bytes.as_ref(),
+                                            forward_data.raw_ipv4_summary.as_ref(),
+                                        ) {
+                                            match session.send_ipv4_packet(raw_bytes) {
+                                                Ok(bytes_sent_to_adapter) => {
+                                                    wintun_runtime_sent_packets.push(
                                                     serde_json::json!({
                                                         "direction": "tunnel-to-adapter",
                                                         "protocol": summary.protocol.clone(),
@@ -4981,13 +6416,14 @@ fn run_room_runtime(
                                                         "broadcast": summary.broadcast,
                                                     }),
                                                 );
-                                            }
-                                            Err(err) => {
-                                                let message = format!(
+                                                }
+                                                Err(err) => {
+                                                    let message = format!(
                                                     "Failed to write raw IPv4 packet to Wintun: {err}"
                                                 );
-                                                last_error = Some(message.clone());
-                                                wintun_runtime_errors.push(message);
+                                                    last_error = Some(message.clone());
+                                                    wintun_runtime_errors.push(message);
+                                                }
                                             }
                                         }
                                     }
@@ -5020,7 +6456,9 @@ fn run_room_runtime(
                             }
                         }
                         tunnel_packets.push(serde_json::json!({
-                            "peer": peer.to_string(),
+                            "peer": observed_peer_text,
+                            "peerId": observed_peer_id,
+                            "connectionPath": if opened.relay.is_some() { "relay" } else { "direct" },
                             "bytes": received,
                             "kind": payload.metadata.packet_kind,
                             "sequence": payload.metadata.sequence,
@@ -5072,18 +6510,28 @@ fn run_room_runtime(
                         bytes: received as u32,
                     });
                     if broadcast {
+                        let source_ip = socket_addr_ipv4(source);
+                        let forward_capture_broadcast = source_ip == plan.local_virtual_ip
+                            || (forward_self_probe && source_ip == Ipv4Addr::LOCALHOST);
                         let targets = forward_targets_by_port
                             .iter()
                             .find(|(forward_port, _)| forward_port == port)
                             .map(|(_, targets)| targets.as_slice())
                             .unwrap_or(&[]);
+                        let targets = if forward_capture_broadcast {
+                            targets
+                        } else {
+                            &[]
+                        };
                         broadcast_forward_events.push(lai_core::BroadcastForwardEvent {
                             protocol: "udp".to_owned(),
-                            source_ip: socket_addr_ipv4(source),
+                            source_ip,
                             destination_ip: socket_addr_ipv4(destination),
                             destination_port: destination.port(),
                             forwarded: !targets.is_empty(),
-                            reason: if targets.is_empty() {
+                            reason: if !forward_capture_broadcast {
+                                "remote-source-loop-prevention".to_owned()
+                            } else if targets.is_empty() {
                                 "no-forward-targets".to_owned()
                             } else {
                                 "userspace-capture-forwarded".to_owned()
@@ -5145,11 +6593,24 @@ fn run_room_runtime(
                                 serde_json::to_string(&forward_payload)?.as_bytes(),
                             )?;
                             let wire = serde_json::to_vec(&envelope)?;
-                            match tunnel_socket.send_to(&wire, target) {
+                            let sequence = forwarded_packets.len() as u64 + 1;
+                            match runtime_send_wire_to_target(
+                                &tunnel_socket,
+                                key,
+                                &plan.room_id,
+                                &plan.local_peer_id,
+                                target,
+                                &wire,
+                                "runtime-udp-forward",
+                                sequence,
+                                &mut tcp_relay_clients,
+                            ) {
                                 Ok(sent) => {
                                     bytes_sent += sent as u64;
                                     forwarded_packets.push(serde_json::json!({
-                                        "target": target.to_string(),
+                                        "target": target.endpoint,
+                                        "targetPeerId": target.peer_id,
+                                        "connectionPath": target.connection_path,
                                         "source": source.to_string(),
                                         "destination": destination.to_string(),
                                         "bytesSent": sent,
@@ -5160,7 +6621,8 @@ fn run_room_runtime(
                                 }
                                 Err(err) => {
                                     last_error = Some(format!(
-                                        "Failed to forward UDP packet to {target}: {err}"
+                                        "Failed to forward UDP packet to {}: {err}",
+                                        target.endpoint
                                     ));
                                 }
                             }
@@ -5204,7 +6666,16 @@ fn run_room_runtime(
                                 packet_count: 1,
                                 bytes: udp_packet.payload.len() as u32,
                             });
-                            let (broadcast_decision, should_forward_udp) = if udp_packet.broadcast {
+                            let udp_drop_reason = if udp_packet.source_ip != plan.local_virtual_ip {
+                                Some("remote-source-loop-prevention")
+                            } else {
+                                runtime_wintun_udp_drop_reason(udp_packet)
+                            };
+                            let (broadcast_decision, should_forward_udp) = if udp_drop_reason
+                                .is_some()
+                            {
+                                (None, false)
+                            } else if udp_packet.broadcast {
                                 let packet = lai_core::BroadcastPacket {
                                     protocol: "udp".to_owned(),
                                     source_ip: udp_packet.source_ip,
@@ -5247,6 +6718,7 @@ fn run_room_runtime(
                                 "broadcast": udp_packet.broadcast,
                                 "forwarded": should_forward_udp,
                                 "broadcastDecision": broadcast_decision,
+                                "dropReason": udp_drop_reason,
                             }));
 
                             let udp_forward_targets = if should_forward_udp {
@@ -5278,11 +6750,24 @@ fn run_room_runtime(
                                     serde_json::to_string(&forward_payload)?.as_bytes(),
                                 )?;
                                 let wire = serde_json::to_vec(&envelope)?;
-                                match tunnel_socket.send_to(&wire, target) {
+                                let sequence = forwarded_packets.len() as u64 + 1;
+                                match runtime_send_wire_to_target(
+                                    &tunnel_socket,
+                                    key,
+                                    &plan.room_id,
+                                    &plan.local_peer_id,
+                                    target,
+                                    &wire,
+                                    "runtime-udp-forward",
+                                    sequence,
+                                    &mut tcp_relay_clients,
+                                ) {
                                     Ok(sent) => {
                                         bytes_sent += sent as u64;
                                         forwarded_packets.push(serde_json::json!({
-                                            "target": target.to_string(),
+                                            "target": target.endpoint,
+                                            "targetPeerId": target.peer_id,
+                                            "connectionPath": target.connection_path,
                                             "source": format!("{}:{}", udp_packet.source_ip, udp_packet.source_port),
                                             "destination": format!("{}:{}", udp_packet.destination_ip, udp_packet.destination_port),
                                             "bytesSent": sent,
@@ -5294,7 +6779,8 @@ fn run_room_runtime(
                                     }
                                     Err(err) => {
                                         last_error = Some(format!(
-                                            "Failed to forward Wintun packet to {target}: {err}"
+                                            "Failed to forward Wintun packet to {}: {err}",
+                                            target.endpoint
                                         ));
                                     }
                                 }
@@ -5319,6 +6805,13 @@ fn run_room_runtime(
                                 packet_count: 1,
                                 bytes: tcp_packet.payload.len() as u32,
                             });
+                            let tcp_drop_reason = if tcp_packet.source_ip != plan.local_virtual_ip {
+                                Some("remote-source-loop-prevention")
+                            } else {
+                                runtime_wintun_tcp_drop_reason(tcp_packet)
+                            };
+                            let should_forward_tcp =
+                                tcp_drop_reason.is_none() && !heartbeat_targets.is_empty();
                             wintun_runtime_received_packets.push(serde_json::json!({
                                 "packetIndex": packet_index,
                                 "protocol": "tcp",
@@ -5329,10 +6822,16 @@ fn run_room_runtime(
                                 "destinationPort": tcp_packet.destination_port,
                                 "payloadBytes": tcp_packet.payload.len(),
                                 "flags": tcp_packet.flags,
-                                "forwarded": !heartbeat_targets.is_empty(),
+                                "forwarded": should_forward_tcp,
+                                "dropReason": tcp_drop_reason,
                             }));
 
-                            for target in &heartbeat_targets {
+                            let tcp_forward_targets = if should_forward_tcp {
+                                heartbeat_targets.as_slice()
+                            } else {
+                                &[]
+                            };
+                            for target in tcp_forward_targets {
                                 let forward_payload = serde_json::json!({
                                     "room_id": plan.room_id,
                                     "peer_id": plan.local_peer_id,
@@ -5357,11 +6856,24 @@ fn run_room_runtime(
                                     serde_json::to_string(&forward_payload)?.as_bytes(),
                                 )?;
                                 let wire = serde_json::to_vec(&envelope)?;
-                                match tunnel_socket.send_to(&wire, target) {
+                                let sequence = forwarded_packets.len() as u64 + 1;
+                                match runtime_send_wire_to_target(
+                                    &tunnel_socket,
+                                    key,
+                                    &plan.room_id,
+                                    &plan.local_peer_id,
+                                    target,
+                                    &wire,
+                                    "runtime-ipv4-forward",
+                                    sequence,
+                                    &mut tcp_relay_clients,
+                                ) {
                                     Ok(sent) => {
                                         bytes_sent += sent as u64;
                                         forwarded_packets.push(serde_json::json!({
-                                            "target": target.to_string(),
+                                            "target": target.endpoint,
+                                            "targetPeerId": target.peer_id,
+                                            "connectionPath": target.connection_path,
                                             "source": format!("{}:{}", tcp_packet.source_ip, tcp_packet.source_port),
                                             "destination": format!("{}:{}", tcp_packet.destination_ip, tcp_packet.destination_port),
                                             "bytesSent": sent,
@@ -5374,13 +6886,38 @@ fn run_room_runtime(
                                     }
                                     Err(err) => {
                                         last_error = Some(format!(
-                                            "Failed to forward Wintun TCP packet to {target}: {err}"
+                                            "Failed to forward Wintun TCP packet to {}: {err}",
+                                            target.endpoint
                                         ));
                                     }
                                 }
                             }
                         }
                         (_, _, Some(summary)) => {
+                            let ipv4_drop_reason = if summary.source_ip != plan.local_virtual_ip {
+                                Some("remote-source-loop-prevention")
+                            } else {
+                                runtime_wintun_ipv4_drop_reason(summary)
+                            };
+                            let should_forward_ipv4 =
+                                ipv4_drop_reason.is_none() && !heartbeat_targets.is_empty();
+                            if should_forward_ipv4
+                                && summary.protocol == "icmp"
+                                && lai_core::parse_ipv4_icmp_echo_request(&packet.bytes).is_ok()
+                            {
+                                let request = lai_core::parse_ipv4_icmp_echo_request(&packet.bytes)
+                                    .map_err(invalid_input)?;
+                                icmp_echo_requests.push(serde_json::json!({
+                                    "direction": "adapter-to-tunnel",
+                                    "sourceIp": request.source_ip,
+                                    "destinationIp": request.destination_ip,
+                                    "identifier": request.identifier,
+                                    "sequence": request.sequence,
+                                    "payloadBytes": request.payload.len(),
+                                    "forwarded": true,
+                                    "sentAtMs": current_epoch_ms(),
+                                }));
+                            }
                             wintun_runtime_received_packets.push(serde_json::json!({
                                 "packetIndex": packet_index,
                                 "protocol": summary.protocol.clone(),
@@ -5389,10 +6926,16 @@ fn run_room_runtime(
                                 "sourceIp": summary.source_ip,
                                 "destinationIp": summary.destination_ip,
                                 "payloadBytes": summary.payload_bytes,
-                                "forwarded": !heartbeat_targets.is_empty(),
+                                "forwarded": should_forward_ipv4,
+                                "dropReason": ipv4_drop_reason,
                             }));
 
-                            for target in &heartbeat_targets {
+                            let ipv4_forward_targets = if should_forward_ipv4 {
+                                heartbeat_targets.as_slice()
+                            } else {
+                                &[]
+                            };
+                            for target in ipv4_forward_targets {
                                 let forward_payload = serde_json::json!({
                                     "room_id": plan.room_id,
                                     "peer_id": plan.local_peer_id,
@@ -5414,11 +6957,24 @@ fn run_room_runtime(
                                     serde_json::to_string(&forward_payload)?.as_bytes(),
                                 )?;
                                 let wire = serde_json::to_vec(&envelope)?;
-                                match tunnel_socket.send_to(&wire, target) {
+                                let sequence = forwarded_packets.len() as u64 + 1;
+                                match runtime_send_wire_to_target(
+                                    &tunnel_socket,
+                                    key,
+                                    &plan.room_id,
+                                    &plan.local_peer_id,
+                                    target,
+                                    &wire,
+                                    "runtime-ipv4-forward",
+                                    sequence,
+                                    &mut tcp_relay_clients,
+                                ) {
                                     Ok(sent) => {
                                         bytes_sent += sent as u64;
                                         forwarded_packets.push(serde_json::json!({
-                                            "target": target.to_string(),
+                                            "target": target.endpoint,
+                                            "targetPeerId": target.peer_id,
+                                            "connectionPath": target.connection_path,
                                             "source": summary.source_ip,
                                             "destination": summary.destination_ip,
                                             "bytesSent": sent,
@@ -5431,7 +6987,8 @@ fn run_room_runtime(
                                     }
                                     Err(err) => {
                                         last_error = Some(format!(
-                                            "Failed to forward Wintun IPv4 packet to {target}: {err}"
+                                            "Failed to forward Wintun IPv4 packet to {}: {err}",
+                                            target.endpoint
                                         ));
                                     }
                                 }
@@ -5482,14 +7039,33 @@ fn run_room_runtime(
         last_error = Some("Runtime tunnel peer timed out before the runtime stopped.".to_owned());
     }
 
+    let observed_connection_path = if connected_peer_count > 0 {
+        Some(runtime_connection_path_from_packets(
+            &tunnel_packets,
+            &heartbeat_ack_packets,
+        ))
+    } else {
+        None
+    };
+    let tunnel_endpoint_text = tunnel_endpoint.to_string();
+    let runtime_peer_summary_values = runtime_peer_summaries(
+        plan,
+        &[],
+        &tunnel_packets,
+        &forwarded_packets,
+        &heartbeat_packets,
+        &heartbeat_ack_packets,
+        observed_connection_path.as_deref(),
+        Some(tunnel_endpoint_text.as_str()),
+    );
+    if runtime_timeout_error_has_recovered(last_error.as_deref(), &runtime_peer_summary_values) {
+        last_error = None;
+    }
+
     let tunnel_snapshot = TunnelServiceSnapshot {
         service_running: true,
         connected_peer_count,
-        connection_path: if connected_peer_count > 0 {
-            Some("p2p".to_owned())
-        } else {
-            None
-        },
+        connection_path: observed_connection_path,
         average_latency_ms: Some(duration_ms.min(u32::MAX as u64) as u32),
         packet_loss_percent: if self_probe && connected_peer_count == 0 {
             Some(100.0)
@@ -5515,21 +7091,6 @@ fn run_room_runtime(
                 "closed": false,
             })
         });
-    let tunnel_endpoint_text = tunnel_endpoint.to_string();
-    let runtime_peer_summary_values = runtime_peer_summaries(
-        plan,
-        &[],
-        &tunnel_packets,
-        &forwarded_packets,
-        &heartbeat_packets,
-        &heartbeat_ack_packets,
-        if connected_peer_count > 0 {
-            Some("p2p")
-        } else {
-            None
-        },
-        Some(tunnel_endpoint_text.as_str()),
-    );
     let runtime_peer_observations =
         runtime_peer_observations_from_summaries(&runtime_peer_summary_values);
     let expected_peer_count = if runtime_peer_observations.is_empty() {
@@ -5551,8 +7112,23 @@ fn run_room_runtime(
             runtime_expected_broadcast_ports,
             runtime_expected_game_ports,
         ));
+    let wintun_required = packet_io_backend == "wintun" && wintun_runtime;
+    let wintun_open_ok =
+        !wintun_required || wintun_runtime_open["status"].as_str() == Some("session-opened");
+    let wintun_config_ok =
+        !wintun_required || wintun_adapter_config["status"].as_str() == Some("applied");
+    let packet_path_counters = runtime_packet_path_counters(
+        &tunnel_packets,
+        &forwarded_packets,
+        &raw_virtual_packets,
+        &icmp_echo_replies,
+        &icmp_echo_requests,
+        &wintun_runtime_received_packets,
+        &wintun_runtime_sent_packets,
+        &injected_packets,
+    );
     let result = serde_json::json!({
-        "status": if tunnel_snapshot.last_error.is_none() { "ok" } else { "degraded" },
+        "status": if tunnel_snapshot.last_error.is_none() && wintun_open_ok && wintun_config_ok { "ok" } else { "degraded" },
         "startedAtMs": started_at_ms,
         "durationMs": duration_ms,
         "stopReason": stop_reason,
@@ -5563,8 +7139,11 @@ fn run_room_runtime(
         "adapterReadStatus": packet_io_probe["adapterReadStatus"].clone(),
         "forwardRawIpv4": forward_raw_ipv4,
         "actualTunnelEndpoint": tunnel_endpoint_text,
+        "captureBindErrors": capture_bind_errors,
         "tunnelServiceSnapshot": tunnel_snapshot,
-        "heartbeatTargets": heartbeat_targets.iter().map(SocketAddr::to_string).collect::<Vec<_>>(),
+        "heartbeatTargets": heartbeat_targets.iter().map(|target| target.endpoint.clone()).collect::<Vec<_>>(),
+        "relayFallbackActive": using_relay_fallback_targets,
+        "relayFallbackEvents": relay_fallback_events,
         "heartbeatPackets": heartbeat_packets,
         "heartbeatPacketsSent": heartbeat_packets_sent,
         "heartbeatAckPackets": heartbeat_ack_packets,
@@ -5574,14 +7153,19 @@ fn run_room_runtime(
         "forwardedPackets": forwarded_packets,
         "broadcastForwardReport": broadcast_forward_report,
         "rawVirtualPackets": raw_virtual_packets,
+        "icmpEchoRequests": icmp_echo_requests,
+        "icmpEchoReplies": icmp_echo_replies,
+        "packetPathCounters": packet_path_counters,
         "wintunRuntime": {
             "enabled": wintun_runtime,
             "open": wintun_runtime_open,
+            "adapterConfig": wintun_adapter_config,
             "close": wintun_runtime_close,
             "receivedPackets": wintun_runtime_received_packets,
             "sentPackets": wintun_runtime_sent_packets,
             "errors": wintun_runtime_errors,
         },
+        "runtimeRouteEvidence": runtime_route_evidence,
         "runtimeCleanupPlan": runtime_cleanup_plan,
         "injectedPackets": injected_packets,
         "injectedReceivedPackets": injected_received_packets,
@@ -5595,6 +7179,190 @@ fn run_room_runtime(
         write_json_file(path, &result)?;
     }
     Ok(result)
+}
+
+fn bind_runtime_tunnel_socket(
+    bind_endpoint: &str,
+) -> Result<UdpSocket, Box<dyn std::error::Error>> {
+    UdpSocket::bind(bind_endpoint).map_err(|err| {
+        invalid_input(format!(
+            "failed to bind runtime UDP tunnel socket `{bind_endpoint}`: {err}"
+        ))
+    })
+}
+
+fn publish_runtime_coordination_offer(
+    server: Option<&str>,
+    ttl_ms: u64,
+    room_id: &str,
+    peer_id: &str,
+    virtual_ip: Ipv4Addr,
+    socket: &UdpSocket,
+    stun_server: Option<&str>,
+    stun_timeout_ms: u64,
+    upnp_port_map: bool,
+    upnp_timeout_ms: u64,
+    upnp_lease_seconds: u32,
+    upnp_gateway_location: Option<&str>,
+    relay_endpoints: &[String],
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    let Some(server) = server else {
+        return Ok(serde_json::json!({ "status": "skipped", "reason": "no-coordination-server" }));
+    };
+    if ttl_ms == 0 {
+        return Ok(serde_json::json!({ "status": "skipped", "reason": "publish-disabled" }));
+    }
+    let local_endpoint = socket.local_addr()?;
+    let mut offer = lai_core::create_nat_traversal_offer(
+        room_id,
+        peer_id,
+        format!("{peer_id}-runtime-offer"),
+        current_epoch_ms(),
+        local_endpoint,
+        None,
+        relay_endpoints.to_vec(),
+    );
+    offer.virtual_ip = Some(virtual_ip);
+    enrich_offer_with_local_host_candidates(&mut offer, socket)?;
+    let stun_mapping =
+        apply_stun_mapping_candidates_to_offer(&mut offer, socket, stun_server, stun_timeout_ms);
+    let upnp_mapping = if upnp_port_map {
+        apply_upnp_port_mapping_to_offer(
+            &mut offer,
+            socket,
+            upnp_timeout_ms,
+            upnp_lease_seconds,
+            upnp_gateway_location,
+        )
+    } else {
+        UpnpPortMappingReport::disabled()
+    };
+    match coordination_http_publish_offer(server, &offer, ttl_ms as u128) {
+        Ok(result) => Ok(serde_json::json!({
+            "status": "ok",
+            "server": server,
+            "ttlMs": ttl_ms,
+            "localEndpoint": local_endpoint,
+            "offer": offer,
+            "stunMapping": stun_mapping,
+            "upnpPortMapping": upnp_mapping,
+            "result": result,
+        })),
+        Err(err) => Ok(serde_json::json!({
+            "status": "error",
+            "server": server,
+            "ttlMs": ttl_ms,
+            "localEndpoint": local_endpoint,
+            "error": err.to_string(),
+            "offer": offer,
+            "stunMapping": stun_mapping,
+            "upnpPortMapping": upnp_mapping,
+        })),
+    }
+}
+
+fn runtime_packet_path_counters(
+    tunnel_packets: &[serde_json::Value],
+    forwarded_packets: &[serde_json::Value],
+    raw_virtual_packets: &[serde_json::Value],
+    icmp_echo_replies: &[serde_json::Value],
+    icmp_echo_requests: &[serde_json::Value],
+    wintun_runtime_received_packets: &[serde_json::Value],
+    wintun_runtime_sent_packets: &[serde_json::Value],
+    injected_packets: &[serde_json::Value],
+) -> serde_json::Value {
+    serde_json::json!({
+        "tunnelPacketsReceived": tunnel_packets.len(),
+        "forwardedPacketsSent": forwarded_packets.len(),
+        "rawVirtualPacketsReceived": raw_virtual_packets.len(),
+        "icmpEchoRequestsSeen": icmp_echo_requests.len(),
+        "icmpEchoRepliesSent": icmp_echo_replies.len(),
+        "wintunPacketsReceived": wintun_runtime_received_packets.len(),
+        "wintunPacketsSent": wintun_runtime_sent_packets.len(),
+        "injectedPacketsSent": injected_packets.len(),
+    })
+}
+
+fn runtime_route_evidence(
+    adapter_name: &str,
+    local_virtual_ip: Ipv4Addr,
+    enabled: bool,
+) -> serde_json::Value {
+    if !enabled {
+        return serde_json::json!({
+            "enabled": false,
+            "status": "disabled",
+        });
+    }
+    let subnet = runtime_subnet_from_local_ip(local_virtual_ip);
+    let adapter_source = load_adapter_source(adapter_name, None, true);
+    let route_source = load_route_source(None, true);
+    let adapter_observation = if adapter_source.raw_output.trim().is_empty() {
+        None
+    } else {
+        parse_netsh_adapter_observation(
+            adapter_name.to_owned(),
+            &adapter_source.raw_output,
+            Some(local_virtual_ip),
+            Some(subnet),
+        )
+    };
+    let routes = if route_source.error.is_none() {
+        lai_core::parse_windows_ipv4_routes(&route_source.raw_output)
+    } else {
+        Vec::new()
+    };
+    let matching_routes = routes
+        .iter()
+        .filter(|route| route.destination.intersects(subnet))
+        .cloned()
+        .collect::<Vec<_>>();
+    let exact_on_link_route = matching_routes.iter().any(|route| {
+        route.destination == subnet
+            && route.gateway.is_none()
+            && route.interface_ip == Some(local_virtual_ip)
+    });
+    let status = if adapter_source.error.is_some() || route_source.error.is_some() {
+        "scan-error"
+    } else if adapter_observation
+        .as_ref()
+        .and_then(|adapter| adapter.assigned_ip)
+        != Some(local_virtual_ip)
+    {
+        "adapter-ip-mismatch"
+    } else if exact_on_link_route {
+        "ok"
+    } else if matching_routes.is_empty() {
+        "missing-route"
+    } else {
+        "route-mismatch"
+    };
+    let next_action = match status {
+        "ok" => "Windows route table sends the room subnet to the virtual adapter.",
+        "adapter-ip-mismatch" => {
+            "Run adapter-apply as Administrator; the virtual adapter IP does not match the room IP."
+        }
+        "missing-route" => {
+            "Run adapter-apply as Administrator; no route for the room subnet was found."
+        }
+        "route-mismatch" => {
+            "Inspect route print -4; a route overlaps the room subnet but does not point at the virtual adapter IP."
+        }
+        _ => "Run route-scan/adapter diagnostics from an Administrator terminal.",
+    };
+    serde_json::json!({
+        "enabled": true,
+        "status": status,
+        "adapterName": adapter_name,
+        "localVirtualIp": local_virtual_ip,
+        "subnet": subnet,
+        "adapterSource": adapter_source,
+        "adapterObservation": adapter_observation,
+        "routeSource": route_source,
+        "matchingRoutes": matching_routes,
+        "exactOnLinkRoute": exact_on_link_route,
+        "nextAction": next_action,
+    })
 }
 
 fn runtime_packet_io_probe(
@@ -6075,7 +7843,8 @@ fn runtime_forward_targets(
     actual_broadcast_ports: &[u16],
     forward_self_probe: bool,
     tunnel_endpoint: SocketAddr,
-) -> Result<Vec<(u16, Vec<SocketAddr>)>, Box<dyn std::error::Error>> {
+    use_fallback: bool,
+) -> Result<Vec<(u16, Vec<RuntimeSendTarget>)>, Box<dyn std::error::Error>> {
     let mut targets_by_port = Vec::new();
     for forwarder in &plan.udp_forwarders {
         let forward_port = if forwarder.port == 0 {
@@ -6090,25 +7859,95 @@ fn runtime_forward_targets(
             .forward_to_peers
             .iter()
             .map(|endpoint| {
-                endpoint.parse::<SocketAddr>().map_err(|err| {
-                    invalid_input(format!(
-                        "invalid runtime forward endpoint `{endpoint}`: {err}"
-                    ))
-                })
+                let peer = plan.peers.iter().find(|peer| peer.endpoint == *endpoint);
+                let (target_endpoint, connection_path) =
+                    runtime_peer_target_endpoint_and_path(peer, endpoint, use_fallback);
+                runtime_send_target_from_endpoint(
+                    peer.map(|peer| peer.peer_id.clone())
+                        .unwrap_or_else(|| endpoint.clone()),
+                    &target_endpoint,
+                    connection_path,
+                )
             })
             .collect::<Result<Vec<_>, _>>()?;
         if forward_self_probe {
-            targets.push(tunnel_endpoint);
+            let endpoint = loopback_endpoint_for_bound_socket(tunnel_endpoint);
+            targets.push(RuntimeSendTarget {
+                peer_id: "self-probe".to_owned(),
+                endpoint: endpoint.to_string(),
+                socket_endpoint: Some(endpoint),
+                relay_url: None,
+                tcp_relay_url: None,
+                connection_path: "direct".to_owned(),
+            });
         }
         targets_by_port.push((forward_port, targets));
     }
     if forward_self_probe && targets_by_port.is_empty() {
-        targets_by_port.extend(
-            actual_broadcast_ports
-                .iter()
-                .copied()
-                .map(|port| (port, vec![tunnel_endpoint])),
-        );
+        targets_by_port.extend(actual_broadcast_ports.iter().copied().map(|port| {
+            let endpoint = loopback_endpoint_for_bound_socket(tunnel_endpoint);
+            (
+                port,
+                vec![RuntimeSendTarget {
+                    peer_id: "self-probe".to_owned(),
+                    endpoint: endpoint.to_string(),
+                    socket_endpoint: Some(endpoint),
+                    relay_url: None,
+                    tcp_relay_url: None,
+                    connection_path: "direct".to_owned(),
+                }],
+            )
+        }));
+    }
+    Ok(targets_by_port)
+}
+
+fn runtime_direct_forward_targets(
+    plan: &RoomRuntimePlan,
+    actual_broadcast_ports: &[u16],
+    forward_self_probe: bool,
+    tunnel_endpoint: SocketAddr,
+) -> Result<Vec<(u16, Vec<RuntimeSendTarget>)>, Box<dyn std::error::Error>> {
+    let mut targets_by_port = Vec::new();
+    for forwarder in &plan.udp_forwarders {
+        let forward_port = if forwarder.port == 0 {
+            actual_broadcast_ports.first().copied().unwrap_or(0)
+        } else {
+            forwarder.port
+        };
+        if forward_port == 0 {
+            continue;
+        }
+        let mut targets = plan
+            .peers
+            .iter()
+            .filter_map(|peer| {
+                peer.direct_endpoint
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|endpoint| !endpoint.is_empty())
+                    .map(|endpoint| (peer, endpoint.to_owned()))
+            })
+            .map(|(peer, endpoint)| {
+                runtime_send_target_from_endpoint(
+                    peer.peer_id.clone(),
+                    &endpoint,
+                    "direct".to_owned(),
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if forward_self_probe {
+            let endpoint = loopback_endpoint_for_bound_socket(tunnel_endpoint);
+            targets.push(RuntimeSendTarget {
+                peer_id: "self-probe".to_owned(),
+                endpoint: endpoint.to_string(),
+                socket_endpoint: Some(endpoint),
+                relay_url: None,
+                tcp_relay_url: None,
+                connection_path: "direct".to_owned(),
+            });
+        }
+        targets_by_port.push((forward_port, targets));
     }
     Ok(targets_by_port)
 }
@@ -6117,25 +7956,285 @@ fn runtime_heartbeat_targets(
     plan: &RoomRuntimePlan,
     self_probe: bool,
     tunnel_endpoint: SocketAddr,
-) -> Result<Vec<SocketAddr>, Box<dyn std::error::Error>> {
+    use_fallback: bool,
+) -> Result<Vec<RuntimeSendTarget>, Box<dyn std::error::Error>> {
     let mut targets = plan
         .peers
         .iter()
         .map(|peer| {
-            peer.endpoint.parse::<SocketAddr>().map_err(|err| {
-                invalid_input(format!(
-                    "invalid runtime heartbeat endpoint `{}`: {err}",
-                    peer.endpoint
-                ))
-            })
+            let (target_endpoint, connection_path) =
+                runtime_peer_target_endpoint_and_path(Some(peer), &peer.endpoint, use_fallback);
+            runtime_send_target_from_endpoint(
+                peer.peer_id.clone(),
+                &target_endpoint,
+                connection_path,
+            )
         })
         .collect::<Result<Vec<_>, _>>()?;
     if self_probe {
-        targets.push(tunnel_endpoint);
+        targets.push(RuntimeSendTarget {
+            peer_id: "self-probe".to_owned(),
+            endpoint: loopback_endpoint_for_bound_socket(tunnel_endpoint).to_string(),
+            socket_endpoint: Some(loopback_endpoint_for_bound_socket(tunnel_endpoint)),
+            relay_url: None,
+            tcp_relay_url: None,
+            connection_path: "direct".to_owned(),
+        });
     }
-    targets.sort_unstable();
-    targets.dedup();
+    targets.sort_by(|left, right| {
+        left.endpoint
+            .cmp(&right.endpoint)
+            .then_with(|| left.peer_id.cmp(&right.peer_id))
+            .then_with(|| left.connection_path.cmp(&right.connection_path))
+    });
+    targets.dedup_by(|left, right| {
+        left.endpoint == right.endpoint
+            && left.peer_id == right.peer_id
+            && left.connection_path == right.connection_path
+    });
     Ok(targets)
+}
+
+fn runtime_direct_heartbeat_targets(
+    plan: &RoomRuntimePlan,
+    self_probe: bool,
+    tunnel_endpoint: SocketAddr,
+) -> Result<Vec<RuntimeSendTarget>, Box<dyn std::error::Error>> {
+    let mut targets = runtime_direct_probe_heartbeat_targets(plan)?;
+    if self_probe {
+        targets.push(RuntimeSendTarget {
+            peer_id: "self-probe".to_owned(),
+            endpoint: loopback_endpoint_for_bound_socket(tunnel_endpoint).to_string(),
+            socket_endpoint: Some(loopback_endpoint_for_bound_socket(tunnel_endpoint)),
+            relay_url: None,
+            tcp_relay_url: None,
+            connection_path: "direct".to_owned(),
+        });
+    }
+    targets.sort_by(|left, right| {
+        left.endpoint
+            .cmp(&right.endpoint)
+            .then_with(|| left.peer_id.cmp(&right.peer_id))
+            .then_with(|| left.connection_path.cmp(&right.connection_path))
+    });
+    targets.dedup_by(|left, right| {
+        left.endpoint == right.endpoint
+            && left.peer_id == right.peer_id
+            && left.connection_path == right.connection_path
+    });
+    Ok(targets)
+}
+
+fn runtime_direct_probe_heartbeat_targets(
+    plan: &RoomRuntimePlan,
+) -> Result<Vec<RuntimeSendTarget>, Box<dyn std::error::Error>> {
+    let mut targets = plan
+        .peers
+        .iter()
+        .filter_map(|peer| {
+            peer.direct_endpoint
+                .as_deref()
+                .map(str::trim)
+                .filter(|endpoint| !endpoint.is_empty())
+                .map(|endpoint| (peer, endpoint.to_owned()))
+        })
+        .map(|(peer, endpoint)| {
+            runtime_send_target_from_endpoint(peer.peer_id.clone(), &endpoint, "direct".to_owned())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    targets.sort_by(|left, right| {
+        left.endpoint
+            .cmp(&right.endpoint)
+            .then_with(|| left.peer_id.cmp(&right.peer_id))
+            .then_with(|| left.connection_path.cmp(&right.connection_path))
+    });
+    targets.dedup_by(|left, right| {
+        left.endpoint == right.endpoint
+            && left.peer_id == right.peer_id
+            && left.connection_path == right.connection_path
+    });
+    Ok(targets)
+}
+
+fn runtime_peer_target_endpoint_and_path(
+    peer: Option<&RoomRuntimePeer>,
+    endpoint: &str,
+    use_fallback: bool,
+) -> (String, String) {
+    if use_fallback {
+        if let Some(peer) = peer {
+            if let Some(fallback) = peer
+                .fallback_endpoint
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                return (fallback.to_owned(), "relay".to_owned());
+            }
+        }
+    }
+    if let Some(peer) = peer.filter(|peer| peer.connection_path.eq_ignore_ascii_case("direct")) {
+        if let Some(direct) = peer
+            .direct_endpoint
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            return (direct.to_owned(), "direct".to_owned());
+        }
+    }
+    (
+        endpoint.to_owned(),
+        peer.map(|peer| peer.connection_path.clone())
+            .unwrap_or_else(|| "direct".to_owned()),
+    )
+}
+
+fn runtime_send_target_from_endpoint(
+    peer_id: String,
+    endpoint: &str,
+    connection_path: String,
+) -> Result<RuntimeSendTarget, Box<dyn std::error::Error>> {
+    if is_http_relay_endpoint(endpoint) {
+        let relay_endpoint = udp_relay_endpoint_from_http_url(endpoint)?;
+        return Ok(RuntimeSendTarget {
+            peer_id,
+            endpoint: endpoint.to_owned(),
+            socket_endpoint: Some(relay_endpoint),
+            relay_url: None,
+            tcp_relay_url: None,
+            connection_path: "relay".to_owned(),
+        });
+    }
+    Ok(RuntimeSendTarget {
+        peer_id,
+        endpoint: endpoint.to_owned(),
+        socket_endpoint: endpoint.parse::<SocketAddr>().ok(),
+        relay_url: None,
+        tcp_relay_url: None,
+        connection_path,
+    })
+}
+
+fn runtime_observed_configured_peer<'a>(
+    plan: &'a RoomRuntimePlan,
+    observed_peer: SocketAddr,
+    observed_peer_id: Option<&str>,
+    observed_via_relay: bool,
+) -> Option<&'a RoomRuntimePeer> {
+    if let Some(peer_id) = observed_peer_id {
+        if peer_id == "self-probe" || peer_id == plan.local_peer_id {
+            return None;
+        }
+        if let Some(peer) = plan.peers.iter().find(|peer| peer.peer_id == peer_id) {
+            return Some(peer);
+        }
+    }
+    if observed_via_relay {
+        return None;
+    }
+    plan.peers.iter().find(|peer| {
+        peer.endpoint.parse::<SocketAddr>().ok() == Some(observed_peer)
+            || peer
+                .direct_endpoint
+                .as_deref()
+                .and_then(|endpoint| endpoint.parse::<SocketAddr>().ok())
+                == Some(observed_peer)
+    })
+}
+
+fn udp_relay_endpoint_from_http_url(
+    endpoint: &str,
+) -> Result<SocketAddr, Box<dyn std::error::Error>> {
+    let trimmed = endpoint.trim();
+    let without_scheme = trimmed
+        .strip_prefix("http://")
+        .or_else(|| trimmed.strip_prefix("https://"))
+        .ok_or_else(|| invalid_input(format!("invalid HTTP relay endpoint `{endpoint}`")))?;
+    let authority = without_scheme
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or_default()
+        .trim();
+    let host = if let Some(stripped) = authority.strip_prefix('[') {
+        stripped
+            .split(']')
+            .next()
+            .ok_or_else(|| invalid_input(format!("invalid HTTP relay endpoint `{endpoint}`")))?
+            .to_owned()
+    } else {
+        authority.split(':').next().unwrap_or_default().to_owned()
+    };
+    if host.is_empty() {
+        return Err(invalid_input(format!("invalid HTTP relay endpoint `{endpoint}`")).into());
+    }
+    (host.as_str(), DEFAULT_UDP_RELAY_PORT)
+        .to_socket_addrs()?
+        .next()
+        .ok_or_else(|| {
+            invalid_input(format!(
+                "failed to resolve UDP relay endpoint `{host}:{DEFAULT_UDP_RELAY_PORT}`"
+            ))
+            .into()
+        })
+}
+
+fn tcp_relay_endpoint_from_http_url(
+    endpoint: &str,
+) -> Result<SocketAddr, Box<dyn std::error::Error>> {
+    let trimmed = endpoint.trim();
+    let (without_scheme, default_port) = if let Some(value) = trimmed.strip_prefix("http://") {
+        (value, 80)
+    } else if let Some(value) = trimmed.strip_prefix("https://") {
+        (value, 443)
+    } else {
+        return Err(invalid_input(format!("invalid TCP relay endpoint `{endpoint}`")).into());
+    };
+    let authority = without_scheme
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or_default()
+        .trim();
+    let (host, port) = if let Some(stripped) = authority.strip_prefix('[') {
+        let host = stripped
+            .split(']')
+            .next()
+            .ok_or_else(|| invalid_input(format!("invalid TCP relay endpoint `{endpoint}`")))?;
+        let port = stripped
+            .split(']')
+            .nth(1)
+            .and_then(|tail| tail.strip_prefix(':'))
+            .and_then(|port| port.parse::<u16>().ok())
+            .unwrap_or(default_port);
+        (host.to_owned(), port)
+    } else {
+        let mut parts = authority.splitn(2, ':');
+        let host = parts.next().unwrap_or_default().to_owned();
+        let port = parts
+            .next()
+            .and_then(|port| port.parse::<u16>().ok())
+            .unwrap_or(default_port);
+        (host, port)
+    };
+    if host.is_empty() {
+        return Err(invalid_input(format!("invalid TCP relay endpoint `{endpoint}`")).into());
+    }
+    (host.as_str(), port)
+        .to_socket_addrs()?
+        .next()
+        .ok_or_else(|| {
+            invalid_input(format!(
+                "failed to resolve TCP relay endpoint `{host}:{port}`"
+            ))
+            .into()
+        })
+}
+
+fn loopback_endpoint_for_bound_socket(endpoint: SocketAddr) -> SocketAddr {
+    match endpoint {
+        SocketAddr::V4(value) => SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), value.port()),
+        SocketAddr::V6(value) => SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), value.port()),
+    }
 }
 
 fn refresh_runtime_network_observation(
@@ -6225,16 +8324,33 @@ fn runtime_peer_summaries(
         let report = path_entry
             .and_then(|entry| entry.get("report"))
             .or(path_entry);
-        let selected_path = report
+        let observed_path =
+            runtime_observed_connection_path(peer, tunnel_packets, heartbeat_ack_packets);
+        let report_selected_path = report
             .and_then(|report| report.get("selected_path"))
             .and_then(serde_json::Value::as_str)
+            .map(str::to_owned);
+        let selected_path = observed_path
+            .clone()
             .or_else(|| {
-                runtime_path.filter(|_| peer_has_tunnel_packets(tunnel_packets, &peer.endpoint))
+                runtime_path
+                    .filter(|_| peer_has_tunnel_packets(tunnel_packets, &peer.endpoint))
+                    .map(str::to_owned)
             })
-            .unwrap_or("unknown");
+            .or(report_selected_path.clone())
+            .unwrap_or_else(|| "unknown".to_owned());
         let connection_path_status = report
             .and_then(|report| report.get("status"))
             .and_then(serde_json::Value::as_str)
+            .or_else(|| {
+                if selected_path == "relay" {
+                    Some("relay-ready")
+                } else if selected_path == "direct" || selected_path == "p2p" {
+                    Some("observed")
+                } else {
+                    None
+                }
+            })
             .unwrap_or_else(|| {
                 if peer_has_tunnel_packets(tunnel_packets, &peer.endpoint) {
                     "observed"
@@ -6246,29 +8362,34 @@ fn runtime_peer_summaries(
             .and_then(|entry| entry.get("bootstrapStatus"))
             .and_then(serde_json::Value::as_str)
             .unwrap_or("not-run");
-        let latency_ms = path_entry
-            .and_then(|entry| entry.get("bootstrapLatencyMs"))
-            .and_then(serde_json::Value::as_u64)
-            .or_else(|| max_json_u64(heartbeat_ack_packets, "peer", &peer.endpoint, "roundTripMs"));
-        let bytes_sent = sum_json_bytes(heartbeat_packets, "target", &peer.endpoint, "bytesSent")
-            + sum_json_bytes(heartbeat_ack_packets, "target", &peer.endpoint, "bytesSent")
-            + sum_json_bytes(forwarded_packets, "target", &peer.endpoint, "bytesSent");
-        let bytes_received = sum_json_bytes(tunnel_packets, "peer", &peer.endpoint, "bytes");
-        let heartbeat_packets_sent =
-            count_json_matches(heartbeat_packets, "target", &peer.endpoint);
+        let path_kind = runtime_peer_path_kind(&selected_path, connection_path_status);
+        let latency_ms =
+            recent_average_peer_json_u64(heartbeat_ack_packets, peer, path_kind, "roundTripMs", 5)
+                .or_else(|| {
+                    path_entry
+                        .and_then(|entry| entry.get("bootstrapLatencyMs"))
+                        .and_then(serde_json::Value::as_u64)
+                });
+        let bytes_sent = sum_peer_json_bytes(heartbeat_packets, peer, path_kind, "bytesSent")
+            + sum_peer_json_bytes(heartbeat_ack_packets, peer, path_kind, "bytesSent")
+            + sum_peer_json_bytes(forwarded_packets, peer, path_kind, "bytesSent");
+        let bytes_received = sum_peer_json_bytes(tunnel_packets, peer, path_kind, "bytes");
+        let heartbeat_packets_sent = count_peer_json_matches(heartbeat_packets, peer, path_kind);
         let heartbeat_ack_packets_received =
-            count_json_matches(heartbeat_ack_packets, "peer", &peer.endpoint);
+            count_peer_json_matches(heartbeat_ack_packets, peer, path_kind);
         let heartbeat_ack_packets_sent =
-            count_json_matches(heartbeat_ack_packets, "target", &peer.endpoint);
-        let forwarded_packets_sent =
-            count_json_matches(forwarded_packets, "target", &peer.endpoint);
-        let tunnel_packets_received = count_json_matches(tunnel_packets, "peer", &peer.endpoint);
-        let last_seen_at_ms = max_json_u64(tunnel_packets, "peer", &peer.endpoint, "receivedAtMs");
+            count_peer_json_matches(heartbeat_ack_packets, peer, path_kind);
+        let forwarded_packets_sent = count_peer_json_matches(forwarded_packets, peer, path_kind);
+        let tunnel_packets_received = count_peer_json_matches(tunnel_packets, peer, path_kind);
+        let last_seen_at_ms = max_optional_u64(
+            max_peer_json_u64(tunnel_packets, peer, path_kind, "receivedAtMs"),
+            max_peer_json_u64(heartbeat_ack_packets, peer, path_kind, "receivedAtMs"),
+        );
         let last_sent_at_ms = max_optional_u64(
-            max_json_u64(heartbeat_packets, "target", &peer.endpoint, "sentAtMs"),
+            max_peer_json_u64(heartbeat_packets, peer, path_kind, "sentAtMs"),
             max_optional_u64(
-                max_json_u64(heartbeat_ack_packets, "target", &peer.endpoint, "sentAtMs"),
-                max_json_u64(forwarded_packets, "target", &peer.endpoint, "sentAtMs"),
+                max_peer_json_u64(heartbeat_ack_packets, peer, path_kind, "sentAtMs"),
+                max_peer_json_u64(forwarded_packets, peer, path_kind, "sentAtMs"),
             ),
         );
         let heartbeat_loss_percent = percent_unacked(
@@ -6276,20 +8397,17 @@ fn runtime_peer_summaries(
             heartbeat_ack_packets_received as u64,
         );
         let recent_loss_window_size =
-            heartbeat_loss_window_size(heartbeat_packets, "target", &peer.endpoint, 10);
+            heartbeat_loss_window_size(heartbeat_packets, peer, path_kind, 10);
         let heartbeat_loss_window_percent = heartbeat_loss_window_percent(
             heartbeat_packets,
             heartbeat_ack_packets,
-            "target",
-            "peer",
-            &peer.endpoint,
+            peer,
+            path_kind,
             recent_loss_window_size,
         );
         let heartbeat_rtt_sample_count =
-            count_json_u64(heartbeat_ack_packets, "peer", &peer.endpoint, "roundTripMs");
-        let heartbeat_rtt_jitter_ms =
-            round_trip_jitter_ms(heartbeat_ack_packets, "peer", &peer.endpoint);
-        let path_kind = runtime_peer_path_kind(selected_path, connection_path_status);
+            count_peer_json_u64(heartbeat_ack_packets, peer, path_kind, "roundTripMs");
+        let heartbeat_rtt_jitter_ms = round_trip_jitter_ms(heartbeat_ack_packets, peer, path_kind);
         let direct_bytes_sent = if path_kind == "direct" { bytes_sent } else { 0 };
         let direct_bytes_received = if path_kind == "direct" {
             bytes_received
@@ -6312,9 +8430,12 @@ fn runtime_peer_summaries(
         } else {
             0
         };
-        let connected = tunnel_packets_received > 0;
+        let now_ms = current_epoch_ms() as u64;
+        let connected = last_seen_at_ms
+            .map(|last_seen| now_ms.saturating_sub(last_seen) <= RUNTIME_PEER_CONNECTED_WINDOW_MS)
+            .unwrap_or(false);
         let health = runtime_peer_summary_health(
-            selected_path,
+            &selected_path,
             connection_path_status,
             connected,
             heartbeat_ack_packets_received,
@@ -6403,6 +8524,9 @@ fn runtime_observed_peers(
             },
             virtual_ip: plan.local_virtual_ip,
             endpoint,
+            connection_path: "unknown".to_owned(),
+            direct_endpoint: None,
+            fallback_endpoint: None,
         })
         .collect()
 }
@@ -6585,6 +8709,37 @@ fn runtime_peer_summary_health(
     })
 }
 
+fn runtime_timeout_error_has_recovered(
+    last_error: Option<&str>,
+    runtime_peer_summaries: &[serde_json::Value],
+) -> bool {
+    let Some(error) = last_error else {
+        return false;
+    };
+    if !error.starts_with("No runtime tunnel packets were received")
+        && error != "Runtime tunnel peer timed out before the runtime stopped."
+    {
+        return false;
+    }
+    runtime_peer_summaries.iter().any(|summary| {
+        let acked = summary
+            .get("heartbeatAckPacketsReceived")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or_default()
+            > 0;
+        let recently_healthy = summary
+            .get("heartbeatLossWindowPercent")
+            .and_then(serde_json::Value::as_f64)
+            .is_some_and(|loss| loss < 50.0);
+        let health_allows_connected = summary
+            .get("health")
+            .and_then(|health| health.get("status"))
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|status| status != "needs-attention");
+        acked && recently_healthy && health_allows_connected
+    })
+}
+
 fn runtime_heartbeat_ack_payload(
     plan: &RoomRuntimePlan,
     plaintext: &[u8],
@@ -6674,17 +8829,58 @@ fn runtime_peer_path_kind(selected_path: &str, connection_path_status: &str) -> 
     }
 }
 
+fn runtime_wintun_udp_drop_reason(packet: &VirtualUdpPacket) -> Option<&'static str> {
+    if runtime_is_multicast_ipv4(packet.destination_ip) {
+        return Some("multicast-noise");
+    }
+    if runtime_is_noisy_udp_service(packet.destination_ip, packet.destination_port) {
+        return Some("system-discovery-noise");
+    }
+    None
+}
+
+fn runtime_wintun_tcp_drop_reason(packet: &lai_core::VirtualTcpPacket) -> Option<&'static str> {
+    if runtime_is_multicast_ipv4(packet.destination_ip) {
+        return Some("multicast-noise");
+    }
+    None
+}
+
+fn runtime_wintun_ipv4_drop_reason(
+    summary: &lai_core::VirtualIpv4PacketSummary,
+) -> Option<&'static str> {
+    if summary.protocol_number == 2 {
+        return Some("igmp-noise");
+    }
+    if runtime_is_multicast_ipv4(summary.destination_ip) {
+        return Some("multicast-noise");
+    }
+    if summary.broadcast {
+        return Some("non-udp-broadcast-noise");
+    }
+    None
+}
+
+fn runtime_is_multicast_ipv4(address: Ipv4Addr) -> bool {
+    let first = address.octets()[0];
+    (224..=239).contains(&first)
+}
+
+fn runtime_is_noisy_udp_service(destination_ip: Ipv4Addr, destination_port: u16) -> bool {
+    let broadcast = destination_ip == Ipv4Addr::BROADCAST || destination_ip.octets()[3] == 255;
+    (broadcast || runtime_is_multicast_ipv4(destination_ip))
+        && matches!(destination_port, 137 | 138 | 1900 | 3702 | 5353 | 5355)
+}
+
 fn heartbeat_loss_window_size(
     sent_packets: &[serde_json::Value],
-    match_key: &str,
-    endpoint: &str,
+    peer: &RoomRuntimePeer,
+    path_kind: &str,
     max_window_size: usize,
 ) -> usize {
     sent_packets
         .iter()
-        .filter(|packet| {
-            packet.get(match_key).and_then(serde_json::Value::as_str) == Some(endpoint)
-        })
+        .filter(|packet| json_matches_runtime_peer_path(packet, peer, path_kind))
         .count()
         .min(max_window_size)
 }
@@ -6692,9 +8888,8 @@ fn heartbeat_loss_window_size(
 fn heartbeat_loss_window_percent(
     sent_packets: &[serde_json::Value],
     ack_packets: &[serde_json::Value],
-    sent_match_key: &str,
-    ack_match_key: &str,
-    endpoint: &str,
+    peer: &RoomRuntimePeer,
+    path_kind: &str,
     window_size: usize,
 ) -> Option<f64> {
     if window_size == 0 {
@@ -6702,12 +8897,7 @@ fn heartbeat_loss_window_percent(
     }
     let mut sent = sent_packets
         .iter()
-        .filter(|packet| {
-            packet
-                .get(sent_match_key)
-                .and_then(serde_json::Value::as_str)
-                == Some(endpoint)
-        })
+        .filter(|packet| json_matches_runtime_peer_path(packet, peer, path_kind))
         .filter_map(|packet| {
             Some((
                 packet
@@ -6727,12 +8917,7 @@ fn heartbeat_loss_window_percent(
         .collect::<HashSet<_>>();
     let acked = ack_packets
         .iter()
-        .filter(|packet| {
-            packet
-                .get(ack_match_key)
-                .and_then(serde_json::Value::as_str)
-                == Some(endpoint)
-        })
+        .filter(|packet| json_matches_runtime_peer_path(packet, peer, path_kind))
         .filter_map(|packet| {
             packet
                 .get("ackedSequence")
@@ -6746,12 +8931,12 @@ fn heartbeat_loss_window_percent(
 
 fn round_trip_jitter_ms(
     values: &[serde_json::Value],
-    match_key: &str,
-    endpoint: &str,
+    peer: &RoomRuntimePeer,
+    path_kind: &str,
 ) -> Option<f64> {
     let mut samples = values
         .iter()
-        .filter(|value| value.get(match_key).and_then(serde_json::Value::as_str) == Some(endpoint))
+        .filter(|value| json_matches_runtime_peer_path(value, peer, path_kind))
         .filter_map(|value| {
             Some((
                 value
@@ -6781,39 +8966,88 @@ fn peer_has_tunnel_packets(packets: &[serde_json::Value], endpoint: &str) -> boo
         .any(|packet| packet.get("peer").and_then(serde_json::Value::as_str) == Some(endpoint))
 }
 
-fn sum_json_bytes(
+fn runtime_observed_connection_path(
+    peer: &RoomRuntimePeer,
+    tunnel_packets: &[serde_json::Value],
+    heartbeat_ack_packets: &[serde_json::Value],
+) -> Option<String> {
+    let observed = tunnel_packets
+        .iter()
+        .chain(heartbeat_ack_packets.iter())
+        .filter(|packet| json_matches_runtime_peer(packet, peer))
+        .filter_map(|packet| {
+            packet
+                .get("connectionPath")
+                .and_then(serde_json::Value::as_str)
+        })
+        .find(|path| !path.trim().is_empty())
+        .map(str::to_owned);
+    observed.or_else(|| {
+        if is_http_relay_endpoint(&peer.endpoint)
+            || peer.connection_path.eq_ignore_ascii_case("relay")
+        {
+            Some("relay".to_owned())
+        } else if peer.connection_path.eq_ignore_ascii_case("direct") {
+            Some("p2p".to_owned())
+        } else {
+            None
+        }
+    })
+}
+
+fn runtime_connection_path_from_packets(
+    tunnel_packets: &[serde_json::Value],
+    heartbeat_ack_packets: &[serde_json::Value],
+) -> String {
+    let has_relay = tunnel_packets
+        .iter()
+        .chain(heartbeat_ack_packets.iter())
+        .any(|packet| {
+            packet
+                .get("connectionPath")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|path| path.eq_ignore_ascii_case("relay"))
+        });
+    if has_relay {
+        "relay".to_owned()
+    } else {
+        "p2p".to_owned()
+    }
+}
+
+fn sum_peer_json_bytes(
     values: &[serde_json::Value],
-    match_key: &str,
-    match_value: &str,
+    peer: &RoomRuntimePeer,
+    path_kind: &str,
     bytes_key: &str,
 ) -> u64 {
     values
         .iter()
-        .filter(|value| {
-            value.get(match_key).and_then(serde_json::Value::as_str) == Some(match_value)
-        })
+        .filter(|value| json_matches_runtime_peer_path(value, peer, path_kind))
         .filter_map(|value| value.get(bytes_key).and_then(serde_json::Value::as_u64))
         .sum()
 }
 
-fn count_json_matches(values: &[serde_json::Value], key: &str, expected: &str) -> usize {
+fn count_peer_json_matches(
+    values: &[serde_json::Value],
+    peer: &RoomRuntimePeer,
+    path_kind: &str,
+) -> usize {
     values
         .iter()
-        .filter(|value| value.get(key).and_then(serde_json::Value::as_str) == Some(expected))
+        .filter(|value| json_matches_runtime_peer_path(value, peer, path_kind))
         .count()
 }
 
-fn count_json_u64(
+fn count_peer_json_u64(
     values: &[serde_json::Value],
-    match_key: &str,
-    match_value: &str,
+    peer: &RoomRuntimePeer,
+    path_kind: &str,
     value_key: &str,
 ) -> usize {
     values
         .iter()
-        .filter(|value| {
-            value.get(match_key).and_then(serde_json::Value::as_str) == Some(match_value)
-        })
+        .filter(|value| json_matches_runtime_peer_path(value, peer, path_kind))
         .filter(|value| {
             value
                 .get(value_key)
@@ -6823,19 +9057,107 @@ fn count_json_u64(
         .count()
 }
 
-fn max_json_u64(
+fn max_peer_json_u64(
     values: &[serde_json::Value],
-    match_key: &str,
-    match_value: &str,
+    peer: &RoomRuntimePeer,
+    path_kind: &str,
     value_key: &str,
 ) -> Option<u64> {
     values
         .iter()
-        .filter(|value| {
-            value.get(match_key).and_then(serde_json::Value::as_str) == Some(match_value)
-        })
+        .filter(|value| json_matches_runtime_peer_path(value, peer, path_kind))
         .filter_map(|value| value.get(value_key).and_then(serde_json::Value::as_u64))
         .max()
+}
+
+fn recent_average_peer_json_u64(
+    values: &[serde_json::Value],
+    peer: &RoomRuntimePeer,
+    path_kind: &str,
+    value_key: &str,
+    window_size: usize,
+) -> Option<u64> {
+    if window_size == 0 {
+        return None;
+    }
+    let mut samples = values
+        .iter()
+        .filter(|value| json_matches_runtime_peer_path(value, peer, path_kind))
+        .filter_map(|value| {
+            let sample = value.get(value_key).and_then(serde_json::Value::as_u64)?;
+            let received_at_ms = value
+                .get("receivedAtMs")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or_default();
+            Some((received_at_ms, sample))
+        })
+        .collect::<Vec<_>>();
+    if samples.is_empty() {
+        return None;
+    }
+    samples.sort_by_key(|(received_at_ms, _)| *received_at_ms);
+    let recent = samples.iter().rev().take(window_size).collect::<Vec<_>>();
+    let total = recent.iter().map(|(_, sample)| *sample).sum::<u64>();
+    Some(((total as f64) / (recent.len() as f64)).round() as u64)
+}
+
+fn json_matches_runtime_peer(value: &serde_json::Value, peer: &RoomRuntimePeer) -> bool {
+    if value
+        .get("peerId")
+        .or_else(|| value.get("targetPeerId"))
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|value| value == peer.peer_id)
+    {
+        return true;
+    }
+    let Some(endpoint) = value
+        .get("peer")
+        .or_else(|| value.get("target"))
+        .and_then(serde_json::Value::as_str)
+    else {
+        return false;
+    };
+    endpoint == peer.endpoint
+        || peer
+            .direct_endpoint
+            .as_deref()
+            .is_some_and(|direct| endpoint == direct)
+        || peer
+            .fallback_endpoint
+            .as_deref()
+            .is_some_and(|fallback| endpoint == fallback)
+}
+
+fn json_matches_runtime_peer_path(
+    value: &serde_json::Value,
+    peer: &RoomRuntimePeer,
+    path_kind: &str,
+) -> bool {
+    if !json_matches_runtime_peer(value, peer) {
+        return false;
+    }
+    let Some(connection_path) = value
+        .get("connectionPath")
+        .and_then(serde_json::Value::as_str)
+    else {
+        return path_kind != "relay";
+    };
+    match path_kind {
+        "relay" => {
+            connection_path.eq_ignore_ascii_case("relay")
+                || connection_path.eq_ignore_ascii_case("relayed")
+        }
+        "direct" => {
+            connection_path.eq_ignore_ascii_case("direct")
+                || connection_path.eq_ignore_ascii_case("p2p")
+        }
+        _ => true,
+    }
+}
+
+fn is_http_relay_endpoint(endpoint: &str) -> bool {
+    let endpoint = endpoint.trim();
+    endpoint.starts_with("http://") || endpoint.starts_with("https://")
 }
 
 fn max_optional_u64(left: Option<u64>, right: Option<u64>) -> Option<u64> {
@@ -6852,6 +9174,147 @@ fn json_array_values(value: &serde_json::Value, key: &str) -> Vec<serde_json::Va
         .and_then(serde_json::Value::as_array)
         .cloned()
         .unwrap_or_default()
+}
+
+fn runtime_http_post_json(
+    url: &str,
+    body: &serde_json::Value,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    runtime_http_json_request("POST", url, Some(&serde_json::to_string(body)?))
+}
+
+fn runtime_http_get_json(url: &str) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    runtime_http_json_request("GET", url, None)
+}
+
+fn runtime_http_json_request(
+    method: &str,
+    url: &str,
+    body: Option<&str>,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    let parsed = parse_runtime_http_url(url)?;
+    let mut stream = runtime_http_connect(&parsed)?;
+    stream.set_read_timeout(Some(Duration::from_secs(3)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(3)))?;
+    let body = body.unwrap_or("");
+    let request = format!(
+        "{method} {} HTTP/1.1\r\nHost: {}\r\nAccept: application/json\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        parsed.path_and_query,
+        parsed.host_header,
+        body.as_bytes().len(),
+        body
+    );
+    stream.write_all(request.as_bytes())?;
+    stream.flush()?;
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response)?;
+    parse_runtime_http_json_response(&response)
+}
+
+fn runtime_http_connect(
+    parsed: &RuntimeParsedHttpUrl,
+) -> Result<TcpStream, Box<dyn std::error::Error>> {
+    let timeout = Duration::from_millis(1500);
+    let mut last_error = None;
+    for addr in (parsed.host.as_str(), parsed.port).to_socket_addrs()? {
+        match TcpStream::connect_timeout(&addr, timeout) {
+            Ok(stream) => return Ok(stream),
+            Err(err) => last_error = Some(err),
+        }
+    }
+    Err(invalid_input(format!(
+        "failed to connect to HTTP relay {} within {}ms: {}",
+        parsed.host_header,
+        timeout.as_millis(),
+        last_error
+            .map(|err| err.to_string())
+            .unwrap_or_else(|| "no resolved addresses".to_owned())
+    ))
+    .into())
+}
+
+struct RuntimeParsedHttpUrl {
+    host: String,
+    port: u16,
+    host_header: String,
+    path_and_query: String,
+}
+
+fn parse_runtime_http_url(url: &str) -> Result<RuntimeParsedHttpUrl, Box<dyn std::error::Error>> {
+    let without_scheme = url
+        .strip_prefix("http://")
+        .ok_or_else(|| invalid_input("only http:// relay URLs are supported".to_owned()))?;
+    let (authority, path_and_query) = match without_scheme.split_once('/') {
+        Some((authority, path)) => (authority, format!("/{path}")),
+        None => (without_scheme, "/".to_owned()),
+    };
+    let (host, port) = match authority.rsplit_once(':') {
+        Some((host, port)) => (host.to_owned(), port.parse::<u16>()?),
+        None => (authority.to_owned(), 80),
+    };
+    if host.is_empty() {
+        return Err(invalid_input("missing HTTP relay host".to_owned()).into());
+    }
+    Ok(RuntimeParsedHttpUrl {
+        host,
+        port,
+        host_header: authority.to_owned(),
+        path_and_query,
+    })
+}
+
+fn parse_runtime_http_json_response(
+    response: &[u8],
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    let header_end = response
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .ok_or_else(|| invalid_input("HTTP response missing header terminator".to_owned()))?;
+    let headers = String::from_utf8_lossy(&response[..header_end]).to_string();
+    let status_code = headers
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .ok_or_else(|| invalid_input("HTTP response missing status code".to_owned()))?
+        .parse::<u16>()?;
+    let body = &response[header_end + 4..];
+    let value = if body.is_empty() {
+        serde_json::json!({})
+    } else {
+        serde_json::from_slice::<serde_json::Value>(body)?
+    };
+    if !(200..300).contains(&status_code) {
+        return Err(invalid_input(format!(
+            "HTTP request failed with status {status_code}: {value}"
+        ))
+        .into());
+    }
+    Ok(value)
+}
+
+fn trim_trailing_slash_local(value: &str) -> &str {
+    value.trim_end_matches('/')
+}
+
+fn percent_encode_runtime(value: &str) -> String {
+    let mut encoded = String::new();
+    for byte in value.as_bytes() {
+        match *byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                encoded.push(*byte as char)
+            }
+            _ => encoded.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    encoded
+}
+
+fn http_relay_pseudo_endpoint(server: &str) -> Result<SocketAddr, Box<dyn std::error::Error>> {
+    let parsed = parse_runtime_http_url(server)?;
+    let mut addrs = (parsed.host.as_str(), parsed.port).to_socket_addrs()?;
+    addrs
+        .next()
+        .ok_or_else(|| invalid_input(format!("could not resolve HTTP relay `{server}`")).into())
 }
 
 struct RuntimeForwardPayloadData {
@@ -6915,6 +9378,89 @@ fn runtime_forward_payload_data(
         raw_tcp_packet,
         raw_ipv4_packet_bytes,
     })
+}
+
+fn runtime_send_icmp_echo_reply(
+    socket: &UdpSocket,
+    key: &str,
+    plan: &RoomRuntimePlan,
+    target: &RuntimeSendTarget,
+    raw_bytes: &[u8],
+    sequence: u64,
+    tcp_relay_clients: &mut HashMap<String, RuntimeTcpRelayClient>,
+) -> Result<Option<(usize, serde_json::Value, serde_json::Value)>, Box<dyn std::error::Error>> {
+    let request = match lai_core::parse_ipv4_icmp_echo_request(raw_bytes) {
+        Ok(request) => request,
+        Err(_) => return Ok(None),
+    };
+    if request.destination_ip != plan.local_virtual_ip {
+        return Ok(None);
+    }
+
+    let reply_bytes = lai_core::build_ipv4_icmp_echo_reply(&request, 64).map_err(invalid_input)?;
+    let reply_summary = lai_core::parse_ipv4_packet_summary(&reply_bytes).map_err(invalid_input)?;
+    let sent_at_ms = current_epoch_ms();
+    let reply_payload = serde_json::json!({
+        "room_id": plan.room_id,
+        "peer_id": plan.local_peer_id,
+        "kind": "runtime-ipv4-forward",
+        "source": reply_summary.source_ip.to_string(),
+        "destination": reply_summary.destination_ip.to_string(),
+        "broadcast": false,
+        "payload_encoding": "raw-ipv4",
+        "raw_ipv4_packet": STANDARD_NO_PAD.encode(&reply_bytes),
+        "raw_ipv4_packet_bytes": reply_bytes.len(),
+        "ipv4_protocol": reply_summary.protocol.clone(),
+        "ipv4_protocol_number": reply_summary.protocol_number,
+        "icmp_echo_reply": true,
+    });
+    let envelope = seal_tunnel_payload(
+        key,
+        "runtime-ipv4-forward",
+        sequence,
+        sent_at_ms,
+        serde_json::to_string(&reply_payload)?.as_bytes(),
+    )?;
+    let wire = serde_json::to_vec(&envelope)?;
+    let sent = runtime_send_wire_to_target(
+        socket,
+        key,
+        &plan.room_id,
+        &plan.local_peer_id,
+        target,
+        &wire,
+        "runtime-ipv4-forward",
+        sequence,
+        tcp_relay_clients,
+    )?;
+
+    let reply_event = serde_json::json!({
+        "target": target.endpoint,
+        "targetPeerId": target.peer_id,
+        "connectionPath": target.connection_path,
+        "sourceIp": reply_summary.source_ip,
+        "destinationIp": reply_summary.destination_ip,
+        "identifier": request.identifier,
+        "sequence": request.sequence,
+        "payloadBytes": request.payload.len(),
+        "rawIpv4PacketBytes": reply_bytes.len(),
+        "sentAtMs": sent_at_ms,
+    });
+    let forwarded_event = serde_json::json!({
+        "target": target.endpoint,
+        "targetPeerId": target.peer_id,
+        "connectionPath": target.connection_path,
+        "source": reply_summary.source_ip,
+        "destination": reply_summary.destination_ip,
+        "bytesSent": sent,
+        "payloadBytes": reply_summary.payload_bytes,
+        "rawIpv4PacketBytes": reply_bytes.len(),
+        "packetIoBackend": "icmp-responder",
+        "protocol": "icmp",
+        "sentAtMs": sent_at_ms,
+    });
+
+    Ok(Some((sent, reply_event, forwarded_event)))
 }
 
 fn runtime_virtual_udp_packet(

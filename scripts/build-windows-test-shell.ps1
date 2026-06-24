@@ -59,6 +59,14 @@ if (Test-Path -LiteralPath $gameProfilesSource) {
     Copy-Item -LiteralPath $gameProfilesSource -Destination $gameProfilesOut -Force
 }
 
+$wintunDll = Join-Path $repoRoot 'tools\wintun\wintun-0.14.1\wintun\bin\amd64\wintun.dll'
+if (Test-Path -LiteralPath $wintunDll) {
+    Copy-Item -LiteralPath $wintunDll -Destination (Join-Path $dist 'wintun.dll') -Force
+}
+else {
+    Write-Warning "wintun.dll was not found. Run scripts\install-wintun.ps1 before real LAN runtime tests."
+}
+
 Write-Host "Built latest Windows test shell:"
 Write-Host "  $desktopOut"
 Write-Host "  $cliOut"
@@ -67,4 +75,7 @@ if (Test-Path -LiteralPath $nativeCliOut) {
 }
 if (Test-Path -LiteralPath $gameProfilesOut) {
     Write-Host "  $gameProfilesOut"
+}
+if (Test-Path -LiteralPath (Join-Path $dist 'wintun.dll')) {
+    Write-Host "  $(Join-Path $dist 'wintun.dll')"
 }

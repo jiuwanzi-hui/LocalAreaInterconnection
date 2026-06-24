@@ -89,12 +89,13 @@ fn create_wintun_adapter_windows(request: WintunAdapterCreateRequest) -> WintunA
         let adapter = create_adapter(adapter_name_wide.as_ptr(), tunnel_type_wide.as_ptr(), guid);
 
         if adapter.is_null() {
+            let error = std::io::Error::last_os_error();
             FreeLibrary(dll);
             WintunAdapterCreateReport {
                 status: "create-failed".to_owned(),
                 adapter_name: None,
                 reboot_required: None,
-                error: Some("WintunCreateAdapter returned null".to_owned()),
+                error: Some(format!("WintunCreateAdapter returned null ({error}).")),
             }
         } else {
             type WintunCloseAdapterFn = unsafe extern "system" fn(*mut std::ffi::c_void);
