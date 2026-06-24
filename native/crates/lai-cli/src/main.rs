@@ -59,6 +59,11 @@ const RUNTIME_HTTP_RELAY_PACKET_MAX_AGE_MS: u128 = 5_000;
 const RUNTIME_RELAY_REGISTRATION_INTERVAL_MS: u64 = 2_000;
 const RUNTIME_DIRECT_RESTORE_CONFIRMATIONS: u8 = 2;
 const RUNTIME_DIRECT_RESTORE_WINDOW_MS: u64 = 3_000;
+const RUNTIME_P2P_REFRESH_INTERVAL_MS: u64 = 15_000;
+const RUNTIME_P2P_REFRESH_IDLE_MS: u64 = 5_000;
+const RUNTIME_P2P_REFRESH_TIMEOUT_MS: u64 = 1_500;
+const RUNTIME_P2P_REFRESH_ATTEMPTS: u16 = 20;
+const RUNTIME_P2P_REFRESH_INTERVAL_PUNCH_MS: u64 = 50;
 const RUNTIME_TUNNEL_READ_TIMEOUT_MS: u64 = 1;
 const RUNTIME_WINTUN_DRAIN_LIMIT: usize = 64;
 const RUNTIME_HEARTBEAT_EVENT_LOG_LIMIT: usize = 20_000;
@@ -5822,9 +5827,10 @@ fn run_room_runtime(
         ),
         started_at_ms,
     );
+    let mut active_plan = plan.clone();
     let mut broadcast_forward_events = Vec::new();
     let mut forward_targets_by_port = runtime_forward_targets(
-        plan,
+        &active_plan,
         &actual_broadcast_ports,
         forward_self_probe,
         tunnel_endpoint,
@@ -5853,12 +5859,13 @@ fn run_room_runtime(
     let mut direct_restore_probe_count = 0u8;
     let mut direct_restore_probe_started_at = None::<Instant>;
     let mut heartbeat_targets =
-        runtime_heartbeat_targets(plan, self_probe, tunnel_endpoint, false)?;
-    let relay_registration_targets = runtime_heartbeat_targets(plan, false, tunnel_endpoint, true)?
-        .into_iter()
-        .filter(RuntimeSendTarget::is_relay)
-        .collect::<Vec<_>>();
-    let direct_probe_heartbeat_targets = runtime_direct_probe_heartbeat_targets(plan)?
+        runtime_heartbeat_targets(&active_plan, self_probe, tunnel_endpoint, false)?;
+    let mut relay_registration_targets =
+        runtime_heartbeat_targets(&active_plan, false, tunnel_endpoint, true)?
+            .into_iter()
+            .filter(RuntimeSendTarget::is_relay)
+            .collect::<Vec<_>>();
+    let mut direct_probe_heartbeat_targets = runtime_direct_probe_heartbeat_targets(&active_plan)?
         .into_iter()
         .filter(|target| !target.is_relay())
         .collect::<Vec<_>>();
@@ -5894,12 +5901,16 @@ fn run_room_runtime(
     let mut next_coordination_publish_at = coordination_publisher
         .as_ref()
         .map(|publisher| started_at + Duration::from_millis(publisher.interval_ms.max(1)));
+    let mut next_coordination_p2p_refresh_at = coordination_publisher
+        .as_ref()
+        .map(|_| started_at + Duration::from_millis(RUNTIME_P2P_REFRESH_INTERVAL_MS.min(5_000)));
     let mut heartbeat_packets = Vec::new();
     let mut heartbeat_ack_packets = Vec::new();
     let mut next_heartbeat_sequence = 1u64;
     let mut next_forward_sequence = 1u64;
     let mut coordination_monitor_reports = Vec::new();
     let mut coordination_publish_reports = Vec::new();
+    let mut coordination_p2p_refresh_reports = Vec::new();
     let mut snapshot_write_count = 0u32;
     let mut last_peer_packet_at = None;
     let mut peer_timed_out = false;
@@ -6077,7 +6088,7 @@ fn run_room_runtime(
                     using_relay_fallback_targets,
                 );
                 let snapshot_peer_summaries = runtime_peer_summaries(
-                    plan,
+                    &active_plan,
                     &[],
                     &tunnel_packets,
                     &forwarded_packets,
@@ -6133,8 +6144,10 @@ fn run_room_runtime(
                     "wintunRuntime": wintun_runtime_open.clone(),
                     "runtimeCleanupPlan": runtime_cleanup_plan.clone(),
                     "runtimePeerSummaries": snapshot_peer_summaries,
+                    "activePlan": active_plan,
                     "coordinationMonitorReports": coordination_monitor_reports.clone(),
                     "coordinationPublishReports": coordination_publish_reports.clone(),
+                    "coordinationP2pRefreshReports": coordination_p2p_refresh_reports.clone(),
                     "relayFallbackActive": using_relay_fallback_targets,
                     "relayFallbackEvents": relay_fallback_events.clone(),
                     "relayRegistrationTargets": relay_registration_targets.iter().map(|target| {
@@ -6241,7 +6254,114 @@ fn run_room_runtime(
             }
         }
 
-        if !plan.peers.is_empty() {
+        if let (Some(publisher), Some(next_refresh)) = (
+            coordination_publisher.as_ref(),
+            next_coordination_p2p_refresh_at,
+        ) {
+            if now >= next_refresh {
+                let latest_traffic = latest_runtime_traffic_at_ms(
+                    &forwarded_packets,
+                    &icmp_echo_requests,
+                    &icmp_echo_replies,
+                    &wintun_runtime_received_packets,
+                    &wintun_runtime_sent_packets,
+                );
+                let idle = latest_traffic
+                    .map(|latest| {
+                        current_epoch_ms().saturating_sub(latest as u128)
+                            >= RUNTIME_P2P_REFRESH_IDLE_MS as u128
+                    })
+                    .unwrap_or(true);
+                if using_relay_fallback_targets && idle {
+                    match runtime_refresh_p2p_from_coordination_server(
+                        &publisher.server,
+                        &mut active_plan,
+                        key,
+                        &tunnel_socket,
+                        publisher.stun_server.as_deref(),
+                        publisher.stun_timeout_ms,
+                        publisher.upnp_port_map,
+                        publisher.upnp_timeout_ms,
+                        publisher.upnp_lease_seconds,
+                        publisher.upnp_gateway_location.as_deref(),
+                        &publisher.relay_endpoints,
+                    ) {
+                        Ok(report) => {
+                            let restored = report
+                                .get("directRestored")
+                                .and_then(serde_json::Value::as_bool)
+                                .unwrap_or(false);
+                            if restored {
+                                using_relay_fallback_targets = false;
+                                direct_restore_probe_endpoint.clear();
+                                direct_restore_probe_count = 0;
+                                direct_restore_probe_started_at = None;
+                                heartbeat_targets = runtime_direct_heartbeat_targets(
+                                    &active_plan,
+                                    self_probe,
+                                    tunnel_endpoint,
+                                )?;
+                                forward_targets_by_port = runtime_direct_forward_targets(
+                                    &active_plan,
+                                    &actual_broadcast_ports,
+                                    forward_self_probe,
+                                    tunnel_endpoint,
+                                )?;
+                                direct_probe_heartbeat_targets =
+                                    runtime_direct_probe_heartbeat_targets(&active_plan)?
+                                        .into_iter()
+                                        .filter(|target| !target.is_relay())
+                                        .collect::<Vec<_>>();
+                                relay_registration_targets = runtime_heartbeat_targets(
+                                    &active_plan,
+                                    false,
+                                    tunnel_endpoint,
+                                    true,
+                                )?
+                                .into_iter()
+                                .filter(RuntimeSendTarget::is_relay)
+                                .collect::<Vec<_>>();
+                                relay_fallback_events.push(serde_json::json!({
+                                    "status": "restored-direct",
+                                    "reason": "coordination-refresh",
+                                    "restoredAtMs": current_epoch_ms(),
+                                    "report": report,
+                                }));
+                            }
+                            coordination_p2p_refresh_reports.push(report);
+                        }
+                        Err(err) => coordination_p2p_refresh_reports.push(serde_json::json!({
+                            "status": "error",
+                            "server": publisher.server.clone(),
+                            "checkedAtMs": current_epoch_ms(),
+                            "error": err.to_string(),
+                        })),
+                    }
+                    tunnel_socket.set_read_timeout(Some(Duration::from_millis(
+                        RUNTIME_TUNNEL_READ_TIMEOUT_MS,
+                    )))?;
+                    trim_event_log(
+                        &mut coordination_p2p_refresh_reports,
+                        RUNTIME_SMALL_DIAGNOSTIC_EVENT_LOG_LIMIT,
+                    );
+                } else {
+                    coordination_p2p_refresh_reports.push(serde_json::json!({
+                        "status": "skipped",
+                        "reason": if using_relay_fallback_targets { "recent-traffic" } else { "not-on-relay-fallback" },
+                        "checkedAtMs": current_epoch_ms(),
+                        "latestTrafficAtMs": latest_traffic,
+                    }));
+                    trim_event_log(
+                        &mut coordination_p2p_refresh_reports,
+                        RUNTIME_SMALL_DIAGNOSTIC_EVENT_LOG_LIMIT,
+                    );
+                }
+                next_coordination_p2p_refresh_at =
+                    Some(now + Duration::from_millis(RUNTIME_P2P_REFRESH_INTERVAL_MS));
+            }
+        }
+
+        if !active_plan.peers.is_empty() {
             if let Some(timeout) = peer_timeout {
                 let timed_out = last_peer_packet_at
                     .map(|last_seen| now.saturating_duration_since(last_seen) > timeout)
@@ -6252,7 +6372,7 @@ fn run_room_runtime(
                         "No runtime tunnel packets were received from configured peers within {peer_timeout_ms}ms."
                     ));
                     if !using_relay_fallback_targets
-                        && plan.peers.iter().any(|peer| {
+                        && active_plan.peers.iter().any(|peer| {
                             peer.fallback_endpoint
                                 .as_deref()
                                 .map(str::trim)
@@ -6263,10 +6383,14 @@ fn run_room_runtime(
                         direct_restore_probe_endpoint.clear();
                         direct_restore_probe_count = 0;
                         direct_restore_probe_started_at = None;
-                        heartbeat_targets =
-                            runtime_heartbeat_targets(plan, self_probe, tunnel_endpoint, true)?;
+                        heartbeat_targets = runtime_heartbeat_targets(
+                            &active_plan,
+                            self_probe,
+                            tunnel_endpoint,
+                            true,
+                        )?;
                         forward_targets_by_port = runtime_forward_targets(
-                            plan,
+                            &active_plan,
                             &actual_broadcast_ports,
                             forward_self_probe,
                             tunnel_endpoint,
@@ -6327,7 +6451,7 @@ fn run_room_runtime(
                             .as_ref()
                             .map(|relay| relay.from_peer_id.clone());
                         let observed_runtime_peer = runtime_observed_configured_peer(
-                            plan,
+                            &active_plan,
                             observed_peer,
                             observed_peer_id.as_deref(),
                             opened.relay.is_some(),
@@ -6374,12 +6498,12 @@ fn run_room_runtime(
                                 direct_restore_probe_count = 0;
                                 direct_restore_probe_started_at = None;
                                 heartbeat_targets = runtime_direct_heartbeat_targets(
-                                    plan,
+                                    &active_plan,
                                     self_probe,
                                     tunnel_endpoint,
                                 )?;
                                 forward_targets_by_port = runtime_direct_forward_targets(
-                                    plan,
+                                    &active_plan,
                                     &actual_broadcast_ports,
                                     forward_self_probe,
                                     tunnel_endpoint,
@@ -6441,7 +6565,7 @@ fn run_room_runtime(
                                     )?;
                                     let wire = serde_json::to_vec(&envelope)?;
                                     let ack_target = runtime_reply_target(
-                                        plan,
+                                        &active_plan,
                                         observed_peer,
                                         opened.relay.as_ref(),
                                     );
@@ -6617,7 +6741,7 @@ fn run_room_runtime(
                                             }));
                                         }
                                         let reply_target = runtime_reply_target(
-                                            plan,
+                                            &active_plan,
                                             observed_peer,
                                             opened.relay.as_ref(),
                                         );
@@ -6966,7 +7090,7 @@ fn run_room_runtime(
                                     };
                                 let udp_forward_targets =
                                     runtime_targets_for_virtual_packet_destination(
-                                        plan,
+                                        &active_plan,
                                         heartbeat_targets.as_slice(),
                                         udp_packet.destination_ip,
                                     );
@@ -7116,7 +7240,7 @@ fn run_room_runtime(
                                     };
                                 let tcp_forward_targets =
                                     runtime_targets_for_virtual_packet_destination(
-                                        plan,
+                                        &active_plan,
                                         heartbeat_targets.as_slice(),
                                         tcp_packet.destination_ip,
                                     );
@@ -7212,7 +7336,7 @@ fn run_room_runtime(
                                 };
                                 let ipv4_forward_targets =
                                     runtime_targets_for_virtual_packet_destination(
-                                        plan,
+                                        &active_plan,
                                         heartbeat_targets.as_slice(),
                                         summary.destination_ip,
                                     );
@@ -7386,7 +7510,7 @@ fn run_room_runtime(
     );
     let tunnel_endpoint_text = tunnel_endpoint.to_string();
     let runtime_peer_summary_values = runtime_peer_summaries(
-        plan,
+        &active_plan,
         &[],
         &tunnel_packets,
         &forwarded_packets,
@@ -7442,10 +7566,10 @@ fn run_room_runtime(
     let runtime_peer_observations =
         runtime_peer_observations_from_summaries(&runtime_peer_summary_values);
     let expected_peer_count = if runtime_peer_observations.is_empty() {
-        if plan.peers.is_empty() {
+        if active_plan.peers.is_empty() {
             connected_peer_count
         } else {
-            plan.peers.len() as u16
+            active_plan.peers.len() as u16
         }
     } else {
         runtime_peer_observations.len() as u16
@@ -7482,7 +7606,7 @@ fn run_room_runtime(
         &wintun_runtime_received_packets,
         &wintun_runtime_sent_packets,
     );
-    let result = serde_json::json!({
+    let mut result = serde_json::json!({
         "status": if tunnel_snapshot.last_error.is_none() && wintun_open_ok && wintun_config_ok { "ok" } else { "degraded" },
         "startedAtMs": started_at_ms,
         "durationMs": duration_ms,
@@ -7532,6 +7656,9 @@ fn run_room_runtime(
         "networkObservation": network_report,
         "runtimePeerSummaries": runtime_peer_summary_values,
     });
+    result["activePlan"] = serde_json::to_value(active_plan)?;
+    result["coordinationP2pRefreshReports"] =
+        serde_json::Value::Array(coordination_p2p_refresh_reports);
     if let Some(path) = snapshot_out {
         write_json_file(path, &result)?;
     }
@@ -7615,6 +7742,112 @@ fn publish_runtime_coordination_offer(
             "stunMapping": stun_mapping,
             "upnpPortMapping": upnp_mapping,
         })),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn runtime_refresh_p2p_from_coordination_server(
+    server: &str,
+    active_plan: &mut RoomRuntimePlan,
+    key: &str,
+    socket: &UdpSocket,
+    stun_server: Option<&str>,
+    stun_timeout_ms: u64,
+    upnp_port_map: bool,
+    upnp_timeout_ms: u64,
+    upnp_lease_seconds: u32,
+    upnp_gateway_location: Option<&str>,
+    relay_endpoints: &[String],
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    let checked_at_ms = current_epoch_ms();
+    let fetch_value =
+        coordination_http_fetch_offers(server, &active_plan.room_id, &active_plan.local_peer_id)?;
+    let fetch: lai_core::CoordinationFetchResult = serde_json::from_value(fetch_value.clone())?;
+    let peers = active_plan.peers.clone();
+    let mut peer_reports = Vec::new();
+
+    for peer in peers {
+        let Some(offer) = runtime_coordination_offer_for_peer(&fetch, &peer.peer_id) else {
+            peer_reports.push(serde_json::json!({
+                "peerId": peer.peer_id,
+                "status": "missing-offer",
+            }));
+            continue;
+        };
+        let mut result = run_nat_p2p_bootstrap_on_socket(
+            socket,
+            &active_plan.room_id,
+            &active_plan.local_peer_id,
+            active_plan.local_virtual_ip,
+            key,
+            offer,
+            None,
+            stun_server,
+            stun_timeout_ms,
+            upnp_port_map,
+            upnp_timeout_ms,
+            upnp_lease_seconds,
+            upnp_gateway_location,
+            udp_relay_endpoints(relay_endpoints),
+            RUNTIME_P2P_REFRESH_ATTEMPTS,
+            RUNTIME_P2P_REFRESH_INTERVAL_PUNCH_MS,
+            RUNTIME_P2P_REFRESH_TIMEOUT_MS,
+        )?;
+        add_relay_candidates_to_bootstrap_result(&mut result, relay_endpoints)?;
+        let direct_endpoint = result
+            .get("selectedPeer")
+            .and_then(|peer| peer.get("endpoint"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned);
+        let restored = result.get("status").and_then(serde_json::Value::as_str) == Some("ok")
+            && direct_endpoint
+                .as_deref()
+                .is_some_and(|endpoint| endpoint.parse::<SocketAddr>().is_ok());
+        if restored {
+            if let Some(endpoint) = direct_endpoint.as_deref() {
+                runtime_update_active_peer_direct_endpoint(active_plan, &peer.peer_id, endpoint);
+            }
+        }
+        peer_reports.push(serde_json::json!({
+            "peerId": peer.peer_id,
+            "status": if restored { "direct-restored" } else { "not-restored" },
+            "directEndpoint": direct_endpoint,
+            "result": result,
+        }));
+        if restored {
+            return Ok(serde_json::json!({
+                "status": "ok",
+                "server": server,
+                "checkedAtMs": checked_at_ms,
+                "directRestored": true,
+                "peerReports": peer_reports,
+                "fetch": fetch_value,
+            }));
+        }
+    }
+
+    Ok(serde_json::json!({
+        "status": "no-direct-refresh",
+        "server": server,
+        "checkedAtMs": checked_at_ms,
+        "directRestored": false,
+        "peerReports": peer_reports,
+        "fetch": fetch_value,
+    }))
+}
+
+fn runtime_update_active_peer_direct_endpoint(
+    plan: &mut RoomRuntimePlan,
+    peer_id: &str,
+    direct_endpoint: &str,
+) {
+    if let Some(peer) = plan.peers.iter_mut().find(|peer| peer.peer_id == peer_id) {
+        if peer.fallback_endpoint.is_none() && peer.connection_path.eq_ignore_ascii_case("relay") {
+            peer.fallback_endpoint = Some(peer.endpoint.clone());
+        }
+        peer.direct_endpoint = Some(direct_endpoint.to_owned());
+        peer.endpoint = direct_endpoint.to_owned();
+        peer.connection_path = "direct".to_owned();
     }
 }
 
@@ -7753,7 +7986,8 @@ mod tests {
         latest_runtime_traffic_at_ms, next_runtime_sequence, runtime_active_connection_path,
         runtime_connected_peer_count_from_summaries, runtime_peer_from_bootstrap_result,
         runtime_peer_summaries, runtime_reply_target,
-        runtime_targets_for_virtual_packet_destination, trim_event_log, RuntimeSendTarget,
+        runtime_targets_for_virtual_packet_destination, runtime_update_active_peer_direct_endpoint,
+        trim_event_log, RuntimeSendTarget,
     };
     use lai_core::{
         NatCandidate, NatTraversalOffer, NetworkCommand, RoomRuntimePeer, RoomRuntimePlan,
@@ -8117,6 +8351,46 @@ mod tests {
         assert_eq!(direct_probe_summary[0]["selectedPath"], "direct");
         assert_eq!(direct_probe_summary[0]["pathKind"], "direct");
         assert_eq!(direct_probe_summary[0]["latencyMs"], 4);
+    }
+
+    #[test]
+    fn runtime_active_plan_update_preserves_relay_fallback_endpoint() {
+        let mut plan = RoomRuntimePlan {
+            room_id: "room".to_owned(),
+            local_peer_id: "peer_a".to_owned(),
+            local_virtual_ip: Ipv4Addr::new(10, 77, 12, 2),
+            tunnel: RuntimeTunnelPlan {
+                bind_endpoint: "127.0.0.1:0".to_owned(),
+                encryption: "psk".to_owned(),
+                handshake: "p2p".to_owned(),
+                peer_count: 1,
+            },
+            peers: vec![RoomRuntimePeer {
+                peer_id: "peer_b".to_owned(),
+                virtual_ip: Ipv4Addr::new(10, 77, 12, 3),
+                endpoint: "49.235.146.152:39091".to_owned(),
+                connection_path: "relay".to_owned(),
+                direct_endpoint: None,
+                fallback_endpoint: None,
+            }],
+            capture_ports: Vec::<RuntimePortBinding>::new(),
+            udp_forwarders: Vec::<RuntimeUdpForwardPlan>::new(),
+            diagnostic_outputs: Vec::new(),
+            warnings: Vec::new(),
+        };
+
+        runtime_update_active_peer_direct_endpoint(&mut plan, "peer_b", "198.51.100.10:41000");
+
+        assert_eq!(plan.peers[0].endpoint, "198.51.100.10:41000");
+        assert_eq!(plan.peers[0].connection_path, "direct");
+        assert_eq!(
+            plan.peers[0].direct_endpoint.as_deref(),
+            Some("198.51.100.10:41000")
+        );
+        assert_eq!(
+            plan.peers[0].fallback_endpoint.as_deref(),
+            Some("49.235.146.152:39091")
+        );
     }
 
     #[test]
