@@ -1310,6 +1310,11 @@ public partial class LocalAreaInterconnectionDesktop
         return fallback;
     }
 
+    string RuntimeBroadcastPortText()
+    {
+        return "39078";
+    }
+
     string RunCli(string arguments)
     {
         string exe = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "LocalAreaInterconnection.Cli.exe");

@@ -1,3 +1,4 @@
+use base64::{engine::general_purpose::STANDARD_NO_PAD, Engine as _};
 use lai_core::{
     create_p2p_handshake_ack, create_p2p_handshake_confirm, create_p2p_handshake_hello,
     open_tunnel_payload, seal_tunnel_payload, P2pHandshakeAck, P2pHandshakeConfirm,
@@ -617,6 +618,7 @@ pub fn run_nat_p2p_bootstrap_on_socket(
     let mut punch_packets = Vec::new();
     let mut handshake_packets = Vec::new();
     let mut ignored_packets = Vec::new();
+    let mut deferred_packets = Vec::new();
     let mut selected_peer = None;
     let mut answered_hello_nonce = None::<String>;
     let mut buffer = vec![0u8; 65_535];
@@ -654,38 +656,56 @@ pub fn run_nat_p2p_bootstrap_on_socket(
                 })
                 .to_string();
                 for target in &plan.target_endpoints {
-                    let sent = send_udp_to(socket, payload.as_bytes(), target)?;
-                    punch_packets.push(serde_json::json!({
-                        "target": target,
-                        "attempt": punch_attempt,
-                        "bytes": sent,
-                    }));
+                    record_udp_send_packet(
+                        &mut punch_packets,
+                        serde_json::json!({
+                            "target": target,
+                            "attempt": punch_attempt,
+                        }),
+                        send_udp_to(socket, payload.as_bytes(), target),
+                    );
                 }
                 punch_attempt = punch_attempt.saturating_add(1);
                 next_punch_at = now + punch_interval;
             }
             if Instant::now() >= next_handshake_resend_at {
                 for target in &plan.target_endpoints {
-                    let sent = send_udp_to(socket, &envelope_bytes, target)?;
-                    handshake_packets.push(serde_json::json!({
-                        "target": target,
-                        "packetKind": "p2p-handshake-hello",
-                        "bytes": sent,
-                    }));
+                    record_udp_send_packet(
+                        &mut handshake_packets,
+                        serde_json::json!({
+                            "target": target,
+                            "packetKind": "p2p-handshake-hello",
+                        }),
+                        send_udp_to(socket, &envelope_bytes, target),
+                    );
                 }
                 next_handshake_resend_at = Instant::now() + handshake_resend_interval;
             }
             match socket.recv_from(&mut buffer) {
                 Ok((received, peer)) => {
+                    let received_wire = &buffer[..received];
                     let envelope: TunnelEnvelope = match serde_json::from_slice(&buffer[..received])
                     {
                         Ok(value) => value,
                         Err(_) => {
-                            ignored_packets.push(serde_json::json!({
-                                "peer": peer.to_string(),
-                                "bytes": received,
-                                "reason": "not-tunnel-envelope",
-                            }));
+                            if should_defer_runtime_packet(received_wire) {
+                                deferred_packets.push(deferred_runtime_packet(
+                                    peer,
+                                    received_wire,
+                                    "runtime-packet-during-bootstrap",
+                                ));
+                                ignored_packets.push(serde_json::json!({
+                                    "peer": peer.to_string(),
+                                    "bytes": received,
+                                    "reason": "deferred-runtime-packet",
+                                }));
+                            } else {
+                                ignored_packets.push(serde_json::json!({
+                                    "peer": peer.to_string(),
+                                    "bytes": received,
+                                    "reason": "not-tunnel-envelope",
+                                }));
+                            }
                             continue;
                         }
                     };
@@ -730,12 +750,23 @@ pub fn run_nat_p2p_bootstrap_on_socket(
                             &ack_bytes,
                         )?;
                         let ack_wire = serde_json::to_vec(&ack_envelope)?;
-                        let sent = send_udp_to(socket, &ack_wire, peer)?;
-                        handshake_packets.push(serde_json::json!({
-                            "target": peer.to_string(),
-                            "packetKind": "p2p-handshake-ack",
-                            "bytes": sent,
-                        }));
+                        let ack_sent = record_udp_send_packet(
+                            &mut handshake_packets,
+                            serde_json::json!({
+                                "target": peer.to_string(),
+                                "packetKind": "p2p-handshake-ack",
+                            }),
+                            send_udp_to(socket, &ack_wire, peer),
+                        );
+                        if !ack_sent {
+                            ignored_packets.push(serde_json::json!({
+                                "peer": peer.to_string(),
+                                "bytes": received,
+                                "reason": "handshake-ack-send-error",
+                                "packetKind": payload.metadata.packet_kind,
+                            }));
+                            continue;
+                        }
                         ignored_packets.push(serde_json::json!({
                             "peer": peer.to_string(),
                             "bytes": received,
@@ -783,6 +814,20 @@ pub fn run_nat_p2p_bootstrap_on_socket(
                         }
                         continue;
                     }
+                    if !payload.metadata.packet_kind.starts_with("p2p-handshake-") {
+                        deferred_packets.push(deferred_runtime_packet(
+                            peer,
+                            received_wire,
+                            "runtime-packet-during-bootstrap",
+                        ));
+                        ignored_packets.push(serde_json::json!({
+                            "peer": peer.to_string(),
+                            "bytes": received,
+                            "reason": "deferred-runtime-packet",
+                            "packetKind": payload.metadata.packet_kind,
+                        }));
+                        continue;
+                    }
                     if payload.metadata.packet_kind != "p2p-handshake-ack" {
                         ignored_packets.push(serde_json::json!({
                             "peer": peer.to_string(),
@@ -816,12 +861,20 @@ pub fn run_nat_p2p_bootstrap_on_socket(
                             &confirm_bytes,
                         )?;
                         let confirm_wire = serde_json::to_vec(&confirm_envelope)?;
-                        let sent = send_udp_to(socket, &confirm_wire, peer)?;
-                        handshake_packets.push(serde_json::json!({
-                            "target": peer.to_string(),
-                            "packetKind": "p2p-handshake-confirm",
-                            "bytes": sent,
-                        }));
+                        for burst_index in 0..3u8 {
+                            record_udp_send_packet(
+                                &mut handshake_packets,
+                                serde_json::json!({
+                                    "target": peer.to_string(),
+                                    "packetKind": "p2p-handshake-confirm",
+                                    "burstIndex": burst_index,
+                                }),
+                                send_udp_to(socket, &confirm_wire, peer),
+                            );
+                            if burst_index < 2 {
+                                std::thread::sleep(Duration::from_millis(15));
+                            }
+                        }
                     }
                     selected_peer = Some(serde_json::json!({
                         "endpoint": peer.to_string(),
@@ -883,8 +936,65 @@ pub fn run_nat_p2p_bootstrap_on_socket(
         "punchPackets": punch_packets,
         "handshakePackets": handshake_packets,
         "ignoredPackets": ignored_packets,
+        "deferredPackets": deferred_packets,
         "selectedPeer": selected_peer,
     }))
+}
+
+fn record_udp_send_packet(
+    packets: &mut Vec<serde_json::Value>,
+    mut event: serde_json::Value,
+    result: io::Result<usize>,
+) -> bool {
+    let sent = match result {
+        Ok(bytes) => {
+            set_json_field(&mut event, "bytes", serde_json::json!(bytes));
+            true
+        }
+        Err(err) => {
+            set_json_field(&mut event, "status", serde_json::json!("send-error"));
+            set_json_field(
+                &mut event,
+                "errorKind",
+                serde_json::json!(format!("{:?}", err.kind())),
+            );
+            set_json_field(&mut event, "error", serde_json::json!(err.to_string()));
+            false
+        }
+    };
+    packets.push(event);
+    sent
+}
+
+fn set_json_field(event: &mut serde_json::Value, key: &str, value: serde_json::Value) {
+    if let Some(object) = event.as_object_mut() {
+        object.insert(key.to_owned(), value);
+    }
+}
+
+fn should_defer_runtime_packet(wire: &[u8]) -> bool {
+    if wire.starts_with(b"LAIR1") {
+        return true;
+    }
+    serde_json::from_slice::<serde_json::Value>(wire)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("kind")
+                .or_else(|| value.get("packetKind"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        })
+        .is_some_and(|kind| kind.starts_with("relay-"))
+}
+
+fn deferred_runtime_packet(peer: SocketAddr, wire: &[u8], reason: &str) -> serde_json::Value {
+    serde_json::json!({
+        "peer": peer.to_string(),
+        "bytes": STANDARD_NO_PAD.encode(wire),
+        "byteCount": wire.len(),
+        "reason": reason,
+    })
 }
 
 pub fn run_nat_hole_punch_loopback_test(
@@ -1634,7 +1744,7 @@ fn invalid_input(message: String) -> Box<dyn std::error::Error> {
 
 #[cfg(test)]
 mod tests {
-    use super::{bind_udp_socket, send_udp_to};
+    use super::{bind_udp_socket, send_udp_to, should_defer_runtime_packet};
     use std::net::UdpSocket;
     use std::time::Duration;
 
@@ -1650,5 +1760,17 @@ mod tests {
         let mut buffer = [0u8; 16];
         let (received, _) = receiver.recv_from(&mut buffer).unwrap();
         assert_eq!(&buffer[..received], b"ping");
+    }
+
+    #[test]
+    fn p2p_bootstrap_defers_relay_runtime_packets_but_not_nat_punches() {
+        let relay_packet = b"LAIR1\x02\x00\x04room\x00\x06peer_a\x00\x06peer_b\x00\x00\x00\x00";
+        let relay_json = br#"{"kind":"relay-udp-forward","bytes":"abc"}"#;
+        let nat_punch = br#"{"schemaVersion":1,"type":"nat-punch","peerId":"peer_a"}"#;
+
+        assert!(should_defer_runtime_packet(relay_packet));
+        assert!(should_defer_runtime_packet(relay_json));
+        assert!(!should_defer_runtime_packet(nat_punch));
+        assert!(!should_defer_runtime_packet(b"not-json"));
     }
 }

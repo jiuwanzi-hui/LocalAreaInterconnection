@@ -485,7 +485,7 @@ public partial class LocalAreaInterconnectionDesktop
             + PingArgs()
             + PacketObservationArgs()
             + RuntimeSnapshotArgs()
-            + " --broadcast-ports " + ports.Text
+            + " --broadcast-ports " + RuntimeBroadcastPortText()
             + " --game-ports " + ports.Text;
     }
 
@@ -501,7 +501,7 @@ public partial class LocalAreaInterconnectionDesktop
             + PingArgs()
             + PacketObservationArgs()
             + RuntimeSnapshotArgs()
-            + " --broadcast-ports " + ports.Text
+            + " --broadcast-ports " + RuntimeBroadcastPortText()
             + " --game-ports " + ports.Text
             + " --game-name " + Quote(gameName.Text)
             + GameCatalogArgs()
@@ -922,7 +922,7 @@ public partial class LocalAreaInterconnectionDesktop
             : AllocateNativeRuntimeBindForStart();
         string roomKey = RuntimeRoomKey();
         string gamePort = FirstPortText("27015");
-        string broadcastPort = FirstPortText("39078");
+        string broadcastPort = RuntimeBroadcastPortText();
         string coordinationServerValue = coordinationServer.Text.Trim();
         string stunServerValue = stunServer.Text.Trim();
         int runtimePort = RuntimePortFromBind(bind);

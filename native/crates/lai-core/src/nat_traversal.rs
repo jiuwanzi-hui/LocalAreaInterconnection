@@ -2,6 +2,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::net::{Ipv4Addr, SocketAddr};
 
+const SRFLX_PORT_PROBE_WINDOW: u16 = 2;
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct NatCandidate {
     pub candidate_type: String,
@@ -121,12 +123,18 @@ pub fn create_nat_punch_plan(
         .iter()
         .filter(|candidate| candidate.transport.eq_ignore_ascii_case("udp"))
         .filter(|candidate| !candidate.candidate_type.eq_ignore_ascii_case("relay"))
-        .map(|candidate| {
-            (
-                punch_candidate_rank(candidate),
-                candidate.priority,
-                candidate.endpoint.clone(),
-            )
+        .flat_map(|candidate| {
+            candidate
+                .target_endpoints()
+                .into_iter()
+                .map(move |(target_rank, endpoint)| {
+                    (
+                        punch_candidate_rank(candidate),
+                        candidate.priority,
+                        target_rank,
+                        endpoint,
+                    )
+                })
         })
         .collect::<Vec<_>>();
     targets.sort_by(|left, right| {
@@ -134,12 +142,14 @@ pub fn create_nat_punch_plan(
             .0
             .cmp(&left.0)
             .then_with(|| right.1.cmp(&left.1))
-            .then_with(|| left.2.cmp(&right.2))
+            .then_with(|| right.2.cmp(&left.2))
+            .then_with(|| left.3.cmp(&right.3))
     });
-    targets.dedup_by(|left, right| left.2 == right.2);
+    let mut seen_targets = HashSet::new();
+    targets.retain(|target| seen_targets.insert(target.3.clone()));
     let targets = targets
         .into_iter()
-        .map(|(_, _, endpoint)| endpoint)
+        .map(|(_, _, _, endpoint)| endpoint)
         .collect::<Vec<_>>();
 
     let status = if local_offer.room_id != remote_offer.room_id {
@@ -154,7 +164,7 @@ pub fn create_nat_punch_plan(
     .to_owned();
 
     let next_action = match status.as_str() {
-        "ready" => "Send small UDP punch packets to every target endpoint at the configured interval, then start the encrypted P2P handshake.".to_owned(),
+        "ready" => "Send small UDP punch packets to every target endpoint at the configured interval, including a small srflx port-neighbor probe window, then start the encrypted P2P handshake.".to_owned(),
         "room-mismatch" => "Reject this candidate exchange; both peers must use the same room id.".to_owned(),
         "same-peer" => "Reject this candidate exchange; a peer cannot punch to itself.".to_owned(),
         _ => "Wait for the remote peer to publish at least one UDP candidate endpoint.".to_owned(),
@@ -197,6 +207,32 @@ fn punch_candidate_rank(candidate: &NatCandidate) -> u8 {
         2
     } else {
         0
+    }
+}
+
+trait NatCandidateTargetEndpoints {
+    fn target_endpoints(&self) -> Vec<(u8, String)>;
+}
+
+impl NatCandidateTargetEndpoints for NatCandidate {
+    fn target_endpoints(&self) -> Vec<(u8, String)> {
+        let mut endpoints = vec![(2, self.endpoint.clone())];
+        if self.candidate_type.eq_ignore_ascii_case("srflx")
+            && !self.source.eq_ignore_ascii_case("upnp-port-mapping")
+        {
+            if let Ok(endpoint) = self.endpoint.parse::<SocketAddr>() {
+                let port = endpoint.port();
+                for offset in 1..=SRFLX_PORT_PROBE_WINDOW {
+                    if let Some(lower) = port.checked_sub(offset).filter(|value| *value > 0) {
+                        endpoints.push((1, SocketAddr::new(endpoint.ip(), lower).to_string()));
+                    }
+                    if let Some(upper) = port.checked_add(offset) {
+                        endpoints.push((1, SocketAddr::new(endpoint.ip(), upper).to_string()));
+                    }
+                }
+            }
+        }
+        endpoints
     }
 }
 
@@ -257,7 +293,17 @@ mod tests {
         let plan = create_nat_punch_plan(&local, &remote, 3, 25);
 
         assert_eq!(plan.status, "ready");
-        assert_eq!(plan.target_endpoints.len(), 2);
+        assert_eq!(plan.target_endpoints.len(), 6);
+        assert_eq!(plan.target_endpoints[0], "192.0.2.10:40000");
+        assert!(plan
+            .target_endpoints
+            .contains(&"192.0.2.10:39999".to_owned()));
+        assert!(plan
+            .target_endpoints
+            .contains(&"192.0.2.10:40001".to_owned()));
+        assert!(plan
+            .target_endpoints
+            .contains(&"127.0.0.1:10001".to_owned()));
         assert_eq!(plan.attempt_count, 3);
     }
 
@@ -318,9 +364,61 @@ mod tests {
             vec![
                 "198.51.100.20:39090",
                 "198.51.100.20:44000",
+                "198.51.100.20:43998",
+                "198.51.100.20:43999",
+                "198.51.100.20:44001",
+                "198.51.100.20:44002",
                 "192.168.1.20:39090",
             ]
         );
+    }
+
+    #[test]
+    fn punch_plan_deduplicates_expanded_targets_after_priority_sort() {
+        let local = create_nat_traversal_offer(
+            "room",
+            "peer_a",
+            "a",
+            1,
+            "10.0.0.2:10000".parse().unwrap(),
+            None,
+            vec![],
+        );
+        let remote = NatTraversalOffer {
+            schema_version: 1,
+            room_id: "room".to_owned(),
+            peer_id: "peer_b".to_owned(),
+            virtual_ip: None,
+            nonce: "b".to_owned(),
+            created_at_ms: 1,
+            candidates: vec![
+                NatCandidate {
+                    candidate_type: "srflx".to_owned(),
+                    transport: "udp".to_owned(),
+                    endpoint: "198.51.100.20:44000".to_owned(),
+                    priority: 90,
+                    source: "observed-endpoint".to_owned(),
+                },
+                NatCandidate {
+                    candidate_type: "host".to_owned(),
+                    transport: "udp".to_owned(),
+                    endpoint: "198.51.100.20:44000".to_owned(),
+                    priority: 100,
+                    source: "local-socket".to_owned(),
+                },
+            ],
+        };
+
+        let plan = create_nat_punch_plan(&local, &remote, 3, 25);
+
+        assert_eq!(
+            plan.target_endpoints
+                .iter()
+                .filter(|endpoint| endpoint.as_str() == "198.51.100.20:44000")
+                .count(),
+            1
+        );
+        assert_eq!(plan.target_endpoints[0], "198.51.100.20:44000");
     }
 
     #[test]

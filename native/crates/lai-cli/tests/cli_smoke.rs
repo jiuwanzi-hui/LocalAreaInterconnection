@@ -3775,6 +3775,14 @@ fn room_runtime_run_publishes_coordination_offer_from_runtime_socket() {
         value["coordinationPublishReports"][0]["localEndpoint"],
         value["actualTunnelEndpoint"]
     );
+    assert_eq!(
+        value["coordinationPublishReports"][0]["source"],
+        "cached-initial-offer"
+    );
+    assert_eq!(
+        value["coordinationPublishReports"][0]["liveStunSkipped"],
+        true
+    );
     let _ = server_output;
 }
 
@@ -5788,7 +5796,14 @@ fn nat_p2p_bootstrap_punches_then_completes_encrypted_handshake() {
     assert_eq!(bootstrap["selectedPeer"]["handshakeRole"], "received-ack");
     assert_eq!(bootstrap["selectedPeer"]["confirmedByAck"], true);
     assert_eq!(bootstrap["punchPackets"].as_array().unwrap().len(), 1);
-    assert_eq!(bootstrap["handshakePackets"].as_array().unwrap().len(), 2);
+    let handshake_packets = bootstrap["handshakePackets"].as_array().unwrap();
+    assert_eq!(handshake_packets.len(), 4);
+    assert_eq!(handshake_packets[1]["packetKind"], "p2p-handshake-confirm");
+    assert_eq!(handshake_packets[1]["burstIndex"], 0);
+    assert_eq!(handshake_packets[2]["packetKind"], "p2p-handshake-confirm");
+    assert_eq!(handshake_packets[2]["burstIndex"], 1);
+    assert_eq!(handshake_packets[3]["packetKind"], "p2p-handshake-confirm");
+    assert_eq!(handshake_packets[3]["burstIndex"], 2);
     assert!(
         listener_output.status.success(),
         "listener failed\nstatus: {}\nstdout: {}\nstderr: {}",
@@ -5804,6 +5819,99 @@ fn nat_p2p_bootstrap_punches_then_completes_encrypted_handshake() {
         .as_array()
         .unwrap()
         .is_empty());
+}
+
+#[test]
+fn nat_p2p_bootstrap_continues_after_candidate_send_error() {
+    let probe = UdpSocket::bind("127.0.0.1:0").expect("free udp port");
+    let listener_addr = probe.local_addr().unwrap();
+    drop(probe);
+
+    let listener = Command::new(env!("CARGO_BIN_EXE_lai-cli"))
+        .args([
+            "p2p-handshake-listen",
+            "--bind",
+            &listener_addr.to_string(),
+            "--key",
+            "test-room-key",
+            "--responder-peer-id",
+            "peer_b",
+            "--max-packets",
+            "1",
+            "--timeout-ms",
+            "2000",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn p2p listener");
+    std::thread::sleep(Duration::from_millis(80));
+
+    let remote_offer = serde_json::json!({
+        "schema_version": 1,
+        "room_id": "room_test",
+        "peer_id": "peer_b",
+        "nonce": "nonce-b",
+        "created_at_ms": 1,
+        "candidates": [
+            {
+                "candidate_type": "host",
+                "transport": "udp",
+                "endpoint": "[2001:db8::1]:65000",
+                "priority": 200,
+                "source": "unreachable-test-candidate"
+            },
+            {
+                "candidate_type": "host",
+                "transport": "udp",
+                "endpoint": listener_addr.to_string(),
+                "priority": 100,
+                "source": "test-listener"
+            }
+        ]
+    });
+    let remote_offer = serde_json::to_string(&remote_offer).unwrap();
+    let bootstrap = run_cli(&[
+        "nat-p2p-bootstrap",
+        "--room-id",
+        "room_test",
+        "--peer-id",
+        "peer_a",
+        "--virtual-ip",
+        "10.77.12.2",
+        "--key",
+        "test-room-key",
+        "--bind",
+        "127.0.0.1:0",
+        "--remote-offer",
+        &remote_offer,
+        "--punch-attempts",
+        "1",
+        "--punch-interval-ms",
+        "0",
+        "--handshake-timeout-ms",
+        "2000",
+    ]);
+    let listener_output = listener.wait_with_output().expect("listener exits");
+
+    assert_eq!(bootstrap["status"], "ok");
+    assert_eq!(bootstrap["selectedPeer"]["responderPeerId"], "peer_b");
+    assert!(
+        bootstrap["punchPackets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .chain(bootstrap["handshakePackets"].as_array().unwrap().iter())
+            .any(|packet| packet["status"] == "send-error"),
+        "bootstrap should record the unreachable candidate send error: {bootstrap:#?}"
+    );
+    assert!(
+        listener_output.status.success(),
+        "listener failed\nstatus: {}\nstdout: {}\nstderr: {}",
+        listener_output.status,
+        String::from_utf8_lossy(&listener_output.stdout),
+        String::from_utf8_lossy(&listener_output.stderr)
+    );
 }
 
 #[test]

@@ -163,6 +163,8 @@ fn is_p2p_failure(status: &str) -> bool {
             | "unreachable"
             | "disconnected"
             | "no-response"
+            | "sent-no-response"
+            | "handshake-timeout"
     )
 }
 
@@ -231,6 +233,23 @@ mod tests {
         assert_eq!(plan.status, "relay-available");
         assert_eq!(plan.p2p_candidate_count, 1);
         assert_eq!(plan.relay_candidate_count, 1);
+        assert_eq!(plan.selected_relay_endpoints, vec!["203.0.113.10:39090"]);
+    }
+
+    #[test]
+    fn fallback_plan_treats_handshake_timeout_as_p2p_failure() {
+        let local = offer("peer_a", vec![candidate("host", "127.0.0.1:39090", 100)]);
+        let remote = offer(
+            "peer_b",
+            vec![
+                candidate("host", "127.0.0.1:39091", 100),
+                candidate("relay", "203.0.113.10:39090", 10),
+            ],
+        );
+
+        let plan = create_relay_fallback_plan(&local, &remote, "handshake-timeout");
+
+        assert_eq!(plan.status, "relay-available");
         assert_eq!(plan.selected_relay_endpoints, vec!["203.0.113.10:39090"]);
     }
 
