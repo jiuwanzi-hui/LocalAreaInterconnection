@@ -1565,6 +1565,8 @@ fn room_runtime_run_restores_direct_path_after_relay_fallback() {
     let value_a: Value = serde_json::from_slice(&output_a.stdout).expect("peer a json");
     assert_eq!(value_a["status"], "ok");
     assert_eq!(value_a["relayFallbackActive"], false);
+    assert_eq!(value_a["tunnelServiceSnapshot"]["connection_path"], "p2p");
+    assert_eq!(value_a["runtimePeerSummaries"][0]["pathKind"], "direct");
     assert_eq!(value_a["tunnelServiceSnapshot"]["last_error"], Value::Null);
     assert!(value_a["relayFallbackEvents"]
         .as_array()

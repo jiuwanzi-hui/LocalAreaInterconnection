@@ -9014,13 +9014,9 @@ fn runtime_observed_connection_path(
         .iter()
         .chain(heartbeat_ack_packets.iter())
         .filter(|packet| json_matches_runtime_peer(packet, peer))
-        .filter_map(|packet| {
-            packet
-                .get("connectionPath")
-                .and_then(serde_json::Value::as_str)
-        })
-        .find(|path| !path.trim().is_empty())
-        .map(str::to_owned);
+        .filter_map(runtime_packet_path_sample)
+        .max_by_key(|sample| sample.0)
+        .map(|sample| sample.1);
     observed.or_else(|| {
         if is_http_relay_endpoint(&peer.endpoint)
             || peer.connection_path.eq_ignore_ascii_case("relay")
@@ -9038,20 +9034,33 @@ fn runtime_connection_path_from_packets(
     tunnel_packets: &[serde_json::Value],
     heartbeat_ack_packets: &[serde_json::Value],
 ) -> String {
-    let has_relay = tunnel_packets
+    tunnel_packets
         .iter()
         .chain(heartbeat_ack_packets.iter())
-        .any(|packet| {
-            packet
-                .get("connectionPath")
-                .and_then(serde_json::Value::as_str)
-                .is_some_and(|path| path.eq_ignore_ascii_case("relay"))
-        });
-    if has_relay {
-        "relay".to_owned()
-    } else {
-        "p2p".to_owned()
-    }
+        .filter_map(runtime_packet_path_sample)
+        .max_by_key(|sample| sample.0)
+        .map(|sample| {
+            if sample.1.eq_ignore_ascii_case("direct") {
+                "p2p".to_owned()
+            } else {
+                sample.1
+            }
+        })
+        .unwrap_or_else(|| "p2p".to_owned())
+}
+
+fn runtime_packet_path_sample(packet: &serde_json::Value) -> Option<(u64, String)> {
+    let path = packet
+        .get("connectionPath")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|path| !path.is_empty())?;
+    let timestamp = packet
+        .get("receivedAtMs")
+        .or_else(|| packet.get("sentAtMs"))
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or_default();
+    Some((timestamp, path.to_owned()))
 }
 
 fn sum_peer_json_bytes(
