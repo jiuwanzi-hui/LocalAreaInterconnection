@@ -1066,17 +1066,15 @@ public partial class LocalAreaInterconnectionDesktop
             if (virtualIp.Length == 0) virtualIp = JsonStringValue(member, "virtualIp");
             if (SafePeerId(peer) == SafePeerId(specPeer) && virtualIp == specIp)
             {
-                string offerCreated = JsonNumberValue(member, "offer_created_at_ms");
-                if (offerCreated.Length == 0) offerCreated = JsonNumberValue(member, "offerCreatedAtMs");
                 string candidateCount = JsonNumberValue(member, "candidate_count");
                 if (candidateCount.Length == 0) candidateCount = JsonNumberValue(member, "candidateCount");
                 string endpoint = JsonStringValue(member, "preferred_endpoint");
                 if (endpoint.Length == 0) endpoint = JsonStringValue(member, "preferredEndpoint");
-                if (offerCreated.Length == 0 && candidateCount.Length == 0 && endpoint.Length == 0)
+                if (candidateCount.Length == 0 && endpoint.Length == 0)
                 {
                     return "";
                 }
-                return SafePeerId(peer) + "|" + virtualIp + "|" + offerCreated + "|" + candidateCount + "|" + endpoint;
+                return SafePeerId(peer) + "|" + virtualIp + "|" + candidateCount + "|" + endpoint;
             }
             search = end + 1;
         }
