@@ -1007,8 +1007,7 @@ public partial class LocalAreaInterconnectionDesktop
             return true;
         }
 
-        string path = RuntimePrimaryPathKind(snapshot);
-        return path == "relay";
+        return false;
     }
 
     bool RemotePeerTargetsSamePeer(string current, string next)
