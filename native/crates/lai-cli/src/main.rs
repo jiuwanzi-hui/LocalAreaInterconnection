@@ -2881,7 +2881,7 @@ fn best_direct_candidate_endpoint(offer: &lai_core::NatTraversalOffer) -> Option
         .filter(|candidate| !candidate.candidate_type.eq_ignore_ascii_case("relay"))
         .map(|candidate| {
             (
-                runtime_candidate_rank(&candidate.candidate_type),
+                runtime_candidate_rank(&candidate.candidate_type, &candidate.source),
                 candidate.priority,
                 candidate.endpoint.clone(),
             )
@@ -2894,19 +2894,24 @@ fn best_direct_candidate_endpoint(offer: &lai_core::NatTraversalOffer) -> Option
             .then_with(|| right.1.cmp(&left.1))
             .then_with(|| left.2.cmp(&right.2))
     });
+    candidates.dedup_by(|left, right| left.2 == right.2);
     candidates
         .into_iter()
         .map(|(_, _, endpoint)| endpoint)
         .next()
 }
 
-fn runtime_candidate_rank(candidate_type: &str) -> u8 {
+fn runtime_candidate_rank(candidate_type: &str, source: &str) -> u8 {
     if candidate_type.eq_ignore_ascii_case("srflx") {
-        3
+        if source.eq_ignore_ascii_case("upnp-port-mapping") {
+            4
+        } else {
+            3
+        }
     } else if candidate_type.eq_ignore_ascii_case("host") {
         2
     } else {
-        1
+        0
     }
 }
 
@@ -7648,13 +7653,14 @@ fn next_runtime_sequence(next_sequence: &mut u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        is_benign_route_result, latest_runtime_traffic_at_ms, next_runtime_sequence,
-        runtime_connected_peer_count_from_summaries, runtime_peer_from_bootstrap_result,
-        runtime_targets_for_virtual_packet_destination, trim_event_log, RuntimeSendTarget,
+        best_direct_candidate_endpoint, is_benign_route_result, latest_runtime_traffic_at_ms,
+        next_runtime_sequence, runtime_connected_peer_count_from_summaries,
+        runtime_peer_from_bootstrap_result, runtime_targets_for_virtual_packet_destination,
+        trim_event_log, RuntimeSendTarget,
     };
     use lai_core::{
-        NetworkCommand, RoomRuntimePeer, RoomRuntimePlan, RuntimePortBinding, RuntimeTunnelPlan,
-        RuntimeUdpForwardPlan,
+        NatCandidate, NatTraversalOffer, NetworkCommand, RoomRuntimePeer, RoomRuntimePlan,
+        RuntimePortBinding, RuntimeTunnelPlan, RuntimeUdpForwardPlan,
     };
     use std::net::Ipv4Addr;
 
@@ -7708,6 +7714,53 @@ mod tests {
                 &wintun_sent,
             ),
             Some(400)
+        );
+    }
+
+    #[test]
+    fn best_direct_candidate_prefers_upnp_mapping_candidate() {
+        let offer = NatTraversalOffer {
+            schema_version: 1,
+            room_id: "room".to_owned(),
+            peer_id: "peer_b".to_owned(),
+            virtual_ip: None,
+            nonce: "nonce-b".to_owned(),
+            created_at_ms: 1,
+            candidates: vec![
+                NatCandidate {
+                    candidate_type: "host".to_owned(),
+                    transport: "udp".to_owned(),
+                    endpoint: "192.168.1.20:39090".to_owned(),
+                    priority: 100,
+                    source: "local-socket".to_owned(),
+                },
+                NatCandidate {
+                    candidate_type: "srflx".to_owned(),
+                    transport: "udp".to_owned(),
+                    endpoint: "198.51.100.20:44000".to_owned(),
+                    priority: 90,
+                    source: "stun".to_owned(),
+                },
+                NatCandidate {
+                    candidate_type: "srflx".to_owned(),
+                    transport: "udp".to_owned(),
+                    endpoint: "198.51.100.20:39090".to_owned(),
+                    priority: 90,
+                    source: "upnp-port-mapping".to_owned(),
+                },
+                NatCandidate {
+                    candidate_type: "relay".to_owned(),
+                    transport: "udp".to_owned(),
+                    endpoint: "203.0.113.10:39091".to_owned(),
+                    priority: 10,
+                    source: "relay".to_owned(),
+                },
+            ],
+        };
+
+        assert_eq!(
+            best_direct_candidate_endpoint(&offer),
+            Some("198.51.100.20:39090".to_owned())
         );
     }
 
