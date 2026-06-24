@@ -379,6 +379,7 @@ public partial class LocalAreaInterconnectionDesktop
 
     string RuntimeLinkStateText(string json)
     {
+        if (RuntimeHasRouteProblem(json)) return T("runtimePeerUnstable");
         if (RuntimeHasConnectedPeer(json)) return T("runtimeConnected");
         if (RuntimeHasUnstablePeer(json)) return T("runtimePeerUnstable");
         if (RuntimeHasPeer(json)) return T("runtimePeerDisconnected");
@@ -387,6 +388,7 @@ public partial class LocalAreaInterconnectionDesktop
 
     bool RuntimeHasConnectedPeer(string json)
     {
+        if (RuntimeHasRouteProblem(json)) return false;
         string array = JsonArrayValue(json, "runtimePeerSummaries");
         if (array.Length == 0) array = JsonArrayValue(json, "summaries");
         if (array.Length == 0)
@@ -408,6 +410,14 @@ public partial class LocalAreaInterconnectionDesktop
             search = end + 1;
         }
         return false;
+    }
+
+    bool RuntimeHasRouteProblem(string json)
+    {
+        string routeStatus = JsonStringValue(JsonObjectValue(json, "runtimeRouteEvidence"), "status");
+        return routeStatus == "missing-route"
+            || routeStatus == "route-mismatch"
+            || routeStatus == "adapter-ip-mismatch";
     }
 
     bool RuntimeHasUnstablePeer(string json)
@@ -553,6 +563,10 @@ public partial class LocalAreaInterconnectionDesktop
 
     string RuntimeNextActionText(string json, string linkState, string adapter, string tunnel, string p2p, string broadcast, string gameTraffic)
     {
+        if (RuntimeHasRouteProblem(json))
+        {
+            return T("runtimeDiagRouteMismatch");
+        }
         if (linkState == T("runtimeConnected"))
         {
             return T("nextHealthy");
