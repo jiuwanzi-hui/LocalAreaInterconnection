@@ -94,7 +94,7 @@ public partial class LocalAreaInterconnectionDesktop
         if (coordinationServer == null) coordinationServer = HiddenTextBox(DefaultCoordinationServer());
         if (relayServer == null) relayServer = HiddenTextBox(DefaultRelayServer());
         if (stunServer == null) stunServer = HiddenTextBox(DefaultStunServer());
-        if (upnpPortMap == null) upnpPortMap = HiddenTextBox("false");
+        if (upnpPortMap == null) upnpPortMap = HiddenTextBox("true");
         if (remotePeer == null) remotePeer = HiddenTextBox("");
     }
 
@@ -320,15 +320,16 @@ public partial class LocalAreaInterconnectionDesktop
         homeFieldTable.Padding = new Padding(18, 14, 18, 14);
         homeFieldTable.Margin = new Padding(0);
         AddFieldRow(homeFieldTable, 0, "roomName", "Friday LAN");
-        AddFieldRow(homeFieldTable, 1, "host", "Alice");
+        AddFieldRow(homeFieldTable, 1, "host", DefaultHostName());
         AddFieldRow(homeFieldTable, 2, "invite", "");
         AddFieldRow(homeFieldTable, 3, "coordinationServer", DefaultCoordinationServer());
         AddFieldRow(homeFieldTable, 4, "relayServer", DefaultRelayServer());
         AddFieldRow(homeFieldTable, 5, "remotePeer", "");
         AddFieldRow(homeFieldTable, 6, "stunServer", DefaultStunServer());
-        homeFieldTable.RowCount = 7;
+        AddFieldRow(homeFieldTable, 7, "upnpPortMap", "true");
+        homeFieldTable.RowCount = 8;
         homeFieldTable.RowStyles.Clear();
-        for (int i = 0; i < 7; i++)
+        for (int i = 0; i < 8; i++)
         {
             homeFieldTable.RowStyles.Add(new RowStyle(SizeType.Absolute, 34));
         }

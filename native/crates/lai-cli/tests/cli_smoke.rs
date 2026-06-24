@@ -4080,6 +4080,12 @@ fn room_runtime_run_emits_periodic_heartbeats_and_snapshots() {
             >= 1
     );
     assert_eq!(value["runtimePeerSummaries"][0]["pathKind"], "direct");
+    assert!(value["runtimePeerSummaries"][0]["latencyMs"].is_number());
+    assert_eq!(
+        value["tunnelServiceSnapshot"]["average_latency_ms"],
+        value["runtimePeerSummaries"][0]["latencyMs"]
+    );
+    assert_ne!(value["tunnelServiceSnapshot"]["average_latency_ms"], 180);
     assert!(
         value["runtimePeerSummaries"][0]["directBytesSent"]
             .as_u64()

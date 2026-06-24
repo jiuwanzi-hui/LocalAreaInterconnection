@@ -203,6 +203,19 @@ public partial class LocalAreaInterconnectionDesktop
         return "http://49.235.146.152";
     }
 
+    string DefaultHostName()
+    {
+        try
+        {
+            string name = Environment.MachineName.Trim();
+            return name.Length > 0 ? name : "Alice";
+        }
+        catch
+        {
+            return "Alice";
+        }
+    }
+
     string DefaultRelayServer()
     {
         return "49.235.146.152:39091";
@@ -229,9 +242,9 @@ public partial class LocalAreaInterconnectionDesktop
         }
         string spec = SafePeerId(peerId) + "," + virtualIp + "," + preparedOffer;
         return " --nat-bootstrap-remote-peer " + Quote(spec)
-            + " --nat-bootstrap-attempts 24"
-            + " --nat-bootstrap-interval-ms 100"
-            + " --nat-bootstrap-timeout-ms 5000";
+            + " --nat-bootstrap-attempts 60"
+            + " --nat-bootstrap-interval-ms 80"
+            + " --nat-bootstrap-timeout-ms 12000";
     }
 
     bool TryParseRemotePeerOfferSpec(string value, out string peerId, out string virtualIp, out string offerValue)
@@ -943,11 +956,14 @@ public partial class LocalAreaInterconnectionDesktop
         string spec = RemotePeerSpecFromCoordinationView(json);
         if (spec.Length == 0) return;
         string current = remotePeer.Text.Trim();
-        if (RemotePeerTargetsSamePeer(current, spec)) return;
+        bool samePeer = RemotePeerTargetsSamePeer(current, spec);
+        if (samePeer && !RuntimeShouldRetryP2pForSamePeer(spec)) return;
 
         remotePeer.Text = spec;
         if (runtimeProcess == null || runtimeProcess.HasExited) return;
 
+        lastRuntimeP2pRetryUtc = DateTime.UtcNow;
+        lastRuntimeP2pRetrySpec = spec;
         restartingRuntimeForRemotePeer = true;
         try
         {
@@ -958,6 +974,41 @@ public partial class LocalAreaInterconnectionDesktop
         {
             restartingRuntimeForRemotePeer = false;
         }
+    }
+
+    bool RuntimeShouldRetryP2pForSamePeer(string spec)
+    {
+        if (runtimeProcess == null || runtimeProcess.HasExited) return false;
+        if (lastRuntimeP2pRetrySpec == spec
+            && DateTime.UtcNow - lastRuntimeP2pRetryUtc < TimeSpan.FromSeconds(30))
+        {
+            return false;
+        }
+
+        string snapshot = lastRuntimeSnapshotText;
+        try
+        {
+            if (latestRuntimeSnapshot.Length > 0 && File.Exists(latestRuntimeSnapshot))
+            {
+                snapshot = File.ReadAllText(latestRuntimeSnapshot);
+            }
+        }
+        catch
+        {
+            snapshot = lastRuntimeSnapshotText;
+        }
+        if (snapshot.Trim().Length == 0)
+        {
+            return false;
+        }
+
+        if (!RuntimeHasConnectedPeer(snapshot) || RuntimeHasUnstablePeer(snapshot))
+        {
+            return true;
+        }
+
+        string path = RuntimePrimaryPathKind(snapshot);
+        return path == "relay";
     }
 
     bool RemotePeerTargetsSamePeer(string current, string next)

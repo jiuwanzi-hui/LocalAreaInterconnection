@@ -57,6 +57,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 const RUNTIME_PEER_CONNECTED_WINDOW_MS: u64 = 5_000;
 const RUNTIME_HTTP_RELAY_PACKET_MAX_AGE_MS: u128 = 5_000;
 const RUNTIME_RELAY_REGISTRATION_INTERVAL_MS: u64 = 2_000;
+const RUNTIME_TUNNEL_READ_TIMEOUT_MS: u64 = 1;
+const RUNTIME_WINTUN_DRAIN_LIMIT: usize = 64;
 const DEFAULT_UDP_RELAY_PORT: u16 = 39091;
 const UDP_RELAY_BINARY_MAGIC: &[u8] = b"LAIR1";
 const UDP_RELAY_BINARY_REGISTER: u8 = 1;
@@ -5602,7 +5604,7 @@ fn run_room_runtime(
         Some(socket) => socket,
         None => bind_runtime_tunnel_socket(&plan.tunnel.bind_endpoint)?,
     };
-    tunnel_socket.set_read_timeout(Some(Duration::from_millis(25)))?;
+    tunnel_socket.set_read_timeout(Some(Duration::from_millis(RUNTIME_TUNNEL_READ_TIMEOUT_MS)))?;
     let tunnel_endpoint = tunnel_socket.local_addr()?;
     let mut bytes_sent = 0u64;
     let mut bytes_received = 0u64;
@@ -6642,129 +6644,137 @@ fn run_room_runtime(
         }
 
         if let Some(session) = wintun_packet_io.as_mut() {
-            match session.receive_once() {
-                Ok(Some(packet)) => {
-                    let packet_index = wintun_runtime_received_packets.len() + 1;
-                    match (&packet.parsed_udp, &packet.parsed_tcp, &packet.summary) {
-                        (Some(udp_packet), _, _) => {
-                            let observation =
-                                lai_core::udp_observation_from_virtual_packet(udp_packet);
-                            observation_lines.push(
-                                lai_core::packet_observation_line_from_udp_forward(&observation),
-                            );
-                            append_observation_lines(
-                                observe_file,
-                                std::slice::from_ref(&observation),
-                            )?;
-                            capture_summaries.push(PacketCaptureSummary {
-                                protocol: "udp".to_owned(),
-                                source_ip: udp_packet.source_ip,
-                                destination_ip: udp_packet.destination_ip,
-                                destination_port: udp_packet.destination_port,
-                                direction: "virtual-adapter".to_owned(),
-                                broadcast: udp_packet.broadcast,
-                                packet_count: 1,
-                                bytes: udp_packet.payload.len() as u32,
-                            });
-                            let udp_drop_reason = if udp_packet.source_ip != plan.local_virtual_ip {
-                                Some("remote-source-loop-prevention")
-                            } else {
-                                runtime_wintun_udp_drop_reason(udp_packet)
-                            };
-                            let (broadcast_decision, should_forward_udp) = if udp_drop_reason
-                                .is_some()
-                            {
-                                (None, false)
-                            } else if udp_packet.broadcast {
-                                let packet = lai_core::BroadcastPacket {
-                                    protocol: "udp".to_owned(),
-                                    source_ip: udp_packet.source_ip,
-                                    destination_ip: udp_packet.destination_ip,
-                                    destination_port: udp_packet.destination_port,
-                                };
-                                let decision = broadcast_gate.decide(&packet, current_epoch_ms());
-                                let should_forward =
-                                    decision.forward && !heartbeat_targets.is_empty();
-                                broadcast_forward_events.push(lai_core::BroadcastForwardEvent {
-                                    protocol: "udp".to_owned(),
-                                    source_ip: udp_packet.source_ip,
-                                    destination_ip: udp_packet.destination_ip,
-                                    destination_port: udp_packet.destination_port,
-                                    forwarded: should_forward,
-                                    reason: if decision.forward && heartbeat_targets.is_empty() {
-                                        "no-forward-targets".to_owned()
-                                    } else {
-                                        decision.reason.clone()
-                                    },
-                                    target_count: if should_forward {
-                                        heartbeat_targets.len()
-                                    } else {
-                                        0
-                                    },
-                                    packet_io_backend: packet_io_backend.to_owned(),
-                                });
-                                (Some(decision), should_forward)
-                            } else {
-                                (None, !heartbeat_targets.is_empty())
-                            };
-                            wintun_runtime_received_packets.push(serde_json::json!({
-                                "packetIndex": packet_index,
-                                "packetBytes": packet.packet_bytes,
-                                "sourceIp": udp_packet.source_ip,
-                                "destinationIp": udp_packet.destination_ip,
-                                "sourcePort": udp_packet.source_port,
-                                "destinationPort": udp_packet.destination_port,
-                                "payloadBytes": udp_packet.payload.len(),
-                                "broadcast": udp_packet.broadcast,
-                                "forwarded": should_forward_udp,
-                                "broadcastDecision": broadcast_decision,
-                                "dropReason": udp_drop_reason,
-                            }));
-
-                            let udp_forward_targets = if should_forward_udp {
-                                heartbeat_targets.as_slice()
-                            } else {
-                                &[]
-                            };
-                            for target in udp_forward_targets {
-                                let forward_payload = serde_json::json!({
-                                    "room_id": plan.room_id,
-                                    "peer_id": plan.local_peer_id,
-                                    "kind": "runtime-udp-forward",
-                                    "source": format!("{}:{}", udp_packet.source_ip, udp_packet.source_port),
-                                    "destination": format!("{}:{}", udp_packet.destination_ip, udp_packet.destination_port),
-                                    "destination_port": udp_packet.destination_port,
-                                    "broadcast": udp_packet.broadcast,
-                                    "bytes": STANDARD_NO_PAD.encode(&udp_packet.payload),
-                                    "payload_encoding": "udp-payload+raw-ipv4",
-                                    "raw_ipv4_packet": STANDARD_NO_PAD.encode(&packet.bytes),
-                                    "raw_ipv4_packet_bytes": packet.packet_bytes,
-                                    "virtual_source": format!("{}:{}", udp_packet.source_ip, udp_packet.source_port),
-                                    "virtual_destination": format!("{}:{}", udp_packet.destination_ip, udp_packet.destination_port),
-                                });
-                                let envelope = seal_tunnel_payload(
-                                    key,
-                                    "runtime-udp-forward",
-                                    forwarded_packets.len() as u64 + 1,
-                                    current_epoch_ms(),
-                                    serde_json::to_string(&forward_payload)?.as_bytes(),
+            for _ in 0..RUNTIME_WINTUN_DRAIN_LIMIT {
+                match session.receive_once() {
+                    Ok(Some(packet)) => {
+                        let packet_index = wintun_runtime_received_packets.len() + 1;
+                        match (&packet.parsed_udp, &packet.parsed_tcp, &packet.summary) {
+                            (Some(udp_packet), _, _) => {
+                                let observation =
+                                    lai_core::udp_observation_from_virtual_packet(udp_packet);
+                                observation_lines.push(
+                                    lai_core::packet_observation_line_from_udp_forward(
+                                        &observation,
+                                    ),
+                                );
+                                append_observation_lines(
+                                    observe_file,
+                                    std::slice::from_ref(&observation),
                                 )?;
-                                let wire = serde_json::to_vec(&envelope)?;
-                                let sequence = forwarded_packets.len() as u64 + 1;
-                                match runtime_send_wire_to_target(
-                                    &tunnel_socket,
-                                    key,
-                                    &plan.room_id,
-                                    &plan.local_peer_id,
-                                    target,
-                                    &wire,
-                                    "runtime-udp-forward",
-                                    sequence,
-                                    &mut tcp_relay_clients,
-                                ) {
-                                    Ok(sent) => {
-                                        bytes_sent += sent as u64;
-                                        forwarded_packets.push(serde_json::json!({
+                                capture_summaries.push(PacketCaptureSummary {
+                                    protocol: "udp".to_owned(),
+                                    source_ip: udp_packet.source_ip,
+                                    destination_ip: udp_packet.destination_ip,
+                                    destination_port: udp_packet.destination_port,
+                                    direction: "virtual-adapter".to_owned(),
+                                    broadcast: udp_packet.broadcast,
+                                    packet_count: 1,
+                                    bytes: udp_packet.payload.len() as u32,
+                                });
+                                let udp_drop_reason =
+                                    if udp_packet.source_ip != plan.local_virtual_ip {
+                                        Some("remote-source-loop-prevention")
+                                    } else {
+                                        runtime_wintun_udp_drop_reason(udp_packet)
+                                    };
+                                let (broadcast_decision, should_forward_udp) =
+                                    if udp_drop_reason.is_some() {
+                                        (None, false)
+                                    } else if udp_packet.broadcast {
+                                        let packet = lai_core::BroadcastPacket {
+                                            protocol: "udp".to_owned(),
+                                            source_ip: udp_packet.source_ip,
+                                            destination_ip: udp_packet.destination_ip,
+                                            destination_port: udp_packet.destination_port,
+                                        };
+                                        let decision =
+                                            broadcast_gate.decide(&packet, current_epoch_ms());
+                                        let should_forward =
+                                            decision.forward && !heartbeat_targets.is_empty();
+                                        broadcast_forward_events.push(
+                                            lai_core::BroadcastForwardEvent {
+                                                protocol: "udp".to_owned(),
+                                                source_ip: udp_packet.source_ip,
+                                                destination_ip: udp_packet.destination_ip,
+                                                destination_port: udp_packet.destination_port,
+                                                forwarded: should_forward,
+                                                reason: if decision.forward
+                                                    && heartbeat_targets.is_empty()
+                                                {
+                                                    "no-forward-targets".to_owned()
+                                                } else {
+                                                    decision.reason.clone()
+                                                },
+                                                target_count: if should_forward {
+                                                    heartbeat_targets.len()
+                                                } else {
+                                                    0
+                                                },
+                                                packet_io_backend: packet_io_backend.to_owned(),
+                                            },
+                                        );
+                                        (Some(decision), should_forward)
+                                    } else {
+                                        (None, !heartbeat_targets.is_empty())
+                                    };
+                                wintun_runtime_received_packets.push(serde_json::json!({
+                                    "packetIndex": packet_index,
+                                    "packetBytes": packet.packet_bytes,
+                                    "sourceIp": udp_packet.source_ip,
+                                    "destinationIp": udp_packet.destination_ip,
+                                    "sourcePort": udp_packet.source_port,
+                                    "destinationPort": udp_packet.destination_port,
+                                    "payloadBytes": udp_packet.payload.len(),
+                                    "broadcast": udp_packet.broadcast,
+                                    "forwarded": should_forward_udp,
+                                    "broadcastDecision": broadcast_decision,
+                                    "dropReason": udp_drop_reason,
+                                }));
+
+                                let udp_forward_targets = if should_forward_udp {
+                                    heartbeat_targets.as_slice()
+                                } else {
+                                    &[]
+                                };
+                                for target in udp_forward_targets {
+                                    let forward_payload = serde_json::json!({
+                                        "room_id": plan.room_id,
+                                        "peer_id": plan.local_peer_id,
+                                        "kind": "runtime-udp-forward",
+                                        "source": format!("{}:{}", udp_packet.source_ip, udp_packet.source_port),
+                                        "destination": format!("{}:{}", udp_packet.destination_ip, udp_packet.destination_port),
+                                        "destination_port": udp_packet.destination_port,
+                                        "broadcast": udp_packet.broadcast,
+                                        "bytes": STANDARD_NO_PAD.encode(&udp_packet.payload),
+                                        "payload_encoding": "udp-payload+raw-ipv4",
+                                        "raw_ipv4_packet": STANDARD_NO_PAD.encode(&packet.bytes),
+                                        "raw_ipv4_packet_bytes": packet.packet_bytes,
+                                        "virtual_source": format!("{}:{}", udp_packet.source_ip, udp_packet.source_port),
+                                        "virtual_destination": format!("{}:{}", udp_packet.destination_ip, udp_packet.destination_port),
+                                    });
+                                    let envelope = seal_tunnel_payload(
+                                        key,
+                                        "runtime-udp-forward",
+                                        forwarded_packets.len() as u64 + 1,
+                                        current_epoch_ms(),
+                                        serde_json::to_string(&forward_payload)?.as_bytes(),
+                                    )?;
+                                    let wire = serde_json::to_vec(&envelope)?;
+                                    let sequence = forwarded_packets.len() as u64 + 1;
+                                    match runtime_send_wire_to_target(
+                                        &tunnel_socket,
+                                        key,
+                                        &plan.room_id,
+                                        &plan.local_peer_id,
+                                        target,
+                                        &wire,
+                                        "runtime-udp-forward",
+                                        sequence,
+                                        &mut tcp_relay_clients,
+                                    ) {
+                                        Ok(sent) => {
+                                            bytes_sent += sent as u64;
+                                            forwarded_packets.push(serde_json::json!({
                                             "target": target.endpoint,
                                             "targetPeerId": target.peer_id,
                                             "connectionPath": target.connection_path,
@@ -6776,101 +6786,102 @@ fn run_room_runtime(
                                             "packetIoBackend": "wintun",
                                             "sentAtMs": current_epoch_ms(),
                                         }));
-                                    }
-                                    Err(err) => {
-                                        last_error = Some(format!(
-                                            "Failed to forward Wintun packet to {}: {err}",
-                                            target.endpoint
-                                        ));
+                                        }
+                                        Err(err) => {
+                                            last_error = Some(format!(
+                                                "Failed to forward Wintun packet to {}: {err}",
+                                                target.endpoint
+                                            ));
+                                        }
                                     }
                                 }
                             }
-                        }
-                        (_, Some(tcp_packet), Some(summary)) => {
-                            let observation =
-                                lai_core::tcp_observation_from_virtual_packet(tcp_packet);
-                            let line = lai_core::packet_observation_line_from_transport(
-                                "tcp",
-                                &observation,
-                            );
-                            observation_lines.push(line.clone());
-                            append_observation_text_lines(observe_file, &[line])?;
-                            capture_summaries.push(PacketCaptureSummary {
-                                protocol: "tcp".to_owned(),
-                                source_ip: tcp_packet.source_ip,
-                                destination_ip: tcp_packet.destination_ip,
-                                destination_port: tcp_packet.destination_port,
-                                direction: "virtual-adapter".to_owned(),
-                                broadcast: false,
-                                packet_count: 1,
-                                bytes: tcp_packet.payload.len() as u32,
-                            });
-                            let tcp_drop_reason = if tcp_packet.source_ip != plan.local_virtual_ip {
-                                Some("remote-source-loop-prevention")
-                            } else {
-                                runtime_wintun_tcp_drop_reason(tcp_packet)
-                            };
-                            let should_forward_tcp =
-                                tcp_drop_reason.is_none() && !heartbeat_targets.is_empty();
-                            wintun_runtime_received_packets.push(serde_json::json!({
-                                "packetIndex": packet_index,
-                                "protocol": "tcp",
-                                "packetBytes": packet.packet_bytes,
-                                "sourceIp": tcp_packet.source_ip,
-                                "destinationIp": tcp_packet.destination_ip,
-                                "sourcePort": tcp_packet.source_port,
-                                "destinationPort": tcp_packet.destination_port,
-                                "payloadBytes": tcp_packet.payload.len(),
-                                "flags": tcp_packet.flags,
-                                "forwarded": should_forward_tcp,
-                                "dropReason": tcp_drop_reason,
-                            }));
-
-                            let tcp_forward_targets = if should_forward_tcp {
-                                heartbeat_targets.as_slice()
-                            } else {
-                                &[]
-                            };
-                            for target in tcp_forward_targets {
-                                let forward_payload = serde_json::json!({
-                                    "room_id": plan.room_id,
-                                    "peer_id": plan.local_peer_id,
-                                    "kind": "runtime-ipv4-forward",
-                                    "source": format!("{}:{}", tcp_packet.source_ip, tcp_packet.source_port),
-                                    "destination": format!("{}:{}", tcp_packet.destination_ip, tcp_packet.destination_port),
-                                    "destination_port": tcp_packet.destination_port,
-                                    "broadcast": false,
-                                    "payload_encoding": "raw-ipv4",
-                                    "raw_ipv4_packet": STANDARD_NO_PAD.encode(&packet.bytes),
-                                    "raw_ipv4_packet_bytes": packet.packet_bytes,
-                                    "virtual_source": format!("{}:{}", tcp_packet.source_ip, tcp_packet.source_port),
-                                    "virtual_destination": format!("{}:{}", tcp_packet.destination_ip, tcp_packet.destination_port),
-                                    "ipv4_protocol": summary.protocol.clone(),
-                                    "ipv4_protocol_number": summary.protocol_number,
+                            (_, Some(tcp_packet), Some(summary)) => {
+                                let observation =
+                                    lai_core::tcp_observation_from_virtual_packet(tcp_packet);
+                                let line = lai_core::packet_observation_line_from_transport(
+                                    "tcp",
+                                    &observation,
+                                );
+                                observation_lines.push(line.clone());
+                                append_observation_text_lines(observe_file, &[line])?;
+                                capture_summaries.push(PacketCaptureSummary {
+                                    protocol: "tcp".to_owned(),
+                                    source_ip: tcp_packet.source_ip,
+                                    destination_ip: tcp_packet.destination_ip,
+                                    destination_port: tcp_packet.destination_port,
+                                    direction: "virtual-adapter".to_owned(),
+                                    broadcast: false,
+                                    packet_count: 1,
+                                    bytes: tcp_packet.payload.len() as u32,
                                 });
-                                let envelope = seal_tunnel_payload(
-                                    key,
-                                    "runtime-ipv4-forward",
-                                    forwarded_packets.len() as u64 + 1,
-                                    current_epoch_ms(),
-                                    serde_json::to_string(&forward_payload)?.as_bytes(),
-                                )?;
-                                let wire = serde_json::to_vec(&envelope)?;
-                                let sequence = forwarded_packets.len() as u64 + 1;
-                                match runtime_send_wire_to_target(
-                                    &tunnel_socket,
-                                    key,
-                                    &plan.room_id,
-                                    &plan.local_peer_id,
-                                    target,
-                                    &wire,
-                                    "runtime-ipv4-forward",
-                                    sequence,
-                                    &mut tcp_relay_clients,
-                                ) {
-                                    Ok(sent) => {
-                                        bytes_sent += sent as u64;
-                                        forwarded_packets.push(serde_json::json!({
+                                let tcp_drop_reason =
+                                    if tcp_packet.source_ip != plan.local_virtual_ip {
+                                        Some("remote-source-loop-prevention")
+                                    } else {
+                                        runtime_wintun_tcp_drop_reason(tcp_packet)
+                                    };
+                                let should_forward_tcp =
+                                    tcp_drop_reason.is_none() && !heartbeat_targets.is_empty();
+                                wintun_runtime_received_packets.push(serde_json::json!({
+                                    "packetIndex": packet_index,
+                                    "protocol": "tcp",
+                                    "packetBytes": packet.packet_bytes,
+                                    "sourceIp": tcp_packet.source_ip,
+                                    "destinationIp": tcp_packet.destination_ip,
+                                    "sourcePort": tcp_packet.source_port,
+                                    "destinationPort": tcp_packet.destination_port,
+                                    "payloadBytes": tcp_packet.payload.len(),
+                                    "flags": tcp_packet.flags,
+                                    "forwarded": should_forward_tcp,
+                                    "dropReason": tcp_drop_reason,
+                                }));
+
+                                let tcp_forward_targets = if should_forward_tcp {
+                                    heartbeat_targets.as_slice()
+                                } else {
+                                    &[]
+                                };
+                                for target in tcp_forward_targets {
+                                    let forward_payload = serde_json::json!({
+                                        "room_id": plan.room_id,
+                                        "peer_id": plan.local_peer_id,
+                                        "kind": "runtime-ipv4-forward",
+                                        "source": format!("{}:{}", tcp_packet.source_ip, tcp_packet.source_port),
+                                        "destination": format!("{}:{}", tcp_packet.destination_ip, tcp_packet.destination_port),
+                                        "destination_port": tcp_packet.destination_port,
+                                        "broadcast": false,
+                                        "payload_encoding": "raw-ipv4",
+                                        "raw_ipv4_packet": STANDARD_NO_PAD.encode(&packet.bytes),
+                                        "raw_ipv4_packet_bytes": packet.packet_bytes,
+                                        "virtual_source": format!("{}:{}", tcp_packet.source_ip, tcp_packet.source_port),
+                                        "virtual_destination": format!("{}:{}", tcp_packet.destination_ip, tcp_packet.destination_port),
+                                        "ipv4_protocol": summary.protocol.clone(),
+                                        "ipv4_protocol_number": summary.protocol_number,
+                                    });
+                                    let envelope = seal_tunnel_payload(
+                                        key,
+                                        "runtime-ipv4-forward",
+                                        forwarded_packets.len() as u64 + 1,
+                                        current_epoch_ms(),
+                                        serde_json::to_string(&forward_payload)?.as_bytes(),
+                                    )?;
+                                    let wire = serde_json::to_vec(&envelope)?;
+                                    let sequence = forwarded_packets.len() as u64 + 1;
+                                    match runtime_send_wire_to_target(
+                                        &tunnel_socket,
+                                        key,
+                                        &plan.room_id,
+                                        &plan.local_peer_id,
+                                        target,
+                                        &wire,
+                                        "runtime-ipv4-forward",
+                                        sequence,
+                                        &mut tcp_relay_clients,
+                                    ) {
+                                        Ok(sent) => {
+                                            bytes_sent += sent as u64;
+                                            forwarded_packets.push(serde_json::json!({
                                             "target": target.endpoint,
                                             "targetPeerId": target.peer_id,
                                             "connectionPath": target.connection_path,
@@ -6883,132 +6894,136 @@ fn run_room_runtime(
                                             "protocol": "tcp",
                                             "sentAtMs": current_epoch_ms(),
                                         }));
-                                    }
-                                    Err(err) => {
-                                        last_error = Some(format!(
-                                            "Failed to forward Wintun TCP packet to {}: {err}",
-                                            target.endpoint
-                                        ));
+                                        }
+                                        Err(err) => {
+                                            last_error = Some(format!(
+                                                "Failed to forward Wintun TCP packet to {}: {err}",
+                                                target.endpoint
+                                            ));
+                                        }
                                     }
                                 }
                             }
-                        }
-                        (_, _, Some(summary)) => {
-                            let ipv4_drop_reason = if summary.source_ip != plan.local_virtual_ip {
-                                Some("remote-source-loop-prevention")
-                            } else {
-                                runtime_wintun_ipv4_drop_reason(summary)
-                            };
-                            let should_forward_ipv4 =
-                                ipv4_drop_reason.is_none() && !heartbeat_targets.is_empty();
-                            if should_forward_ipv4
-                                && summary.protocol == "icmp"
-                                && lai_core::parse_ipv4_icmp_echo_request(&packet.bytes).is_ok()
-                            {
-                                let request = lai_core::parse_ipv4_icmp_echo_request(&packet.bytes)
-                                    .map_err(invalid_input)?;
-                                icmp_echo_requests.push(serde_json::json!({
-                                    "direction": "adapter-to-tunnel",
-                                    "sourceIp": request.source_ip,
-                                    "destinationIp": request.destination_ip,
-                                    "identifier": request.identifier,
-                                    "sequence": request.sequence,
-                                    "payloadBytes": request.payload.len(),
-                                    "forwarded": true,
-                                    "sentAtMs": current_epoch_ms(),
+                            (_, _, Some(summary)) => {
+                                let ipv4_drop_reason = if summary.source_ip != plan.local_virtual_ip
+                                {
+                                    Some("remote-source-loop-prevention")
+                                } else {
+                                    runtime_wintun_ipv4_drop_reason(summary)
+                                };
+                                let should_forward_ipv4 =
+                                    ipv4_drop_reason.is_none() && !heartbeat_targets.is_empty();
+                                if should_forward_ipv4
+                                    && summary.protocol == "icmp"
+                                    && lai_core::parse_ipv4_icmp_echo_request(&packet.bytes).is_ok()
+                                {
+                                    let request =
+                                        lai_core::parse_ipv4_icmp_echo_request(&packet.bytes)
+                                            .map_err(invalid_input)?;
+                                    icmp_echo_requests.push(serde_json::json!({
+                                        "direction": "adapter-to-tunnel",
+                                        "sourceIp": request.source_ip,
+                                        "destinationIp": request.destination_ip,
+                                        "identifier": request.identifier,
+                                        "sequence": request.sequence,
+                                        "payloadBytes": request.payload.len(),
+                                        "forwarded": true,
+                                        "sentAtMs": current_epoch_ms(),
+                                    }));
+                                }
+                                wintun_runtime_received_packets.push(serde_json::json!({
+                                    "packetIndex": packet_index,
+                                    "protocol": summary.protocol.clone(),
+                                    "protocolNumber": summary.protocol_number,
+                                    "packetBytes": packet.packet_bytes,
+                                    "sourceIp": summary.source_ip,
+                                    "destinationIp": summary.destination_ip,
+                                    "payloadBytes": summary.payload_bytes,
+                                    "forwarded": should_forward_ipv4,
+                                    "dropReason": ipv4_drop_reason,
+                                }));
+
+                                let ipv4_forward_targets = if should_forward_ipv4 {
+                                    heartbeat_targets.as_slice()
+                                } else {
+                                    &[]
+                                };
+                                for target in ipv4_forward_targets {
+                                    let forward_payload = serde_json::json!({
+                                        "room_id": plan.room_id,
+                                        "peer_id": plan.local_peer_id,
+                                        "kind": "runtime-ipv4-forward",
+                                        "source": summary.source_ip.to_string(),
+                                        "destination": summary.destination_ip.to_string(),
+                                        "broadcast": summary.broadcast,
+                                        "payload_encoding": "raw-ipv4",
+                                        "raw_ipv4_packet": STANDARD_NO_PAD.encode(&packet.bytes),
+                                        "raw_ipv4_packet_bytes": packet.packet_bytes,
+                                        "ipv4_protocol": summary.protocol.clone(),
+                                        "ipv4_protocol_number": summary.protocol_number,
+                                    });
+                                    let envelope = seal_tunnel_payload(
+                                        key,
+                                        "runtime-ipv4-forward",
+                                        forwarded_packets.len() as u64 + 1,
+                                        current_epoch_ms(),
+                                        serde_json::to_string(&forward_payload)?.as_bytes(),
+                                    )?;
+                                    let wire = serde_json::to_vec(&envelope)?;
+                                    let sequence = forwarded_packets.len() as u64 + 1;
+                                    match runtime_send_wire_to_target(
+                                        &tunnel_socket,
+                                        key,
+                                        &plan.room_id,
+                                        &plan.local_peer_id,
+                                        target,
+                                        &wire,
+                                        "runtime-ipv4-forward",
+                                        sequence,
+                                        &mut tcp_relay_clients,
+                                    ) {
+                                        Ok(sent) => {
+                                            bytes_sent += sent as u64;
+                                            forwarded_packets.push(serde_json::json!({
+                                                "target": target.endpoint,
+                                                "targetPeerId": target.peer_id,
+                                                "connectionPath": target.connection_path,
+                                                "source": summary.source_ip,
+                                                "destination": summary.destination_ip,
+                                                "bytesSent": sent,
+                                                "payloadBytes": summary.payload_bytes,
+                                                "rawIpv4PacketBytes": packet.packet_bytes,
+                                                "packetIoBackend": "wintun",
+                                                "protocol": summary.protocol.clone(),
+                                                "sentAtMs": current_epoch_ms(),
+                                            }));
+                                        }
+                                        Err(err) => {
+                                            last_error = Some(format!(
+                                                "Failed to forward Wintun IPv4 packet to {}: {err}",
+                                                target.endpoint
+                                            ));
+                                        }
+                                    }
+                                }
+                            }
+                            (_, _, None) => {
+                                wintun_runtime_received_packets.push(serde_json::json!({
+                                    "packetIndex": packet_index,
+                                    "packetBytes": packet.packet_bytes,
+                                    "forwarded": false,
+                                    "parseError": packet.parse_error.clone(),
                                 }));
                             }
-                            wintun_runtime_received_packets.push(serde_json::json!({
-                                "packetIndex": packet_index,
-                                "protocol": summary.protocol.clone(),
-                                "protocolNumber": summary.protocol_number,
-                                "packetBytes": packet.packet_bytes,
-                                "sourceIp": summary.source_ip,
-                                "destinationIp": summary.destination_ip,
-                                "payloadBytes": summary.payload_bytes,
-                                "forwarded": should_forward_ipv4,
-                                "dropReason": ipv4_drop_reason,
-                            }));
-
-                            let ipv4_forward_targets = if should_forward_ipv4 {
-                                heartbeat_targets.as_slice()
-                            } else {
-                                &[]
-                            };
-                            for target in ipv4_forward_targets {
-                                let forward_payload = serde_json::json!({
-                                    "room_id": plan.room_id,
-                                    "peer_id": plan.local_peer_id,
-                                    "kind": "runtime-ipv4-forward",
-                                    "source": summary.source_ip.to_string(),
-                                    "destination": summary.destination_ip.to_string(),
-                                    "broadcast": summary.broadcast,
-                                    "payload_encoding": "raw-ipv4",
-                                    "raw_ipv4_packet": STANDARD_NO_PAD.encode(&packet.bytes),
-                                    "raw_ipv4_packet_bytes": packet.packet_bytes,
-                                    "ipv4_protocol": summary.protocol.clone(),
-                                    "ipv4_protocol_number": summary.protocol_number,
-                                });
-                                let envelope = seal_tunnel_payload(
-                                    key,
-                                    "runtime-ipv4-forward",
-                                    forwarded_packets.len() as u64 + 1,
-                                    current_epoch_ms(),
-                                    serde_json::to_string(&forward_payload)?.as_bytes(),
-                                )?;
-                                let wire = serde_json::to_vec(&envelope)?;
-                                let sequence = forwarded_packets.len() as u64 + 1;
-                                match runtime_send_wire_to_target(
-                                    &tunnel_socket,
-                                    key,
-                                    &plan.room_id,
-                                    &plan.local_peer_id,
-                                    target,
-                                    &wire,
-                                    "runtime-ipv4-forward",
-                                    sequence,
-                                    &mut tcp_relay_clients,
-                                ) {
-                                    Ok(sent) => {
-                                        bytes_sent += sent as u64;
-                                        forwarded_packets.push(serde_json::json!({
-                                            "target": target.endpoint,
-                                            "targetPeerId": target.peer_id,
-                                            "connectionPath": target.connection_path,
-                                            "source": summary.source_ip,
-                                            "destination": summary.destination_ip,
-                                            "bytesSent": sent,
-                                            "payloadBytes": summary.payload_bytes,
-                                            "rawIpv4PacketBytes": packet.packet_bytes,
-                                            "packetIoBackend": "wintun",
-                                            "protocol": summary.protocol.clone(),
-                                            "sentAtMs": current_epoch_ms(),
-                                        }));
-                                    }
-                                    Err(err) => {
-                                        last_error = Some(format!(
-                                            "Failed to forward Wintun IPv4 packet to {}: {err}",
-                                            target.endpoint
-                                        ));
-                                    }
-                                }
-                            }
-                        }
-                        (_, _, None) => {
-                            wintun_runtime_received_packets.push(serde_json::json!({
-                                "packetIndex": packet_index,
-                                "packetBytes": packet.packet_bytes,
-                                "forwarded": false,
-                                "parseError": packet.parse_error.clone(),
-                            }));
                         }
                     }
-                }
-                Ok(None) => {}
-                Err(err) => {
-                    let message = format!("Failed to read raw IPv4 packet from Wintun: {err}");
-                    last_error = Some(message.clone());
-                    wintun_runtime_errors.push(message);
+                    Ok(None) => break,
+                    Err(err) => {
+                        let message = format!("Failed to read raw IPv4 packet from Wintun: {err}");
+                        last_error = Some(message.clone());
+                        wintun_runtime_errors.push(message);
+                        break;
+                    }
                 }
             }
         }
@@ -7061,16 +7076,19 @@ fn run_room_runtime(
     if runtime_timeout_error_has_recovered(last_error.as_deref(), &runtime_peer_summary_values) {
         last_error = None;
     }
+    let average_latency_ms = runtime_best_latency_ms_from_summaries(&runtime_peer_summary_values);
+    let packet_loss_percent =
+        runtime_best_loss_percent_from_summaries(&runtime_peer_summary_values);
 
     let tunnel_snapshot = TunnelServiceSnapshot {
         service_running: true,
         connected_peer_count,
         connection_path: observed_connection_path,
-        average_latency_ms: Some(duration_ms.min(u32::MAX as u64) as u32),
+        average_latency_ms,
         packet_loss_percent: if self_probe && connected_peer_count == 0 {
             Some(100.0)
         } else {
-            Some(0.0)
+            packet_loss_percent
         },
         bytes_sent,
         bytes_received,
@@ -8738,6 +8756,27 @@ fn runtime_timeout_error_has_recovered(
             .is_some_and(|status| status != "needs-attention");
         acked && recently_healthy && health_allows_connected
     })
+}
+
+fn runtime_best_latency_ms_from_summaries(summaries: &[serde_json::Value]) -> Option<u32> {
+    summaries
+        .iter()
+        .filter_map(|summary| summary.get("latencyMs").and_then(serde_json::Value::as_u64))
+        .min()
+        .map(|latency| latency.min(u32::MAX as u64) as u32)
+}
+
+fn runtime_best_loss_percent_from_summaries(summaries: &[serde_json::Value]) -> Option<f32> {
+    summaries
+        .iter()
+        .filter_map(|summary| {
+            summary
+                .get("heartbeatLossWindowPercent")
+                .or_else(|| summary.get("heartbeatLossPercent"))
+                .and_then(serde_json::Value::as_f64)
+        })
+        .min_by(|left, right| left.total_cmp(right))
+        .map(|loss| loss as f32)
 }
 
 fn runtime_heartbeat_ack_payload(

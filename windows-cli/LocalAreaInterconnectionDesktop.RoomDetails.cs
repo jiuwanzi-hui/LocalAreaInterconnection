@@ -53,6 +53,7 @@ public partial class LocalAreaInterconnectionDesktop
     {
         RefreshRuntimeLogTail();
         RefreshCoordinationPresence();
+        RefreshCoordinationRoomViewPeriodically();
         if (latestRuntimeSnapshot.Length == 0 || !File.Exists(latestRuntimeSnapshot))
         {
             RefreshCoordinationRoomView(false);
@@ -75,6 +76,15 @@ public partial class LocalAreaInterconnectionDesktop
         UpdateRoomDetailsFromRuntimeSnapshot(text);
     }
 
+    void RefreshCoordinationRoomViewPeriodically()
+    {
+        if (coordinationRoomRefreshRunning) return;
+        if (coordinationServer == null || coordinationServer.Text.Trim().Length == 0) return;
+        if (DateTime.UtcNow - lastCoordinationRefreshUtc < TimeSpan.FromSeconds(5)) return;
+        lastCoordinationRefreshUtc = DateTime.UtcNow;
+        RefreshCoordinationRoomView(false);
+    }
+
     void UpdateRoomDetailsFromRuntimeSnapshot(string json)
     {
         if (roomSummary == null) return;
@@ -89,6 +99,7 @@ public partial class LocalAreaInterconnectionDesktop
         string heartbeatPackets = JsonNumberValue(json, "heartbeatPacketsSent");
         string snapshotWrites = JsonNumberValue(json, "snapshotWriteCount");
         string runtimePeers = RuntimeCompactPeersText(json);
+        string runtimePaths = RuntimeConnectionPathText(json);
         string linkState = RuntimeLinkStateText(json);
         string primaryPath = RuntimePrimaryPathText(json);
         string runtimeMetrics = RuntimeMetricsText(json);
@@ -115,6 +126,11 @@ public partial class LocalAreaInterconnectionDesktop
             + (runtimePeers.Length > 0 ? runtimePeers : SafeText(hostName.Text) + " @ " + SafeText(ip.Text));
         nextActionSummary.Text = T("detailNext") + " "
             + RuntimeNextActionText(json, linkState, adapter, tunnel, p2p, broadcast, gameTraffic);
+        if (runtimePaths.Length > 0)
+        {
+            nextActionSummary.Text += Environment.NewLine + T("summaryRuntimePaths")
+                + Environment.NewLine + runtimePaths;
+        }
     }
 
     void UpdateRoomDetailsFromRuntimeCleanupPlan(string json)

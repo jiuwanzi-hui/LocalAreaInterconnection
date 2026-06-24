@@ -129,6 +129,8 @@ public partial class LocalAreaInterconnectionDesktop : Form, IMessageFilter
     bool restartingRuntimeForRemotePeer = false;
     bool coordinationPresenceRefreshRunning = false;
     bool coordinationRoomRefreshRunning = false;
+    DateTime lastRuntimeP2pRetryUtc = DateTime.MinValue;
+    string lastRuntimeP2pRetrySpec = "";
     string lastRuntimeSnapshotText = "";
     string latestCoordinationViewText = "";
     int latestCoordinationOnlineCount = 0;

@@ -259,6 +259,8 @@ public partial class LocalAreaInterconnectionDesktop
             string status = JsonStringValue(report, "status");
             string selectedPath = JsonStringValue(report, "selected_path");
             string selectedEndpoint = JsonFirstStringInArray(JsonArrayValue(report, "selected_endpoints"));
+            string localHost = JsonNumberValue(report, "local_host_candidate_count");
+            string localSrflx = JsonNumberValue(report, "local_srflx_candidate_count");
             string remoteHost = JsonNumberValue(report, "remote_host_candidate_count");
             string remoteSrflx = JsonNumberValue(report, "remote_srflx_candidate_count");
             string stunBehavior = JsonStringValue(JsonObjectValue(entry, "stunMapping"), "mappingBehavior");
@@ -271,11 +273,13 @@ public partial class LocalAreaInterconnectionDesktop
                 if (bootstrapStatus.Length > 0) text += " " + bootstrapStatus;
                 if (status.Length > 0) text += " / " + status;
                 if (selectedPath.Length > 0) text += " [" + selectedPath + "]";
-                if (remoteHost.Length > 0 || remoteSrflx.Length > 0)
+                if (localHost.Length > 0 || localSrflx.Length > 0 || remoteHost.Length > 0 || remoteSrflx.Length > 0)
                 {
+                    if (localHost.Length == 0) localHost = "0";
+                    if (localSrflx.Length == 0) localSrflx = "0";
                     if (remoteHost.Length == 0) remoteHost = "0";
                     if (remoteSrflx.Length == 0) remoteSrflx = "0";
-                    text += " h/s=" + remoteHost + "/" + remoteSrflx;
+                    text += " h/s=" + localHost + "/" + localSrflx + " -> " + remoteHost + "/" + remoteSrflx;
                 }
                 if (stunBehavior.Length > 0 && stunBehavior != "not-tested") text += " nat=" + stunBehavior;
                 if (upnpStatus.Length > 0 && upnpStatus != "disabled") text += " upnp=" + upnpStatus;
@@ -440,6 +444,14 @@ public partial class LocalAreaInterconnectionDesktop
 
     string RuntimePrimaryPathText(string json)
     {
+        string path = RuntimePrimaryPathKind(json);
+        if (path == "p2p") return T("technologyUdpP2p");
+        if (path == "relay") return T("technologyUdpRelay");
+        return "";
+    }
+
+    string RuntimePrimaryPathKind(string json)
+    {
         string array = JsonArrayValue(json, "runtimePeerSummaries");
         if (array.Length == 0) array = JsonArrayValue(json, "summaries");
         if (array.Length == 0) return "";
@@ -461,9 +473,8 @@ public partial class LocalAreaInterconnectionDesktop
             else if (path == "p2p") hasP2p = true;
             search = end + 1;
         }
-        if (hasRelay) return T("technologyUdpRelay");
-        if (hasDirect) return T("technologyUdpP2p");
-        if (hasP2p) return T("technologyUdpP2p");
+        if (hasDirect || hasP2p) return "p2p";
+        if (hasRelay) return "relay";
         return "";
     }
 

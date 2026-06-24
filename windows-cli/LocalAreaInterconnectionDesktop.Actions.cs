@@ -897,9 +897,9 @@ public partial class LocalAreaInterconnectionDesktop
             + " --snapshot-out " + Quote(latestRuntimeSnapshot)
             + " --snapshot-interval-ms 1000"
             + " --stop-file " + Quote(runtimeStopFile)
-            + " --nat-bootstrap-attempts 24"
-            + " --nat-bootstrap-interval-ms 100"
-            + " --nat-bootstrap-timeout-ms 8000"
+            + " --nat-bootstrap-attempts 60"
+            + " --nat-bootstrap-interval-ms 80"
+            + " --nat-bootstrap-timeout-ms 12000"
             + RuntimeNatBootstrapStunArgs(stunServerValue)
             + RuntimeNatBootstrapUpnpArgs()
             + RelayCandidateArgs()
