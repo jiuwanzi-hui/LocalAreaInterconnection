@@ -6680,6 +6680,12 @@ fn run_room_runtime(
                                     } else {
                                         runtime_wintun_udp_drop_reason(udp_packet)
                                     };
+                                let udp_forward_targets =
+                                    runtime_targets_for_virtual_packet_destination(
+                                        plan,
+                                        heartbeat_targets.as_slice(),
+                                        udp_packet.destination_ip,
+                                    );
                                 let (broadcast_decision, should_forward_udp) =
                                     if udp_drop_reason.is_some() {
                                         (None, false)
@@ -6693,7 +6699,7 @@ fn run_room_runtime(
                                         let decision =
                                             broadcast_gate.decide(&packet, current_epoch_ms());
                                         let should_forward =
-                                            decision.forward && !heartbeat_targets.is_empty();
+                                            decision.forward && !udp_forward_targets.is_empty();
                                         broadcast_forward_events.push(
                                             lai_core::BroadcastForwardEvent {
                                                 protocol: "udp".to_owned(),
@@ -6702,14 +6708,14 @@ fn run_room_runtime(
                                                 destination_port: udp_packet.destination_port,
                                                 forwarded: should_forward,
                                                 reason: if decision.forward
-                                                    && heartbeat_targets.is_empty()
+                                                    && udp_forward_targets.is_empty()
                                                 {
                                                     "no-forward-targets".to_owned()
                                                 } else {
                                                     decision.reason.clone()
                                                 },
                                                 target_count: if should_forward {
-                                                    heartbeat_targets.len()
+                                                    udp_forward_targets.len()
                                                 } else {
                                                     0
                                                 },
@@ -6734,12 +6740,10 @@ fn run_room_runtime(
                                     "dropReason": udp_drop_reason,
                                 }));
 
-                                let udp_forward_targets = if should_forward_udp {
-                                    heartbeat_targets.as_slice()
-                                } else {
-                                    &[]
-                                };
                                 for target in udp_forward_targets {
+                                    if !should_forward_udp {
+                                        break;
+                                    }
                                     let forward_payload = serde_json::json!({
                                         "room_id": plan.room_id,
                                         "peer_id": plan.local_peer_id,
@@ -6824,8 +6828,14 @@ fn run_room_runtime(
                                     } else {
                                         runtime_wintun_tcp_drop_reason(tcp_packet)
                                     };
+                                let tcp_forward_targets =
+                                    runtime_targets_for_virtual_packet_destination(
+                                        plan,
+                                        heartbeat_targets.as_slice(),
+                                        tcp_packet.destination_ip,
+                                    );
                                 let should_forward_tcp =
-                                    tcp_drop_reason.is_none() && !heartbeat_targets.is_empty();
+                                    tcp_drop_reason.is_none() && !tcp_forward_targets.is_empty();
                                 wintun_runtime_received_packets.push(serde_json::json!({
                                     "packetIndex": packet_index,
                                     "protocol": "tcp",
@@ -6840,12 +6850,10 @@ fn run_room_runtime(
                                     "dropReason": tcp_drop_reason,
                                 }));
 
-                                let tcp_forward_targets = if should_forward_tcp {
-                                    heartbeat_targets.as_slice()
-                                } else {
-                                    &[]
-                                };
                                 for target in tcp_forward_targets {
+                                    if !should_forward_tcp {
+                                        break;
+                                    }
                                     let forward_payload = serde_json::json!({
                                         "room_id": plan.room_id,
                                         "peer_id": plan.local_peer_id,
@@ -6914,8 +6922,14 @@ fn run_room_runtime(
                                 } else {
                                     runtime_wintun_ipv4_drop_reason(summary)
                                 };
+                                let ipv4_forward_targets =
+                                    runtime_targets_for_virtual_packet_destination(
+                                        plan,
+                                        heartbeat_targets.as_slice(),
+                                        summary.destination_ip,
+                                    );
                                 let should_forward_ipv4 =
-                                    ipv4_drop_reason.is_none() && !heartbeat_targets.is_empty();
+                                    ipv4_drop_reason.is_none() && !ipv4_forward_targets.is_empty();
                                 if should_forward_ipv4
                                     && summary.protocol == "icmp"
                                     && lai_core::parse_ipv4_icmp_echo_request(&packet.bytes).is_ok()
@@ -6946,12 +6960,10 @@ fn run_room_runtime(
                                     "dropReason": ipv4_drop_reason,
                                 }));
 
-                                let ipv4_forward_targets = if should_forward_ipv4 {
-                                    heartbeat_targets.as_slice()
-                                } else {
-                                    &[]
-                                };
                                 for target in ipv4_forward_targets {
+                                    if !should_forward_ipv4 {
+                                        break;
+                                    }
                                     let forward_payload = serde_json::json!({
                                         "room_id": plan.room_id,
                                         "peer_id": plan.local_peer_id,
@@ -7379,7 +7391,14 @@ fn trim_event_log<T>(items: &mut Vec<T>, limit: usize) {
 
 #[cfg(test)]
 mod tests {
-    use super::trim_event_log;
+    use super::{
+        runtime_targets_for_virtual_packet_destination, trim_event_log, RuntimeSendTarget,
+    };
+    use lai_core::{
+        RoomRuntimePeer, RoomRuntimePlan, RuntimePortBinding, RuntimeTunnelPlan,
+        RuntimeUdpForwardPlan,
+    };
+    use std::net::Ipv4Addr;
 
     #[test]
     fn trim_event_log_keeps_most_recent_items() {
@@ -7389,6 +7408,87 @@ mod tests {
 
         trim_event_log(&mut values, 0);
         assert!(values.is_empty());
+    }
+
+    #[test]
+    fn virtual_packet_targets_exclude_self_probe_and_match_destination() {
+        let plan = RoomRuntimePlan {
+            room_id: "room".to_owned(),
+            local_peer_id: "peer_a".to_owned(),
+            local_virtual_ip: Ipv4Addr::new(10, 77, 12, 2),
+            tunnel: RuntimeTunnelPlan {
+                bind_endpoint: "127.0.0.1:0".to_owned(),
+                encryption: "psk".to_owned(),
+                handshake: "p2p".to_owned(),
+                peer_count: 2,
+            },
+            peers: vec![
+                RoomRuntimePeer {
+                    peer_id: "peer_b".to_owned(),
+                    virtual_ip: Ipv4Addr::new(10, 77, 12, 3),
+                    endpoint: "127.0.0.1:30003".to_owned(),
+                    connection_path: "direct".to_owned(),
+                    direct_endpoint: None,
+                    fallback_endpoint: None,
+                },
+                RoomRuntimePeer {
+                    peer_id: "peer_c".to_owned(),
+                    virtual_ip: Ipv4Addr::new(10, 77, 12, 4),
+                    endpoint: "127.0.0.1:30004".to_owned(),
+                    connection_path: "direct".to_owned(),
+                    direct_endpoint: None,
+                    fallback_endpoint: None,
+                },
+            ],
+            capture_ports: Vec::<RuntimePortBinding>::new(),
+            udp_forwarders: Vec::<RuntimeUdpForwardPlan>::new(),
+            diagnostic_outputs: Vec::new(),
+            warnings: Vec::new(),
+        };
+        let targets = vec![
+            RuntimeSendTarget {
+                peer_id: "peer_b".to_owned(),
+                endpoint: "127.0.0.1:30003".to_owned(),
+                socket_endpoint: None,
+                relay_url: None,
+                tcp_relay_url: None,
+                connection_path: "direct".to_owned(),
+            },
+            RuntimeSendTarget {
+                peer_id: "peer_c".to_owned(),
+                endpoint: "127.0.0.1:30004".to_owned(),
+                socket_endpoint: None,
+                relay_url: None,
+                tcp_relay_url: None,
+                connection_path: "direct".to_owned(),
+            },
+            RuntimeSendTarget {
+                peer_id: "self-probe".to_owned(),
+                endpoint: "127.0.0.1:30002".to_owned(),
+                socket_endpoint: None,
+                relay_url: None,
+                tcp_relay_url: None,
+                connection_path: "direct".to_owned(),
+            },
+        ];
+
+        let unicast = runtime_targets_for_virtual_packet_destination(
+            &plan,
+            &targets,
+            Ipv4Addr::new(10, 77, 12, 3),
+        );
+        assert_eq!(unicast.len(), 1);
+        assert_eq!(unicast[0].peer_id, "peer_b");
+
+        let broadcast = runtime_targets_for_virtual_packet_destination(
+            &plan,
+            &targets,
+            Ipv4Addr::new(10, 77, 12, 255),
+        );
+        assert_eq!(broadcast.len(), 2);
+        assert!(broadcast
+            .iter()
+            .all(|target| target.peer_id != "self-probe"));
     }
 }
 
@@ -8163,6 +8263,30 @@ fn runtime_direct_probe_heartbeat_targets(
             && left.connection_path == right.connection_path
     });
     Ok(targets)
+}
+
+fn runtime_targets_for_virtual_packet_destination<'a>(
+    plan: &'a RoomRuntimePlan,
+    targets: &'a [RuntimeSendTarget],
+    destination_ip: Ipv4Addr,
+) -> Vec<&'a RuntimeSendTarget> {
+    targets
+        .iter()
+        .filter(|target| target.peer_id != "self-probe")
+        .filter(|target| {
+            runtime_virtual_packet_destination_is_broadcast(destination_ip)
+                || plan
+                    .peers
+                    .iter()
+                    .any(|peer| peer.peer_id == target.peer_id && peer.virtual_ip == destination_ip)
+        })
+        .collect()
+}
+
+fn runtime_virtual_packet_destination_is_broadcast(destination_ip: Ipv4Addr) -> bool {
+    destination_ip == Ipv4Addr::BROADCAST
+        || destination_ip.octets()[3] == 255
+        || runtime_is_multicast_ipv4(destination_ip)
 }
 
 fn runtime_peer_target_endpoint_and_path(
