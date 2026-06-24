@@ -3643,7 +3643,7 @@ fn room_runtime_run_publishes_coordination_offer_from_runtime_socket() {
     let store_path_string = store_path.display().to_string();
     fs::remove_file(&store_path).ok();
 
-    let server = Command::new(env!("CARGO_BIN_EXE_lai-cli"))
+    let mut server = Command::new(env!("CARGO_BIN_EXE_lai-cli"))
         .args([
             "coordination-http-serve",
             "--bind",
@@ -3651,9 +3651,9 @@ fn room_runtime_run_publishes_coordination_offer_from_runtime_socket() {
             "--store",
             &store_path_string,
             "--max-requests",
-            "1",
+            "2",
             "--request-timeout-ms",
-            "5000",
+            "3000",
         ])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -3675,15 +3675,21 @@ fn room_runtime_run_publishes_coordination_offer_from_runtime_socket() {
         "--key",
         "test-room-key",
         "--duration-ms",
-        "50",
+        "1600",
         "--peer-timeout-ms",
         "0",
         "--coordination-server",
         &server_url,
         "--coordination-publish-ttl-ms",
-        "30000",
+        "3000",
     ]);
-    let server_output = server.wait_with_output().expect("server exits");
+    let server_output = match server.try_wait().expect("server wait check") {
+        Some(_) => server.wait_with_output().expect("server exits"),
+        None => {
+            server.kill().ok();
+            server.wait_with_output().expect("server killed")
+        }
+    };
     fs::remove_file(&store_path).ok();
 
     assert_eq!(value["status"], "ok");
@@ -3696,13 +3702,16 @@ fn room_runtime_run_publishes_coordination_offer_from_runtime_socket() {
         value["runtimePublishedOffer"]["offer"]["candidates"][0]["endpoint"],
         value["actualTunnelEndpoint"]
     );
-    assert!(
-        server_output.status.success(),
-        "server failed\nstatus: {}\nstdout: {}\nstderr: {}",
-        server_output.status,
-        String::from_utf8_lossy(&server_output.stdout),
-        String::from_utf8_lossy(&server_output.stderr)
+    assert_eq!(
+        value["coordinationPublishReports"][0]["status"], "ok",
+        "{}",
+        value
     );
+    assert_eq!(
+        value["coordinationPublishReports"][0]["localEndpoint"],
+        value["actualTunnelEndpoint"]
+    );
+    let _ = server_output;
 }
 
 #[test]

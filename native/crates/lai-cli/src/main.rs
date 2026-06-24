@@ -83,6 +83,20 @@ struct RuntimeCoordinationMonitor {
     interval_ms: u64,
 }
 
+#[derive(Clone, Debug)]
+struct RuntimeCoordinationPublisher {
+    server: String,
+    ttl_ms: u64,
+    interval_ms: u64,
+    stun_server: Option<String>,
+    stun_timeout_ms: u64,
+    upnp_port_map: bool,
+    upnp_timeout_ms: u64,
+    upnp_lease_seconds: u32,
+    upnp_gateway_location: Option<String>,
+    relay_endpoints: Vec<String>,
+}
+
 #[derive(Clone, Debug, Serialize)]
 struct RuntimeCoordinationMonitorReport {
     status: String,
@@ -768,6 +782,17 @@ fn run_main() -> Result<(), Box<dyn std::error::Error>> {
                     server: coordination_server.clone(),
                     interval_ms: coordination_monitor_interval_ms,
                 }),
+                runtime_coordination_publisher(
+                    coordination_server.clone(),
+                    coordination_publish_ttl_ms,
+                    nat_bootstrap_stun_server.clone(),
+                    nat_bootstrap_stun_timeout_ms,
+                    nat_bootstrap_upnp_port_map,
+                    nat_bootstrap_upnp_timeout_ms,
+                    nat_bootstrap_upnp_lease_seconds,
+                    nat_bootstrap_upnp_gateway_location.clone(),
+                    relay_endpoints.clone(),
+                ),
                 &RuntimePacketIoProbeOptions {
                     wintun_adapter_name,
                     wintun_ring_capacity,
@@ -5513,6 +5538,37 @@ fn monitor_subnet_for_virtual_ip(virtual_ip: Ipv4Addr) -> Ipv4Subnet {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn runtime_coordination_publisher(
+    server: Option<String>,
+    ttl_ms: u64,
+    stun_server: Option<String>,
+    stun_timeout_ms: u64,
+    upnp_port_map: bool,
+    upnp_timeout_ms: u64,
+    upnp_lease_seconds: u32,
+    upnp_gateway_location: Option<String>,
+    relay_endpoints: Vec<String>,
+) -> Option<RuntimeCoordinationPublisher> {
+    let server = server?.trim().to_owned();
+    if server.is_empty() || ttl_ms == 0 {
+        return None;
+    }
+    let interval_ms = (ttl_ms / 3).max(1_000).min(15_000);
+    Some(RuntimeCoordinationPublisher {
+        server,
+        ttl_ms,
+        interval_ms,
+        stun_server,
+        stun_timeout_ms,
+        upnp_port_map,
+        upnp_timeout_ms,
+        upnp_lease_seconds,
+        upnp_gateway_location,
+        relay_endpoints,
+    })
+}
+
 fn run_room_runtime(
     plan: &RoomRuntimePlan,
     key: &str,
@@ -5531,6 +5587,7 @@ fn run_room_runtime(
     stop_file: Option<&str>,
     snapshot_interval_ms: Option<u64>,
     coordination_monitor: Option<RuntimeCoordinationMonitor>,
+    coordination_publisher: Option<RuntimeCoordinationPublisher>,
     packet_io_probe_options: &RuntimePacketIoProbeOptions,
     wintun_runtime: bool,
     expected_broadcast_ports: Vec<u16>,
@@ -5747,11 +5804,18 @@ fn run_room_runtime(
     let mut next_coordination_monitor_at = coordination_monitor
         .as_ref()
         .map(|_| started_at + Duration::from_millis(1));
+    let coordination_publish_interval = coordination_publisher
+        .as_ref()
+        .map(|publisher| Duration::from_millis(publisher.interval_ms.max(1)));
+    let mut next_coordination_publish_at = coordination_publisher
+        .as_ref()
+        .map(|publisher| started_at + Duration::from_millis(publisher.interval_ms.max(1)));
     let mut heartbeat_packets = Vec::new();
     let mut heartbeat_ack_packets = Vec::new();
     let mut next_heartbeat_sequence = 1u64;
     let mut next_forward_sequence = 1u64;
     let mut coordination_monitor_reports = Vec::new();
+    let mut coordination_publish_reports = Vec::new();
     let mut snapshot_write_count = 0u32;
     let mut last_peer_packet_at = None;
     let mut peer_timed_out = false;
@@ -5964,6 +6028,7 @@ fn run_room_runtime(
                         Some(tunnel_endpoint_text.as_str()),
                     ),
                     "coordinationMonitorReports": coordination_monitor_reports.clone(),
+                    "coordinationPublishReports": coordination_publish_reports.clone(),
                     "relayFallbackActive": using_relay_fallback_targets,
                     "relayFallbackEvents": relay_fallback_events.clone(),
                     "relayRegistrationTargets": relay_registration_targets.iter().map(|target| {
@@ -6029,6 +6094,44 @@ fn run_room_runtime(
                 ) {
                     continue;
                 }
+            }
+        }
+
+        if let (Some(publisher), Some(interval), Some(next_publish)) = (
+            coordination_publisher.as_ref(),
+            coordination_publish_interval,
+            next_coordination_publish_at,
+        ) {
+            if now >= next_publish {
+                match publish_runtime_coordination_offer(
+                    Some(publisher.server.as_str()),
+                    publisher.ttl_ms,
+                    &plan.room_id,
+                    &plan.local_peer_id,
+                    plan.local_virtual_ip,
+                    &tunnel_socket,
+                    publisher.stun_server.as_deref(),
+                    publisher.stun_timeout_ms,
+                    publisher.upnp_port_map,
+                    publisher.upnp_timeout_ms,
+                    publisher.upnp_lease_seconds,
+                    publisher.upnp_gateway_location.as_deref(),
+                    &publisher.relay_endpoints,
+                ) {
+                    Ok(report) => coordination_publish_reports.push(report),
+                    Err(err) => coordination_publish_reports.push(serde_json::json!({
+                        "status": "error",
+                        "server": publisher.server.clone(),
+                        "ttlMs": publisher.ttl_ms,
+                        "publishedAtMs": current_epoch_ms(),
+                        "error": err.to_string(),
+                    })),
+                }
+                trim_event_log(
+                    &mut coordination_publish_reports,
+                    RUNTIME_SMALL_DIAGNOSTIC_EVENT_LOG_LIMIT,
+                );
+                next_coordination_publish_at = Some(now + interval);
             }
         }
 
@@ -7204,6 +7307,7 @@ fn run_room_runtime(
         "heartbeatPacketsSent": heartbeat_packets_sent,
         "heartbeatAckPackets": heartbeat_ack_packets,
         "coordinationMonitorReports": coordination_monitor_reports,
+        "coordinationPublishReports": coordination_publish_reports,
         "snapshotWriteCount": snapshot_write_count,
         "tunnelPackets": tunnel_packets,
         "forwardedPackets": forwarded_packets,

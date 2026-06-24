@@ -429,6 +429,12 @@ public partial class LocalAreaInterconnectionDesktop
         {
             return;
         }
+        if (runtimeProcess != null && !runtimeProcess.HasExited)
+        {
+            lastCoordinationRefreshUtc = DateTime.UtcNow;
+            RefreshCoordinationRoomView(false);
+            return;
+        }
         lastCoordinationRefreshUtc = DateTime.UtcNow;
         string peer = RuntimePeerId();
         string roomId = RuntimeRoomId();
