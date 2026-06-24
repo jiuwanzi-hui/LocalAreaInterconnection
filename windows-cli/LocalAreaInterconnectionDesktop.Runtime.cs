@@ -1048,12 +1048,18 @@ public partial class LocalAreaInterconnectionDesktop
 
     bool RuntimeHasRecentForwardedTraffic(string snapshot, int seconds)
     {
-        long newest = LatestRuntimeTrafficTimestampMs(snapshot, "forwardedPackets", "sentAtMs");
+        long newest = 0;
+        long latestTrafficAtMs;
+        if (Int64.TryParse(JsonNumberValue(snapshot, "latestTrafficAtMs"), NumberStyles.Integer, CultureInfo.InvariantCulture, out latestTrafficAtMs))
+        {
+            newest = latestTrafficAtMs;
+        }
+        newest = Math.Max(newest, LatestRuntimeTrafficTimestampMs(snapshot, "forwardedPackets", "sentAtMs"));
         newest = Math.Max(newest, LatestRuntimeTrafficTimestampMs(snapshot, "icmpEchoRequests", "sentAtMs"));
         newest = Math.Max(newest, LatestRuntimeTrafficTimestampMs(snapshot, "icmpEchoReplies", "sentAtMs"));
-        newest = Math.Max(newest, LatestRuntimeTrafficTimestampMs(snapshot, "wintunRuntime", "receivedPackets", "sentAtMs"));
         newest = Math.Max(newest, LatestRuntimeTrafficTimestampMs(snapshot, "wintunRuntime", "sentPackets", "sentAtMs"));
-        newest = Math.Max(newest, LatestRuntimeTrafficTimestampMs(snapshot, "wintunRuntime", "receivedPackets", "receivedAtMs"));
+        newest = Math.Max(newest, LatestRuntimeForwardedTrafficTimestampMs(snapshot, "wintunRuntime", "receivedPackets", "sentAtMs"));
+        newest = Math.Max(newest, LatestRuntimeForwardedTrafficTimestampMs(snapshot, "wintunRuntime", "receivedPackets", "receivedAtMs"));
         newest = Math.Max(newest, LatestRuntimeTrafficTimestampMs(snapshot, "wintunRuntime", "sentPackets", "receivedAtMs"));
         if (newest <= 0) return false;
         long now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
@@ -1072,6 +1078,13 @@ public partial class LocalAreaInterconnectionDesktop
         return LatestRuntimeTrafficTimestampMs(JsonArrayValue(child, arrayKey), timestampKey);
     }
 
+    long LatestRuntimeForwardedTrafficTimestampMs(string json, string objectKey, string arrayKey, string timestampKey)
+    {
+        string child = JsonObjectValue(json, objectKey);
+        if (child.Length == 0) return 0;
+        return LatestRuntimeForwardedTrafficTimestampMs(JsonArrayValue(child, arrayKey), timestampKey);
+    }
+
     long LatestRuntimeTrafficTimestampMs(string array, string timestampKey)
     {
         long newest = 0;
@@ -1087,6 +1100,30 @@ public partial class LocalAreaInterconnectionDesktop
             if (Int64.TryParse(JsonNumberValue(item, timestampKey), NumberStyles.Integer, CultureInfo.InvariantCulture, out value))
             {
                 newest = Math.Max(newest, value);
+            }
+            search = end + 1;
+        }
+        return newest;
+    }
+
+    long LatestRuntimeForwardedTrafficTimestampMs(string array, string timestampKey)
+    {
+        long newest = 0;
+        int search = 0;
+        while (search < array.Length)
+        {
+            int start = array.IndexOf('{', search);
+            if (start < 0) break;
+            int end = MatchingJsonBrace(array, start);
+            if (end < 0) break;
+            string item = array.Substring(start, end - start + 1);
+            if (JsonBoolValue(item, "forwarded"))
+            {
+                long value;
+                if (Int64.TryParse(JsonNumberValue(item, timestampKey), NumberStyles.Integer, CultureInfo.InvariantCulture, out value))
+                {
+                    newest = Math.Max(newest, value);
+                }
             }
             search = end + 1;
         }

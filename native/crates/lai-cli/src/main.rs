@@ -6064,6 +6064,13 @@ fn run_room_runtime(
                         &wintun_runtime_sent_packets,
                         &injected_packets,
                     ),
+                    "latestTrafficAtMs": latest_runtime_traffic_at_ms(
+                        &forwarded_packets,
+                        &icmp_echo_requests,
+                        &icmp_echo_replies,
+                        &wintun_runtime_received_packets,
+                        &wintun_runtime_sent_packets,
+                    ),
                     "packetIoProbe": packet_io_probe.clone(),
                     "adapterWriteStatus": packet_io_probe["adapterWriteStatus"].clone(),
                     "adapterReadStatus": packet_io_probe["adapterReadStatus"].clone(),
@@ -6601,6 +6608,7 @@ fn run_room_runtime(
                                                         "destinationIp": summary.destination_ip,
                                                         "destinationPort": summary.destination_port,
                                                         "broadcast": summary.broadcast,
+                                                        "sentAtMs": current_epoch_ms(),
                                                     }),
                                                 );
                                                 }
@@ -6833,6 +6841,7 @@ fn run_room_runtime(
                 match session.receive_once() {
                     Ok(Some(packet)) => {
                         let packet_index = wintun_runtime_received_packets.len() + 1;
+                        let packet_received_at_ms = current_epoch_ms();
                         match (&packet.parsed_udp, &packet.parsed_tcp, &packet.summary) {
                             (Some(udp_packet), _, _) => {
                                 let observation =
@@ -6920,6 +6929,7 @@ fn run_room_runtime(
                                     "forwarded": should_forward_udp,
                                     "broadcastDecision": broadcast_decision,
                                     "dropReason": udp_drop_reason,
+                                    "receivedAtMs": packet_received_at_ms,
                                 }));
 
                                 for target in udp_forward_targets {
@@ -7031,6 +7041,7 @@ fn run_room_runtime(
                                     "flags": tcp_packet.flags,
                                     "forwarded": should_forward_tcp,
                                     "dropReason": tcp_drop_reason,
+                                    "receivedAtMs": packet_received_at_ms,
                                 }));
 
                                 for target in tcp_forward_targets {
@@ -7142,6 +7153,7 @@ fn run_room_runtime(
                                     "payloadBytes": summary.payload_bytes,
                                     "forwarded": should_forward_ipv4,
                                     "dropReason": ipv4_drop_reason,
+                                    "receivedAtMs": packet_received_at_ms,
                                 }));
 
                                 for target in ipv4_forward_targets {
@@ -7213,6 +7225,7 @@ fn run_room_runtime(
                                     "packetBytes": packet.packet_bytes,
                                     "forwarded": false,
                                     "parseError": packet.parse_error.clone(),
+                                    "receivedAtMs": packet_received_at_ms,
                                 }));
                             }
                         }
@@ -7363,6 +7376,13 @@ fn run_room_runtime(
         &wintun_runtime_sent_packets,
         &injected_packets,
     );
+    let latest_traffic_at_ms = latest_runtime_traffic_at_ms(
+        &forwarded_packets,
+        &icmp_echo_requests,
+        &icmp_echo_replies,
+        &wintun_runtime_received_packets,
+        &wintun_runtime_sent_packets,
+    );
     let result = serde_json::json!({
         "status": if tunnel_snapshot.last_error.is_none() && wintun_open_ok && wintun_config_ok { "ok" } else { "degraded" },
         "startedAtMs": started_at_ms,
@@ -7393,6 +7413,7 @@ fn run_room_runtime(
         "icmpEchoRequests": icmp_echo_requests,
         "icmpEchoReplies": icmp_echo_replies,
         "packetPathCounters": packet_path_counters,
+        "latestTrafficAtMs": latest_traffic_at_ms,
         "wintunRuntime": {
             "enabled": wintun_runtime,
             "open": wintun_runtime_open,
@@ -7520,6 +7541,48 @@ fn runtime_packet_path_counters(
     })
 }
 
+fn latest_runtime_traffic_at_ms(
+    forwarded_packets: &[serde_json::Value],
+    icmp_echo_requests: &[serde_json::Value],
+    icmp_echo_replies: &[serde_json::Value],
+    wintun_runtime_received_packets: &[serde_json::Value],
+    wintun_runtime_sent_packets: &[serde_json::Value],
+) -> Option<u64> {
+    forwarded_packets
+        .iter()
+        .filter_map(|event| event.get("sentAtMs").and_then(serde_json::Value::as_u64))
+        .chain(
+            icmp_echo_requests
+                .iter()
+                .filter_map(|event| event.get("sentAtMs").and_then(serde_json::Value::as_u64)),
+        )
+        .chain(
+            icmp_echo_replies
+                .iter()
+                .filter_map(|event| event.get("sentAtMs").and_then(serde_json::Value::as_u64)),
+        )
+        .chain(wintun_runtime_received_packets.iter().filter_map(|event| {
+            if !event
+                .get("forwarded")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+            {
+                return None;
+            }
+            event
+                .get("receivedAtMs")
+                .or_else(|| event.get("sentAtMs"))
+                .and_then(serde_json::Value::as_u64)
+        }))
+        .chain(wintun_runtime_sent_packets.iter().filter_map(|event| {
+            event
+                .get("sentAtMs")
+                .or_else(|| event.get("receivedAtMs"))
+                .and_then(serde_json::Value::as_u64)
+        }))
+        .max()
+}
+
 #[allow(clippy::too_many_arguments)]
 fn trim_runtime_diagnostic_buffers(
     heartbeat_packets: &mut Vec<serde_json::Value>,
@@ -7585,9 +7648,9 @@ fn next_runtime_sequence(next_sequence: &mut u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        is_benign_route_result, next_runtime_sequence, runtime_connected_peer_count_from_summaries,
-        runtime_peer_from_bootstrap_result, runtime_targets_for_virtual_packet_destination,
-        trim_event_log, RuntimeSendTarget,
+        is_benign_route_result, latest_runtime_traffic_at_ms, next_runtime_sequence,
+        runtime_connected_peer_count_from_summaries, runtime_peer_from_bootstrap_result,
+        runtime_targets_for_virtual_packet_destination, trim_event_log, RuntimeSendTarget,
     };
     use lai_core::{
         NetworkCommand, RoomRuntimePeer, RoomRuntimePlan, RuntimePortBinding, RuntimeTunnelPlan,
@@ -7616,6 +7679,36 @@ mod tests {
 
         assert_eq!(retained_events, vec![4, 5]);
         assert_eq!(next_runtime_sequence(&mut next_sequence), 6);
+    }
+
+    #[test]
+    fn latest_runtime_traffic_ignores_unforwarded_wintun_noise() {
+        let forwarded_packets = vec![serde_json::json!({ "sentAtMs": 100 })];
+        let icmp_echo_requests = Vec::new();
+        let icmp_echo_replies = Vec::new();
+        let wintun_received = vec![
+            serde_json::json!({
+                "forwarded": false,
+                "dropReason": "multicast-noise",
+                "receivedAtMs": 900
+            }),
+            serde_json::json!({
+                "forwarded": true,
+                "receivedAtMs": 400
+            }),
+        ];
+        let wintun_sent = vec![serde_json::json!({ "sentAtMs": 300 })];
+
+        assert_eq!(
+            latest_runtime_traffic_at_ms(
+                &forwarded_packets,
+                &icmp_echo_requests,
+                &icmp_echo_replies,
+                &wintun_received,
+                &wintun_sent,
+            ),
+            Some(400)
+        );
     }
 
     #[test]
