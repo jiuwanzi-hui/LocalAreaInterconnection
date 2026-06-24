@@ -130,6 +130,21 @@ def trim_http_queue(queue):
     queue[:] = fresh
 
 
+def preferred_offer_endpoint(offer):
+    candidates = offer.get("candidates") if isinstance(offer, dict) else None
+    if not isinstance(candidates, list) or not candidates:
+        return None
+    best = max(
+        (
+            candidate for candidate in candidates
+            if isinstance(candidate, dict) and candidate.get("endpoint")
+        ),
+        key=lambda candidate: (int(candidate.get("priority") or 0), str(candidate.get("endpoint") or "")),
+        default=None,
+    )
+    return best.get("endpoint") if best else None
+
+
 def parse_binary_udp_relay_packet(data):
     header_len = len(UDP_BINARY_MAGIC) + 1 + 2 + 2 + 2 + 4
     if len(data) < header_len or not data.startswith(UDP_BINARY_MAGIC):
@@ -213,6 +228,7 @@ class Handler(BaseHTTPRequestHandler):
                     {
                         "peerId": item["peerId"],
                         "virtualIp": item["offer"].get("virtual_ip"),
+                        "offerCreatedAtMs": item["offer"].get("created_at_ms"),
                         "status": "online" if item["expiresAtMs"] > now_ms() else "expired",
                         "updatedAtMs": item["updatedAtMs"],
                     }
@@ -225,7 +241,8 @@ class Handler(BaseHTTPRequestHandler):
                     "status": peer["status"],
                     "is_host": index == 0,
                     "candidate_count": len(room.get(peer["peerId"], {}).get("offer", {}).get("candidates", [])) if isinstance(room.get(peer["peerId"], {}).get("offer", {}), dict) else 0,
-                    "preferred_endpoint": None,
+                    "preferred_endpoint": preferred_offer_endpoint(room.get(peer["peerId"], {}).get("offer", {})),
+                    "offer_created_at_ms": peer.get("offerCreatedAtMs"),
                     "last_seen_ms": peer["updatedAtMs"],
                     "expires_at_ms": room.get(peer["peerId"], {}).get("expiresAtMs", 0),
                 }
