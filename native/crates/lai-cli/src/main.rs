@@ -5249,7 +5249,7 @@ fn runtime_reply_target(
         };
     }
     let endpoint = observed_peer.to_string();
-    let peer = plan.peers.iter().find(|peer| peer.endpoint == endpoint);
+    let peer = runtime_peer_for_reply_endpoint(plan, observed_peer);
     RuntimeSendTarget {
         peer_id: peer
             .map(|peer| peer.peer_id.clone())
@@ -5259,8 +5259,48 @@ fn runtime_reply_target(
         relay_url: None,
         tcp_relay_url: None,
         connection_path: peer
-            .map(|peer| peer.connection_path.clone())
+            .map(|peer| runtime_reply_connection_path(peer, observed_peer))
             .unwrap_or_else(|| "direct".to_owned()),
+    }
+}
+
+fn runtime_peer_for_reply_endpoint(
+    plan: &RoomRuntimePlan,
+    observed_peer: SocketAddr,
+) -> Option<&RoomRuntimePeer> {
+    let endpoint = observed_peer.to_string();
+    plan.peers.iter().find(|peer| {
+        peer.endpoint == endpoint
+            || peer
+                .direct_endpoint
+                .as_deref()
+                .and_then(|candidate| candidate.parse::<SocketAddr>().ok())
+                == Some(observed_peer)
+            || peer
+                .fallback_endpoint
+                .as_deref()
+                .and_then(|candidate| candidate.parse::<SocketAddr>().ok())
+                == Some(observed_peer)
+    })
+}
+
+fn runtime_reply_connection_path(peer: &RoomRuntimePeer, observed_peer: SocketAddr) -> String {
+    if peer
+        .direct_endpoint
+        .as_deref()
+        .and_then(|candidate| candidate.parse::<SocketAddr>().ok())
+        == Some(observed_peer)
+    {
+        "direct".to_owned()
+    } else if peer
+        .fallback_endpoint
+        .as_deref()
+        .and_then(|candidate| candidate.parse::<SocketAddr>().ok())
+        == Some(observed_peer)
+    {
+        "relay".to_owned()
+    } else {
+        peer.connection_path.clone()
     }
 }
 
@@ -7655,14 +7695,14 @@ mod tests {
     use super::{
         best_direct_candidate_endpoint, is_benign_route_result, latest_runtime_traffic_at_ms,
         next_runtime_sequence, runtime_connected_peer_count_from_summaries,
-        runtime_peer_from_bootstrap_result, runtime_targets_for_virtual_packet_destination,
-        trim_event_log, RuntimeSendTarget,
+        runtime_peer_from_bootstrap_result, runtime_reply_target,
+        runtime_targets_for_virtual_packet_destination, trim_event_log, RuntimeSendTarget,
     };
     use lai_core::{
         NatCandidate, NatTraversalOffer, NetworkCommand, RoomRuntimePeer, RoomRuntimePlan,
         RuntimePortBinding, RuntimeTunnelPlan, RuntimeUdpForwardPlan,
     };
-    use std::net::Ipv4Addr;
+    use std::net::{Ipv4Addr, SocketAddr};
 
     #[test]
     fn trim_event_log_keeps_most_recent_items() {
@@ -7762,6 +7802,40 @@ mod tests {
             best_direct_candidate_endpoint(&offer),
             Some("198.51.100.20:39090".to_owned())
         );
+    }
+
+    #[test]
+    fn reply_target_matches_peer_direct_endpoint() {
+        let direct_endpoint: SocketAddr = "127.0.0.1:41001".parse().unwrap();
+        let plan = RoomRuntimePlan {
+            room_id: "room".to_owned(),
+            local_peer_id: "peer_a".to_owned(),
+            local_virtual_ip: Ipv4Addr::new(10, 77, 12, 2),
+            tunnel: RuntimeTunnelPlan {
+                bind_endpoint: "127.0.0.1:0".to_owned(),
+                encryption: "psk".to_owned(),
+                handshake: "p2p".to_owned(),
+                peer_count: 1,
+            },
+            peers: vec![RoomRuntimePeer {
+                peer_id: "peer_b".to_owned(),
+                virtual_ip: Ipv4Addr::new(10, 77, 12, 3),
+                endpoint: "203.0.113.10:39091".to_owned(),
+                connection_path: "relay".to_owned(),
+                direct_endpoint: Some(direct_endpoint.to_string()),
+                fallback_endpoint: Some("203.0.113.10:39091".to_owned()),
+            }],
+            capture_ports: Vec::<RuntimePortBinding>::new(),
+            udp_forwarders: Vec::<RuntimeUdpForwardPlan>::new(),
+            diagnostic_outputs: Vec::new(),
+            warnings: Vec::new(),
+        };
+
+        let target = runtime_reply_target(&plan, direct_endpoint, None);
+
+        assert_eq!(target.peer_id, "peer_b");
+        assert_eq!(target.endpoint, direct_endpoint.to_string());
+        assert_eq!(target.connection_path, "direct");
     }
 
     #[test]

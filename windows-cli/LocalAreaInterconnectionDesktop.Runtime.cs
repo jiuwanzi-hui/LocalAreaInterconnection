@@ -192,7 +192,6 @@ public partial class LocalAreaInterconnectionDesktop
             {
                 peer = SafePeerId(peerId) + "," + virtualIp;
             }
-            args += " --coordination-server " + Quote(server);
             args += " --coordination-peer " + Quote(peer);
         }
         return args;
@@ -689,7 +688,8 @@ public partial class LocalAreaInterconnectionDesktop
     {
         server = NormalizeCoordinationServer(server);
         if (server.Length == 0) return "";
-        return " --coordination-publish-ttl-ms " + CoordinationOfferTtlMs.ToString(CultureInfo.InvariantCulture);
+        return " --coordination-server " + Quote(server)
+            + " --coordination-publish-ttl-ms " + CoordinationOfferTtlMs.ToString(CultureInfo.InvariantCulture);
     }
 
     bool UpnpPortMapEnabled()
