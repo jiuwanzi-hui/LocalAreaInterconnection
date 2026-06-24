@@ -5563,6 +5563,10 @@ fn coordination_room_view_outputs_online_members() {
         .starts_with("10.77.12."));
     assert_eq!(view["members"][1]["peer_id"], "peer_b");
     assert!(view["members"][1]["candidate_count"].as_u64().unwrap() >= 1);
+    assert!(view["members"][1]["candidate_signature"]
+        .as_str()
+        .unwrap()
+        .contains("host:udp:"));
     assert!(view["next_action"]
         .as_str()
         .unwrap()

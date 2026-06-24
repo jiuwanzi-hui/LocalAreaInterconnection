@@ -1070,6 +1070,12 @@ public partial class LocalAreaInterconnectionDesktop
                 if (candidateCount.Length == 0) candidateCount = JsonNumberValue(member, "candidateCount");
                 string endpoint = JsonStringValue(member, "preferred_endpoint");
                 if (endpoint.Length == 0) endpoint = JsonStringValue(member, "preferredEndpoint");
+                string candidateSignature = JsonStringValue(member, "candidate_signature");
+                if (candidateSignature.Length == 0) candidateSignature = JsonStringValue(member, "candidateSignature");
+                if (candidateSignature.Length > 0)
+                {
+                    return SafePeerId(peer) + "|" + virtualIp + "|" + candidateSignature;
+                }
                 if (candidateCount.Length == 0 && endpoint.Length == 0)
                 {
                     return "";

@@ -10,6 +10,7 @@ pub struct CoordinationRoomMemberView {
     pub is_host: bool,
     pub candidate_count: usize,
     pub preferred_endpoint: Option<String>,
+    pub candidate_signature: Option<String>,
     pub offer_created_at_ms: Option<u128>,
     pub last_seen_ms: u128,
     pub expires_at_ms: u128,
@@ -64,6 +65,23 @@ pub fn coordination_room_view(
                             .max_by_key(|candidate| candidate.priority)
                             .map(|candidate| candidate.endpoint.clone())
                     });
+                    let candidate_signature = peer.offer.as_ref().and_then(|offer| {
+                        let mut values = offer
+                            .candidates
+                            .iter()
+                            .map(|candidate| {
+                                format!(
+                                    "{}:{}:{}:{}",
+                                    candidate.candidate_type,
+                                    candidate.transport,
+                                    candidate.endpoint,
+                                    candidate.priority
+                                )
+                            })
+                            .collect::<Vec<_>>();
+                        values.sort();
+                        (!values.is_empty()).then(|| values.join("|"))
+                    });
                     let offer_created_at_ms = peer.offer.as_ref().map(|offer| offer.created_at_ms);
                     CoordinationRoomMemberView {
                         peer_id: peer.peer_id.clone(),
@@ -76,6 +94,7 @@ pub fn coordination_room_view(
                         is_host: host_peer_id.as_deref() == Some(peer.peer_id.as_str()),
                         candidate_count,
                         preferred_endpoint,
+                        candidate_signature,
                         offer_created_at_ms,
                         last_seen_ms: peer.last_seen_ms,
                         expires_at_ms: peer.expires_at_ms,
@@ -188,6 +207,10 @@ mod tests {
         assert_eq!(
             view.members[1].preferred_endpoint.as_deref(),
             Some("127.0.0.1:10001")
+        );
+        assert_eq!(
+            view.members[1].candidate_signature.as_deref(),
+            Some("host:udp:127.0.0.1:10001:100")
         );
         assert_eq!(view.members[1].offer_created_at_ms, Some(20));
         assert!(view.next_action.contains("runtime bootstrap"));

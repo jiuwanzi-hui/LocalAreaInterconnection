@@ -145,6 +145,28 @@ def preferred_offer_endpoint(offer):
     return best.get("endpoint") if best else None
 
 
+def offer_candidate_signature(offer):
+    candidates = offer.get("candidates") if isinstance(offer, dict) else None
+    if not isinstance(candidates, list) or not candidates:
+        return None
+    values = []
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            continue
+        endpoint = str(candidate.get("endpoint") or "")
+        if not endpoint:
+            continue
+        values.append("{}:{}:{}:{}".format(
+            candidate.get("candidate_type") or "",
+            candidate.get("transport") or "",
+            endpoint,
+            int(candidate.get("priority") or 0),
+        ))
+    if not values:
+        return None
+    return "|".join(sorted(values))
+
+
 def parse_binary_udp_relay_packet(data):
     header_len = len(UDP_BINARY_MAGIC) + 1 + 2 + 2 + 2 + 4
     if len(data) < header_len or not data.startswith(UDP_BINARY_MAGIC):
@@ -242,6 +264,7 @@ class Handler(BaseHTTPRequestHandler):
                     "is_host": index == 0,
                     "candidate_count": len(room.get(peer["peerId"], {}).get("offer", {}).get("candidates", [])) if isinstance(room.get(peer["peerId"], {}).get("offer", {}), dict) else 0,
                     "preferred_endpoint": preferred_offer_endpoint(room.get(peer["peerId"], {}).get("offer", {})),
+                    "candidate_signature": offer_candidate_signature(room.get(peer["peerId"], {}).get("offer", {})),
                     "offer_created_at_ms": peer.get("offerCreatedAtMs"),
                     "last_seen_ms": peer["updatedAtMs"],
                     "expires_at_ms": room.get(peer["peerId"], {}).get("expiresAtMs", 0),
