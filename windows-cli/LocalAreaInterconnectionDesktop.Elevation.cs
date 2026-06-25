@@ -13,6 +13,22 @@ public partial class LocalAreaInterconnectionDesktop
         return Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "LocalAreaInterconnection.Native.Cli.exe");
     }
 
+    bool IsRunningAsAdministrator()
+    {
+        try
+        {
+            using (System.Security.Principal.WindowsIdentity identity = System.Security.Principal.WindowsIdentity.GetCurrent())
+            {
+                System.Security.Principal.WindowsPrincipal principal = new System.Security.Principal.WindowsPrincipal(identity);
+                return principal.IsInRole(System.Security.Principal.WindowsBuiltInRole.Administrator);
+            }
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
     bool ConfirmAdminAction(string messageKey, string titleKey)
     {
         return MessageBox.Show(

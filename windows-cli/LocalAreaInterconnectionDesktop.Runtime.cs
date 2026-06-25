@@ -1357,6 +1357,10 @@ public partial class LocalAreaInterconnectionDesktop
         if (arguments.IndexOf("--wintun-runtime true", StringComparison.OrdinalIgnoreCase) >= 0
             || arguments.IndexOf("--packet-io-backend wintun", StringComparison.OrdinalIgnoreCase) >= 0)
         {
+            if (IsRunningAsAdministrator())
+            {
+                return StartNativeBackgroundProcess(arguments, runtimeOutput, T("runtimeExited"));
+            }
             return StartNativeRuntimeProcessElevated(arguments);
         }
         return StartNativeBackgroundProcess(arguments, runtimeOutput, T("runtimeExited"));

@@ -3223,6 +3223,7 @@ fn run_runtime_coordination_server_bootstraps(
             "fetch": fetch_value,
             "fetchAttempts": waited_fetch.attempts,
             "fetchWaitedMs": waited_fetch.waited_ms,
+            "lastFetchError": waited_fetch.last_error,
             "status": "empty",
         }));
     } else {
@@ -3234,6 +3235,7 @@ fn run_runtime_coordination_server_bootstraps(
                 "fetch": fetch_value,
                 "fetchAttempts": waited_fetch.attempts,
                 "fetchWaitedMs": waited_fetch.waited_ms,
+                "lastFetchError": waited_fetch.last_error,
                 "status": "ok",
             }),
         );
@@ -3247,6 +3249,7 @@ struct RuntimeCoordinationHttpFetch {
     fetch: lai_core::CoordinationFetchResult,
     attempts: u32,
     waited_ms: u128,
+    last_error: Option<String>,
 }
 
 fn wait_for_coordination_http_offers(
@@ -3265,10 +3268,55 @@ fn wait_for_coordination_http_offers(
     let mut fallback_fetch = None;
     let mut fallback_attempts = 0u32;
     let mut fallback_waited_ms = 0u128;
+    let mut last_error = None::<String>;
     loop {
         attempts = attempts.saturating_add(1);
-        let fetch_value = coordination_http_fetch_offers(server, room_id, local_peer_id)?;
-        let fetch: lai_core::CoordinationFetchResult = serde_json::from_value(fetch_value.clone())?;
+        let fetch_result = coordination_http_fetch_offers(server, room_id, local_peer_id).and_then(
+            |fetch_value| {
+                let fetch: lai_core::CoordinationFetchResult =
+                    serde_json::from_value(fetch_value.clone())?;
+                Ok((fetch_value, fetch))
+            },
+        );
+        let (fetch_value, fetch) = match fetch_result {
+            Ok(value) => value,
+            Err(err) => {
+                last_error = Some(err.to_string());
+                if Instant::now() >= deadline {
+                    if let (Some(fetch_value), Some(fetch)) = (fallback_fetch_value, fallback_fetch)
+                    {
+                        return Ok(RuntimeCoordinationHttpFetch {
+                            fetch_value,
+                            fetch,
+                            attempts: fallback_attempts,
+                            waited_ms: fallback_waited_ms,
+                            last_error,
+                        });
+                    }
+                    return Err(invalid_input(format!(
+                        "coordination server fetch failed after {attempts} attempt(s): {err}"
+                    )));
+                }
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    if let (Some(fetch_value), Some(fetch)) = (fallback_fetch_value, fallback_fetch)
+                    {
+                        return Ok(RuntimeCoordinationHttpFetch {
+                            fetch_value,
+                            fetch,
+                            attempts: fallback_attempts,
+                            waited_ms: fallback_waited_ms,
+                            last_error,
+                        });
+                    }
+                    return Err(invalid_input(format!(
+                        "coordination server fetch failed after {attempts} attempt(s): {err}"
+                    )));
+                }
+                std::thread::sleep(interval.min(remaining));
+                continue;
+            }
+        };
         let runtime_present = peer_specs.iter().all(|(remote_peer_id, _)| {
             fetch.offers.iter().any(|offer| {
                 offer.peer_id == *remote_peer_id && runtime_coordination_offer_ready(offer)
@@ -3292,6 +3340,7 @@ fn wait_for_coordination_http_offers(
                 fetch,
                 attempts,
                 waited_ms: started.elapsed().as_millis(),
+                last_error,
             });
         }
         if Instant::now() >= deadline {
@@ -3301,6 +3350,7 @@ fn wait_for_coordination_http_offers(
                     fetch,
                     attempts: fallback_attempts,
                     waited_ms: fallback_waited_ms,
+                    last_error,
                 });
             }
             return Ok(RuntimeCoordinationHttpFetch {
@@ -3308,6 +3358,7 @@ fn wait_for_coordination_http_offers(
                 fetch,
                 attempts,
                 waited_ms: started.elapsed().as_millis(),
+                last_error,
             });
         }
         let remaining = deadline.saturating_duration_since(Instant::now());
@@ -3318,6 +3369,7 @@ fn wait_for_coordination_http_offers(
                     fetch,
                     attempts: fallback_attempts,
                     waited_ms: fallback_waited_ms,
+                    last_error,
                 });
             }
             return Ok(RuntimeCoordinationHttpFetch {
@@ -3325,6 +3377,7 @@ fn wait_for_coordination_http_offers(
                 fetch,
                 attempts,
                 waited_ms: started.elapsed().as_millis(),
+                last_error,
             });
         }
         std::thread::sleep(interval.min(remaining));
@@ -8241,7 +8294,7 @@ mod tests {
         runtime_observed_configured_peer, runtime_peer_from_bootstrap_result,
         runtime_peer_summaries, runtime_plan_has_relay_peer, runtime_reply_target,
         runtime_targets_for_virtual_packet_destination, runtime_update_active_peer_direct_endpoint,
-        trim_event_log, RuntimeSendTarget,
+        trim_event_log, wait_for_coordination_http_offers, RuntimeSendTarget,
     };
     use base64::{engine::general_purpose::STANDARD_NO_PAD, Engine as _};
     use lai_core::{
@@ -8249,7 +8302,8 @@ mod tests {
         RoomRuntimePlan, RuntimePortBinding, RuntimeTunnelPlan, RuntimeUdpForwardPlan,
     };
     use std::collections::VecDeque;
-    use std::net::{Ipv4Addr, SocketAddr};
+    use std::io::{Read, Write};
+    use std::net::{Ipv4Addr, SocketAddr, TcpListener};
 
     #[test]
     fn trim_event_log_keeps_most_recent_items() {
@@ -8272,6 +8326,70 @@ mod tests {
 
         assert_eq!(retained_events, vec![4, 5]);
         assert_eq!(next_runtime_sequence(&mut next_sequence), 6);
+    }
+
+    #[test]
+    fn coordination_http_wait_retries_transient_bad_response() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let server_url = format!("http://{}", listener.local_addr().unwrap());
+        let handle = std::thread::spawn(move || {
+            let mut buffer = [0u8; 2048];
+            let (mut first, _) = listener.accept().unwrap();
+            let _ = first.read(&mut buffer);
+            first.write_all(b"not an http response").unwrap();
+            drop(first);
+
+            let (mut second, _) = listener.accept().unwrap();
+            let _ = second.read(&mut buffer);
+            let body = serde_json::json!({
+                "status": "ok",
+                "room_id": "room_test",
+                "peer_id": "peer_a",
+                "expired_peer_count": 0,
+                "offers": [{
+                    "schema_version": 1,
+                    "room_id": "room_test",
+                    "peer_id": "peer_b",
+                    "virtual_ip": "10.77.12.3",
+                    "nonce": "nonce-b-runtime-offer",
+                    "created_at_ms": 1,
+                    "candidates": [{
+                        "candidate_type": "host",
+                        "transport": "udp",
+                        "endpoint": "127.0.0.1:39091",
+                        "priority": 100,
+                        "source": "test"
+                    }]
+                }]
+            })
+            .to_string();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            second.write_all(response.as_bytes()).unwrap();
+        });
+
+        let waited = wait_for_coordination_http_offers(
+            &server_url,
+            "room_test",
+            "peer_a",
+            &[("peer_b".to_owned(), Ipv4Addr::new(10, 77, 12, 3))],
+            1000,
+            10,
+        )
+        .unwrap();
+
+        assert_eq!(waited.fetch.offers.len(), 1);
+        assert_eq!(waited.fetch.offers[0].peer_id, "peer_b");
+        assert_eq!(waited.attempts, 2);
+        assert!(waited
+            .last_error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("HTTP response missing header terminator"));
+        handle.join().unwrap();
     }
 
     #[test]
