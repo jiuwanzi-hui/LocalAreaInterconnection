@@ -316,38 +316,64 @@ pub fn query_stun_like_server(
     let request_bytes = serde_json::to_vec(&request)?;
     let sent = send_udp_to(socket, &request_bytes, server)?;
     let mut buffer = [0u8; 2048];
-    let result = match socket.recv_from(&mut buffer) {
-        Ok((received, peer)) => {
-            let mut response: serde_json::Value = serde_json::from_slice(&buffer[..received])?;
-            response["status"] = serde_json::Value::String("ok".to_owned());
-            response["queryLocalEndpoint"] =
-                serde_json::Value::String(socket.local_addr()?.to_string());
-            response["server"] = serde_json::Value::String(server.to_string());
-            response["responsePeer"] = serde_json::Value::String(peer.to_string());
-            response["bytesSent"] = serde_json::Value::from(sent as u64);
-            response["bytesReceived"] = serde_json::Value::from(received as u64);
-            Ok(response)
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms.max(1));
+    let result = loop {
+        match socket.recv_from(&mut buffer) {
+            Ok((received, peer)) => {
+                let mut response: serde_json::Value =
+                    match serde_json::from_slice(&buffer[..received]) {
+                        Ok(value) => value,
+                        Err(_) if Instant::now() < deadline => continue,
+                        Err(_) => break timeout_stun_like_response(socket, server, sent),
+                    };
+                let has_observed_endpoint = response
+                    .get("observedEndpoint")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some();
+                if !has_observed_endpoint && Instant::now() < deadline {
+                    continue;
+                }
+                if !has_observed_endpoint {
+                    break timeout_stun_like_response(socket, server, sent);
+                }
+                response["status"] = serde_json::Value::String("ok".to_owned());
+                response["queryLocalEndpoint"] =
+                    serde_json::Value::String(socket.local_addr()?.to_string());
+                response["server"] = serde_json::Value::String(server.to_string());
+                response["responsePeer"] = serde_json::Value::String(peer.to_string());
+                response["bytesSent"] = serde_json::Value::from(sent as u64);
+                response["bytesReceived"] = serde_json::Value::from(received as u64);
+                break Ok(response);
+            }
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    ErrorKind::WouldBlock
+                        | ErrorKind::TimedOut
+                        | ErrorKind::Interrupted
+                        | ErrorKind::ConnectionReset
+                ) && Instant::now() < deadline =>
+            {
+                continue;
+            }
+            Err(_) => break timeout_stun_like_response(socket, server, sent),
         }
-        Err(err)
-            if matches!(
-                err.kind(),
-                ErrorKind::WouldBlock
-                    | ErrorKind::TimedOut
-                    | ErrorKind::Interrupted
-                    | ErrorKind::ConnectionReset
-            ) =>
-        {
-            Ok(serde_json::json!({
-                "status": "timeout",
-                "server": server.to_string(),
-                "queryLocalEndpoint": socket.local_addr()?.to_string(),
-                "bytesSent": sent,
-            }))
-        }
-        Err(err) => Err(err.into()),
     };
     socket.set_read_timeout(previous_timeout)?;
     result
+}
+
+fn timeout_stun_like_response(
+    socket: &UdpSocket,
+    server: SocketAddr,
+    sent: usize,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    Ok(serde_json::json!({
+        "status": "timeout",
+        "server": server.to_string(),
+        "queryLocalEndpoint": socket.local_addr()?.to_string(),
+        "bytesSent": sent,
+    }))
 }
 
 pub fn enrich_offer_with_local_host_candidates(
@@ -1476,11 +1502,29 @@ fn query_standard_stun_server(
     send_udp_to(socket, &request, server)?;
 
     let mut buffer = [0u8; 1500];
-    let result = match socket.recv_from(&mut buffer) {
-        Ok((received, _)) => {
-            parse_standard_stun_observed_endpoint(&buffer[..received], &transaction_id)
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms.max(1));
+    let result = loop {
+        match socket.recv_from(&mut buffer) {
+            Ok((received, _)) => {
+                match parse_standard_stun_observed_endpoint(&buffer[..received], &transaction_id) {
+                    Ok(endpoint) => break Ok(endpoint),
+                    Err(_) if Instant::now() < deadline => continue,
+                    Err(err) => break Err(err),
+                }
+            }
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    ErrorKind::WouldBlock
+                        | ErrorKind::TimedOut
+                        | ErrorKind::Interrupted
+                        | ErrorKind::ConnectionReset
+                ) && Instant::now() < deadline =>
+            {
+                continue;
+            }
+            Err(err) => break Err(err.into()),
         }
-        Err(err) => Err(err.into()),
     };
     socket.set_read_timeout(previous_timeout)?;
     result

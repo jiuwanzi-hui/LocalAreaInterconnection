@@ -59,11 +59,11 @@ const RUNTIME_HTTP_RELAY_PACKET_MAX_AGE_MS: u128 = 5_000;
 const RUNTIME_RELAY_REGISTRATION_INTERVAL_MS: u64 = 2_000;
 const RUNTIME_DIRECT_RESTORE_CONFIRMATIONS: u8 = 2;
 const RUNTIME_DIRECT_RESTORE_WINDOW_MS: u64 = 3_000;
-const RUNTIME_P2P_REFRESH_INTERVAL_MS: u64 = 15_000;
-const RUNTIME_P2P_REFRESH_IDLE_MS: u64 = 5_000;
-const RUNTIME_P2P_REFRESH_BUSY_INTERVAL_MS: u64 = 10_000;
-const RUNTIME_P2P_REFRESH_TIMEOUT_MS: u64 = 500;
-const RUNTIME_P2P_REFRESH_ATTEMPTS: u16 = 10;
+const RUNTIME_P2P_REFRESH_INTERVAL_MS: u64 = 5_000;
+const RUNTIME_P2P_REFRESH_IDLE_MS: u64 = 2_000;
+const RUNTIME_P2P_REFRESH_BUSY_INTERVAL_MS: u64 = 3_000;
+const RUNTIME_P2P_REFRESH_TIMEOUT_MS: u64 = 3_000;
+const RUNTIME_P2P_REFRESH_ATTEMPTS: u16 = 24;
 const RUNTIME_P2P_REFRESH_INTERVAL_PUNCH_MS: u64 = 50;
 const RUNTIME_TUNNEL_READ_TIMEOUT_MS: u64 = 1;
 const RUNTIME_WINTUN_DRAIN_LIMIT: usize = 64;
@@ -7993,12 +7993,12 @@ fn runtime_refresh_p2p_from_coordination_server(
     active_plan: &mut RoomRuntimePlan,
     key: &str,
     socket: &UdpSocket,
-    _stun_server: Option<&str>,
-    _stun_timeout_ms: u64,
-    _upnp_port_map: bool,
-    _upnp_timeout_ms: u64,
-    _upnp_lease_seconds: u32,
-    _upnp_gateway_location: Option<&str>,
+    stun_server: Option<&str>,
+    stun_timeout_ms: u64,
+    upnp_port_map: bool,
+    upnp_timeout_ms: u64,
+    upnp_lease_seconds: u32,
+    upnp_gateway_location: Option<&str>,
     relay_endpoints: &[String],
 ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
     let checked_at_ms = current_epoch_ms();
@@ -8024,12 +8024,12 @@ fn runtime_refresh_p2p_from_coordination_server(
             key,
             offer,
             None,
-            None,
-            0,
-            false,
-            0,
-            0,
-            None,
+            stun_server,
+            stun_timeout_ms,
+            upnp_port_map,
+            upnp_timeout_ms,
+            upnp_lease_seconds,
+            upnp_gateway_location,
             udp_relay_endpoints(relay_endpoints),
             RUNTIME_P2P_REFRESH_ATTEMPTS,
             RUNTIME_P2P_REFRESH_INTERVAL_PUNCH_MS,
@@ -8054,7 +8054,7 @@ fn runtime_refresh_p2p_from_coordination_server(
             "peerId": peer.peer_id,
             "status": if restored { "direct-restored" } else { "not-restored" },
             "directEndpoint": direct_endpoint,
-            "liveStunSkipped": true,
+            "liveStunSkipped": false,
             "result": result,
         }));
         if restored {
@@ -8063,7 +8063,7 @@ fn runtime_refresh_p2p_from_coordination_server(
                 "server": server,
                 "checkedAtMs": checked_at_ms,
                 "directRestored": true,
-                "liveStunSkipped": true,
+                "liveStunSkipped": false,
                 "peerReports": peer_reports,
                 "fetch": fetch_value,
             }));
@@ -8075,7 +8075,7 @@ fn runtime_refresh_p2p_from_coordination_server(
         "server": server,
         "checkedAtMs": checked_at_ms,
         "directRestored": false,
-        "liveStunSkipped": true,
+        "liveStunSkipped": false,
         "peerReports": peer_reports,
         "fetch": fetch_value,
     }))
