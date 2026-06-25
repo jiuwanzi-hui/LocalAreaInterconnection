@@ -1,6 +1,6 @@
 use lai_core::Ipv4Subnet;
 use std::io::{ErrorKind, Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{TcpListener, TcpStream, ToSocketAddrs};
 use std::time::Duration;
 
 use crate::{current_epoch_ms, invalid_input, read_text_file_with_retry, write_json_file};
@@ -441,9 +441,9 @@ fn send_http_json_request(
     body: Option<&str>,
 ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
     let parsed = parse_http_url(url)?;
-    let mut stream = TcpStream::connect((&parsed.host[..], parsed.port))?;
-    stream.set_read_timeout(Some(Duration::from_secs(30)))?;
-    stream.set_write_timeout(Some(Duration::from_secs(30)))?;
+    let mut stream = connect_http_with_timeout(&parsed)?;
+    stream.set_read_timeout(Some(Duration::from_secs(3)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(3)))?;
     let body = body.unwrap_or("");
     let request = format!(
         "{method} {} HTTP/1.1\r\nHost: {}\r\nAccept: application/json\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
@@ -457,6 +457,27 @@ fn send_http_json_request(
     let mut response = Vec::new();
     stream.read_to_end(&mut response)?;
     parse_http_json_response(&response)
+}
+
+fn connect_http_with_timeout(
+    parsed: &ParsedHttpUrl,
+) -> Result<TcpStream, Box<dyn std::error::Error>> {
+    let timeout = Duration::from_millis(1500);
+    let mut last_error = None;
+    for addr in (parsed.host.as_str(), parsed.port).to_socket_addrs()? {
+        match TcpStream::connect_timeout(&addr, timeout) {
+            Ok(stream) => return Ok(stream),
+            Err(err) => last_error = Some(err),
+        }
+    }
+    Err(invalid_input(format!(
+        "failed to connect to coordination server {} within {}ms: {}",
+        parsed.host_header,
+        timeout.as_millis(),
+        last_error
+            .map(|err| err.to_string())
+            .unwrap_or_else(|| "no resolved addresses".to_owned())
+    )))
 }
 
 struct ParsedHttpUrl {
