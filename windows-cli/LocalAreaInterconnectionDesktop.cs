@@ -5,6 +5,7 @@ using System.Diagnostics;
 using System.Drawing;
 using System.Drawing.Drawing2D;
 using System.IO;
+using System.Net;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading.Tasks;
@@ -164,6 +165,7 @@ public partial class LocalAreaInterconnectionDesktop : Form, IMessageFilter
     public static void Main()
     {
         EnableProcessDpiAwareness();
+        DisableDefaultWebProxy();
         Application.EnableVisualStyles();
         Application.SetCompatibleTextRenderingDefault(false);
         Application.SetUnhandledExceptionMode(UnhandledExceptionMode.CatchException);
@@ -180,6 +182,17 @@ public partial class LocalAreaInterconnectionDesktop : Form, IMessageFilter
             }
         };
         Application.Run(new LocalAreaInterconnectionDesktop());
+    }
+
+    static void DisableDefaultWebProxy()
+    {
+        try
+        {
+            WebRequest.DefaultWebProxy = null;
+        }
+        catch
+        {
+        }
     }
 
     static void EnableProcessDpiAwareness()

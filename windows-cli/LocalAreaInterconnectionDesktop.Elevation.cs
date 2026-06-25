@@ -87,6 +87,7 @@ public partial class LocalAreaInterconnectionDesktop
         StringBuilder script = new StringBuilder();
         script.AppendLine("@echo off");
         script.AppendLine("chcp 65001 > nul");
+        ApplyDirectNetworkEnvironmentToBatch(script);
         script.AppendLine("set LAI_EXIT=0");
         for (int i = 0; i < argumentLines.Length; i++)
         {

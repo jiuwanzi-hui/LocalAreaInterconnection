@@ -1315,6 +1315,50 @@ public partial class LocalAreaInterconnectionDesktop
         return "39078";
     }
 
+    void ApplyDirectNetworkEnvironment(ProcessStartInfo start)
+    {
+        if (start == null || start.UseShellExecute)
+        {
+            return;
+        }
+
+        string[] proxyVariables = new[]
+        {
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "ALL_PROXY",
+            "NO_PROXY",
+            "http_proxy",
+            "https_proxy",
+            "all_proxy",
+            "no_proxy",
+        };
+        for (int i = 0; i < proxyVariables.Length; i++)
+        {
+            try
+            {
+                start.EnvironmentVariables.Remove(proxyVariables[i]);
+            }
+            catch
+            {
+            }
+        }
+        start.EnvironmentVariables["NO_PROXY"] = "localhost,127.0.0.1,::1,49.235.146.152";
+        start.EnvironmentVariables["no_proxy"] = "localhost,127.0.0.1,::1,49.235.146.152";
+    }
+
+    void ApplyDirectNetworkEnvironmentToBatch(StringBuilder script)
+    {
+        script.AppendLine("set HTTP_PROXY=");
+        script.AppendLine("set HTTPS_PROXY=");
+        script.AppendLine("set ALL_PROXY=");
+        script.AppendLine("set NO_PROXY=localhost,127.0.0.1,::1,49.235.146.152");
+        script.AppendLine("set http_proxy=");
+        script.AppendLine("set https_proxy=");
+        script.AppendLine("set all_proxy=");
+        script.AppendLine("set no_proxy=localhost,127.0.0.1,::1,49.235.146.152");
+    }
+
     string RunCli(string arguments)
     {
         string exe = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "LocalAreaInterconnection.Cli.exe");
@@ -1385,6 +1429,7 @@ public partial class LocalAreaInterconnectionDesktop
         StringBuilder script = new StringBuilder();
         script.AppendLine("@echo off");
         script.AppendLine("chcp 65001 > nul");
+        ApplyDirectNetworkEnvironmentToBatch(script);
         script.AppendLine("cd /d " + QuoteBatch(AppDomain.CurrentDomain.BaseDirectory));
         script.Append(QuoteBatch(exe)).Append(" ").Append(arguments)
             .Append(" 1> ").Append(QuoteBatch(stdoutPath))
@@ -1469,6 +1514,7 @@ public partial class LocalAreaInterconnectionDesktop
         start.StandardOutputEncoding = Encoding.UTF8;
         start.StandardErrorEncoding = Encoding.UTF8;
         start.CreateNoWindow = true;
+        ApplyDirectNetworkEnvironment(start);
 
         Process process = new Process();
         process.StartInfo = start;
@@ -1685,6 +1731,7 @@ public partial class LocalAreaInterconnectionDesktop
         start.StandardOutputEncoding = Encoding.UTF8;
         start.StandardErrorEncoding = Encoding.UTF8;
         start.CreateNoWindow = true;
+        ApplyDirectNetworkEnvironment(start);
 
         using (Process process = new Process())
         {
